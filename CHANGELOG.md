@@ -2,6 +2,11 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-09-02
+
+### Fixed
+- Command frontmatter: `argument-hint` values are now valid YAML (quoted in full). Strict parsers, including GitHub's preview, rejected the previous form.
+
 ## [1.0.0] - 2026-09-02
 
 ### codex-pr-review

@@ -1,6 +1,6 @@
 {
   "name": "codex-debate",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Structured adversarial debate with Codex on any falsifiable motion or named-option choice: blind first round, claim ledger with evidence grades, verification of contested facts, and a written ruling.",
   "author": { "name": "Hesham Karm" },
   "keywords": ["debate", "codex", "architecture", "decision", "second-opinion"]
