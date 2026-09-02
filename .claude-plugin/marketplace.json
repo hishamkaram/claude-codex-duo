@@ -1,0 +1,23 @@
+{
+  "name": "claude-codex-duo",
+  "description": "Claude Code + OpenAI Codex working as a pair: blind cross-model PR review and structured adversarial debate.",
+  "owner": { "name": "Hesham Karm" },
+  "plugins": [
+    {
+      "name": "codex-pr-review",
+      "description": "Two-model PR review with a blind Codex second reviewer, verification, and one merge decision.",
+      "source": "./plugins/codex-pr-review",
+      "version": "1.0.0",
+      "category": "code-review",
+      "tags": ["code-review", "codex", "pr-review"]
+    },
+    {
+      "name": "codex-debate",
+      "description": "Adversarial debate with Codex on any motion, with a claim ledger and a written ruling.",
+      "source": "./plugins/codex-debate",
+      "version": "1.0.0",
+      "category": "productivity",
+      "tags": ["debate", "codex", "decision"]
+    }
+  ]
+}
