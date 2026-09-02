@@ -2,6 +2,19 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.4] - 2026-09-02
+
+Round 1 of the same Codex debate. Every claim was reproduced before being accepted.
+
+### Fixed
+- `build-brief.sh`: a range-mode call missing only `--head-ref` still aborted with `HREF: parameter null or not set` and exit 1, because the 1.0.3 required-option check omitted that variable. It is now a usage error with exit 2. This was an incomplete fix in 1.0.3, not a new defect.
+- `codex-run.sh`: `--stall-min 08` passed the digit test but aborted the polling arithmetic with `value too great for base`, because bash reads a leading-zero literal as octal. Timing values are now normalised to base 10 and bounded, so `08` behaves as 8 and an oversized value is rejected up front.
+- `build-brief.sh` file-list parser: a path containing a non-UTF-8 byte crashed the builder with `UnicodeDecodeError`, and a path containing a newline was emitted as two Markdown lines, so one changed file stopped being one entry. Paths are now decoded without crashing and control characters are escaped, keeping one file per line.
+- `codex-run.sh` cancellation: the runner wrote "no phantom running job left behind" without checking. It now re-reads the job status and looks for a live worker process after cancelling, and reports honestly on both the progress file and stderr when the cancel is not confirmed.
+
+### Added
+- Regression tests for all four, including leading-zero timings, a range call missing `--head-ref`, and parser input with non-UTF-8 bytes, newlines, spaces and renames.
+
 ## [1.0.3] - 2026-09-02
 
 Found by a Codex debate on packaging and portability; both claims were reproduced before being accepted.

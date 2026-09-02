@@ -56,7 +56,12 @@ while [ $# -gt 0 ]; do
 done
 for v in STALL_MIN MAX_MIN POLL; do
   eval "val=\$$v"
-  case "$val" in ''|*[!0-9]*) die4 "--$(echo "$v" | tr 'A-Z_' 'a-z-') requires a whole number of minutes/seconds (got '$val')";; esac
+  case "$val" in ''|*[!0-9]*) die4 "--$(echo "$v" | tr 'A-Z_' 'a-z-') requires a whole number (got '$val')";; esac
+  # Strip to base 10: bash reads a leading-zero literal as octal, so "08" would
+  # abort arithmetic later with "value too great for base". Also bound the range
+  # so an oversized value cannot silently overflow.
+  val=$(printf '%s' "$val" | sed 's/^0*//'); [ -n "$val" ] && [ "${#val}" -le 6 ] || die4 "--$(echo "$v" | tr 'A-Z_' 'a-z-') must be between 1 and 999999"
+  eval "$v=\$val"
 done
 [ -n "$PROMPT_FILE" ] || die4 "--prompt-file is required"
 [ -r "$PROMPT_FILE" ] || die4 "prompt file not readable: $PROMPT_FILE"
@@ -124,8 +129,23 @@ while :; do
 done
 
 if [ "$OUTCOME" = "STALLED" ] || [ "$OUTCOME" = "TIMEOUT" ] || { [ "$OUTCOME" = "FAILED" ] && [ "${STATUS:-}" = "running" ]; }; then
-  cc cancel "$JOB" >>"$PREFIX.stderr" 2>&1 || true
-  echo "$(elapsed)s $OUTCOME → cancelled $JOB (no phantom running job left behind)" >> "$PREFIX.progress"
+  CANCEL_RC=0; cc cancel "$JOB" >>"$PREFIX.stderr" 2>&1 || CANCEL_RC=$?
+  # Verify the cancel instead of asserting it: re-read status and look for a live
+  # worker. Report honestly if either still says running — a claimed cancel that
+  # did not happen is worse than a reported one that failed.
+  PHANTOM=""; i=0
+  while [ $i -lt 5 ]; do
+    sleep 1; i=$((i+1))
+    ST3=$(cc status "$JOB" --json 2>/dev/null | jobfield status)
+    case "$ST3" in cancelled|canceled|completed|failed) PHANTOM=""; break;; *) PHANTOM="status=$ST3";; esac
+  done
+  if pgrep -f "task-worker.*--job-id $JOB" >/dev/null 2>&1; then PHANTOM="${PHANTOM:+$PHANTOM }worker-process-alive"; fi
+  if [ -n "$PHANTOM" ]; then
+    echo "$(elapsed)s $OUTCOME → cancel of $JOB NOT confirmed (cancel_rc=$CANCEL_RC $PHANTOM); a worker may still be running" >> "$PREFIX.progress"
+    echo "codex-run.sh: cancel of $JOB not confirmed ($PHANTOM); check with: node <codex-plugin>/scripts/codex-companion.mjs status $JOB --json" >&2
+  else
+    echo "$(elapsed)s $OUTCOME → cancelled $JOB (confirmed: no running job, no worker process)" >> "$PREFIX.progress"
+  fi
 fi
 # always try to collect whatever final message exists
 cc result "$JOB" > "$PREFIX.stdout" 2>>"$PREFIX.stderr" || true

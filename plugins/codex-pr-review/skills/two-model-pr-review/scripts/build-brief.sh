@@ -22,6 +22,7 @@ while [ $# -gt 0 ]; do case "$1" in
 for v in REPO BREF BSHA HSHA INTENT CONV OUT; do
   eval "val=\${$v:-}"; [ -n "$val" ] || die2 "--$(echo "$v" | tr 'A-Z' 'a-z') is required"
 done
+if [ "$HSHA" != "WORKTREE" ] && [ -z "${HREF:-}" ]; then die2 "--head-ref is required in range mode (omit it only with --head WORKTREE)"; fi
 [ -d "$REPO" ] || die2 "--repo is not a directory: $REPO"
 [ -r "$INTENT" ] || die2 "--intent-file not readable: $INTENT"
 [ -r "$CONV" ] || die2 "--conventions-file not readable: $CONV"
@@ -45,15 +46,19 @@ if [ "$HSHA" = "WORKTREE" ]; then
   HEADNOTE="Head is a SNAPSHOT TREE of the uncommitted working tree (staged, unstaged, deleted and non-ignored untracked files), not a commit. It is authoritative: read a file exactly as reviewed with \`git show ${TREE}:<path>\`; the working tree should match it. Ignored files are out of scope. Staged intermediate state is not a separate review target (index differs from working tree: ${IDX_DIFFERS}). Submodules present: ${SUBS:-none}; an outer gitlink change is in scope, uncommitted contents inside a submodule are not."
   FILES=$(git -C "$REPO" diff --name-status -M -z "$BSHA" "$TREE" | python3 -c '
 import sys
+def name(b):
+    # Git paths are bytes. Never crash on non-UTF-8, and never emit a newline or
+    # carriage return: one changed file must stay one line of the brief file list.
+    s=b.decode("utf-8","backslashreplace")
+    return s.replace("\\","\\\\").replace("\n","\\n").replace("\r","\\r") if ("\n" in s or "\r" in s or "\\" in s) else s
 t=sys.stdin.buffer.read().split(b"\0"); out=[]; i=0
 while i<len(t) and t[i]:
-    st=t[i].decode(); i+=1
-    if st[0] in "RC": old=t[i].decode(); new=t[i+1].decode(); i+=2; out.append(f"  - {new}  ({st[0]} from {old}, similarity {st[1:]})")
-    else: out.append(f"  - {t[i].decode()}  ({st})"); i+=1
+    st=t[i].decode("ascii","replace"); i+=1
+    if st[0] in "RC": old=name(t[i]); new=name(t[i+1]); i+=2; out.append(f"  - {new}  ({st[0]} from {old}, similarity {st[1:]})")
+    else: out.append(f"  - {name(t[i])}  ({st})"); i+=1
 print("\n".join(sorted(out)))')
   DIFFCMD="git diff ${BSHA} ${TREE}"
 else
-  : "${HREF:?}"
   FILES=$(git -C "$REPO" diff --name-only "$BSHA..$HSHA" | LC_ALL=C sort | sed 's/^/  - /')
   DIFFCMD="git diff ${BSHA}..${HSHA}"
 fi

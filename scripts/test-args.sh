@@ -44,6 +44,33 @@ chk "unknown arg"              2 "unknown arg"     bash "$B" --nope x
 chk "--repo not a directory"   2 "not a directory" bash "$B" --repo "$TMP/absent" --base-ref H --base H --head WORKTREE --intent-file "$PROMPT" --conventions-file "$PROMPT" --out "$TMP/o.md"
 chk "--intent-file unreadable" 2 "not readable"    bash "$B" --repo . --base-ref H --base H --head WORKTREE --intent-file "$TMP/absent" --conventions-file "$PROMPT" --out "$TMP/o.md"
 chk "--out inside the repo"    2 "outside the repository" bash "$B" --repo . --base-ref HEAD --base HEAD --head WORKTREE --intent-file "$PROMPT" --conventions-file "$PROMPT" --out ./brief.md
+# X-07: range mode without --head-ref must be a usage error, not a raw ${HREF:?} abort
+chk "range mode missing --head-ref" 2 "--head-ref is required" bash "$B" --repo . --base-ref HEAD --base HEAD --head HEAD --intent-file "$PROMPT" --conventions-file "$PROMPT" --out "$TMP/o.md"
+
+echo "runner: leading-zero timings are base 10, not octal"
+# X-08: "08"/"09" pass the digit test but abort bash arithmetic as invalid octal.
+# Validation happens before the prompt-file check, so reaching "not readable"
+# proves the value was normalised and no arithmetic abort occurred.
+for v in 08 09 007; do
+  chk "--stall-min $v accepted as base 10" 4 "not readable" bash "$R" "$PFX" --stall-min "$v" --prompt-file "$TMP/absent"
+  chk "--max-min $v accepted as base 10"   4 "not readable" bash "$R" "$PFX" --max-min "$v" --prompt-file "$TMP/absent"
+done
+chk "--poll-sec 0 rejected"        4 "between 1 and"  bash "$R" "$PFX" --poll-sec 0 --prompt-file "$PROMPT"
+chk "oversized --max-min rejected" 4 "between 1 and"  bash "$R" "$PFX" --max-min 12345678 --prompt-file "$PROMPT"
+
+echo "builder: the file-list parser survives awkward filenames"
+# X-09 / X-10: a git path is bytes and may contain a newline; one changed file
+# must stay one line of the brief, and a non-UTF-8 byte must not crash the run.
+PARSER="$TMP/parser.py"
+awk "/FILES=\\\$\(git -C .*name-status -M -z/,/^print/" "$B" | sed -n '2,$p' | sed "s/')$//" > "$PARSER"
+out=$(printf 'M\0bad\xffname.txt\0' | python3 "$PARSER" 2>&1); code=$?
+[ $code -eq 0 ] && printf '  ok    %-42s\n' "non-UTF-8 filename does not crash" || { printf '  FAIL  non-UTF-8 filename: %s\n' "$out"; FAIL=1; }
+out=$(printf 'M\0dir/first\nsecond.md\0' | python3 "$PARSER" 2>&1); code=$?
+n=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
+[ $code -eq 0 ] && [ "$n" = "1" ] && printf '  ok    %-42s\n' "newline in filename stays one line" || { printf '  FAIL  newline filename produced %s lines: %s\n' "$n" "$out"; FAIL=1; }
+out=$(printf 'M\0a file with spaces.md\0R100\0old n.md\0new n.md\0' | python3 "$PARSER" 2>&1)
+printf '%s' "$out" | grep -q 'a file with spaces.md  (M)' && printf '%s' "$out" | grep -q 'new n.md  (R from old n.md, similarity 100)' \
+  && printf '  ok    %-42s\n' "spaces and renames parse correctly" || { printf '  FAIL  parser: %s\n' "$out"; FAIL=1; }
 
 echo "builder: happy path on a throwaway repo"
 G="$TMP/repo"; mkdir -p "$G"; ( cd "$G" && git init -q && git config user.email t@t && git config user.name t && echo a > a.txt && git add a.txt && git commit -qm init ) || { echo "  FAIL  fixture"; FAIL=1; }
