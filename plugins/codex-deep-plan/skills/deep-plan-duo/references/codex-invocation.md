@@ -40,7 +40,10 @@ Never edit them. The round artifact references them; it never pastes them.
 ${CLAUDE_PLUGIN_ROOT}/skills/deep-plan-duo/scripts/build-prompt.sh --art "$ART" --round <n>     # exit 3 = leak; fix, never bypass
 ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/debate/r<n>-codex" <--fresh|--resume-last> --prompt-file "$ART/debate/r<n>-prompt.md" --max-min 30   # background
 ${CLAUDE_PLUGIN_ROOT}/skills/deep-plan-duo/scripts/validate-verdict.py --extract "$ART/debate/r<n>-codex.stdout" \
-    --out "$ART/debate/r<n>-codex.json" --round <n> --role codex --repo "$REPO" [--prior "$ART/debate/r<n-1>-codex.json"]
+    --out "$ART/debate/r<n>-codex.json" --round <n> --role codex
+# repo, base SHA and the earlier rounds are read from "$ART/meta.json" and "$ART/debate/"; every
+# sha-pinned citation is checked against the code AT THE BASE SHA, and from round 1 on every
+# objection still outstanding from earlier rounds must carry a resolution
 ${CLAUDE_PLUGIN_ROOT}/skills/deep-plan-duo/scripts/debate-status.py --art "$ART"
 ```
 

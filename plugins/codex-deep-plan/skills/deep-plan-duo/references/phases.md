@@ -55,7 +55,7 @@ context; you cannot re-read them until round 0 returns. `STATUS: PHASE 4 COMPLET
 
 Pre-flight: the four files above are mode 000; `debate/r0-prompt.md` predates `01-evidence.md`
 (`ls -l --time-style=full-iso` or `stat`). Run the round per `codex-invocation.md` with `--fresh`.
-Validate with `--repo` so Codex's citations are checked against the code. On T5 write
+The validator reads repo and base SHA from `meta.json` and checks Codex's citations against the code at the base commit. On T5 write
 `debate/r0-codex.md` with the verbatim failure and `STATUS: PHASE 5 COMPLETE (SKIPPED — <reason>)`,
 `chmod 600` the four files, and jump to Phase 8 in SOLO mode. Otherwise `chmod 600` the four files
 and write `debate/r0-codex.md` = the validator summary line + `debate-status.py` block + `STATUS:
@@ -72,8 +72,8 @@ not in round 3. `STATUS: PHASE 6 COMPLETE`.
 
 Create the ledger from `divergence.md` and Codex's r0 objections. For each round: write your
 rebuttals (ACCEPT / REJECT / DEFER / CRUX, with evidence) into the ledger; revise
-`04-plan-draft.md` for every ACCEPT; build the prompt; run the round `--resume-last`; validate with
-`--prior`; run `debate-status.py`; rule on every touched row; append the status block. Stop at the
+`04-plan-draft.md` for every ACCEPT; build the prompt; run the round `--resume-last`; validate (earlier
+rounds are folded in automatically); run `debate-status.py`; rule on every touched row; append the status block. Stop at the
 first termination condition. Fact disputes go to `fact-checker` between rounds, never to another
 round. `STATUS: PHASE 7 COMPLETE (<Tn>)`.
 

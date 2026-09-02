@@ -32,6 +32,8 @@ for v in ROUND BUDGET; do
   eval "$v=\$val"
 done
 [ "$ROUND" -le 3 ] || die2 "--round must be 0..3"
+CAP=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("rounds") or 2))' "$ART/meta.json" 2>/dev/null || echo 2)
+[ "$ROUND" -le "$CAP" ] || die2 "--round $ROUND exceeds the run's round cap ($CAP in meta.json); the cap is never extended"
 [ -n "$OUT" ] || OUT="$ART/debate/r$ROUND-prompt.md"
 mkdir -p "$(dirname "$OUT")"
 python3 - "$SK" "$ART" "$ROUND" "${BUDGET:-}" "$OUT" <<'PY'

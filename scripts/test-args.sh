@@ -117,7 +117,7 @@ out=$(bash "$I" --parse-only --issue "https://github.com/own/rep/issues/7" 2>&1)
 printf '%s' "$out" | grep -q '"number": 7' && printf '%s' "$out" | grep -q '"owner": "own"' && printf '  ok    %-42s\n' "issue URL parsed" || { printf '  FAIL  issue parse: %s\n' "$out"; FAIL=1; }
 out=$(bash "$I" --parse-only --pr "#12" 2>&1)
 printf '%s' "$out" | grep -q '"number": 12' && printf '  ok    %-42s\n' "#N parsed as a number" || { printf '  FAIL  pr parse: %s\n' "$out"; FAIL=1; }
-G2="$TMP/repo2"; mkdir -p "$G2"; ( cd "$G2" && git init -q && git config user.email t@t && git config user.name t && printf 'line one\nline two\nline three\n' > f.txt && git add f.txt && git commit -qm init ) || { echo "  FAIL  fixture2"; FAIL=1; }
+G2="$TMP/repo2"; mkdir -p "$G2"; ( cd "$G2" && git init -q && git config user.email t@t && git config user.name t && printf 'line one\nline two\nline three\n' > f.txt && printf 'FROM python\n' > Dockerfile && git add f.txt Dockerfile && git commit -qm init ) || { echo "  FAIL  fixture2"; FAIL=1; }
 SHA2=$(git -C "$G2" rev-parse HEAD)
 printf 'The export endpoint should be rate limited.\n' > "$TMP/req.txt"
 A="$TMP/art1"
@@ -133,6 +133,35 @@ out=$(PATH="$FAKE:$PATH" bash "$I" --repo "$G2" --out "$TMP/art2" --issue 1 --re
 [ $code -eq 3 ] && printf '%s' "$out" | grep -q -- '--issue 1' && [ -f "$TMP/art2/inputs/request-1.md" ] \
   && printf '  ok    %-42s exit=3\n' "gh failure exits 3, names input, keeps others" || { printf '  FAIL  gh failure exit=%s: %s\n' "$code" "$out"; FAIL=1; }
 
+echo "deep-plan: review findings F-01, F-08, F-09, F-10, F-16 (init-plan.sh)"
+# F-01: a refused in-repo --out must not create the directory
+rm -rf "$G2/plan-out"; bash "$I" --repo "$G2" --out "$G2/plan-out" --request x >/dev/null 2>&1
+[ ! -e "$G2/plan-out" ] && printf '  ok    %-42s\n' "refused --out leaves no directory behind" || { printf '  FAIL  refused --out created %s\n' "$G2/plan-out"; FAIL=1; }
+# F-09: an untracked file makes the tree dirty
+echo new > "$G2/untracked.txt"
+bash "$I" --repo "$G2" --out "$TMP/art9" --request x 2>&1 | grep -q 'WARNING: dirty' && python3 -c "import json,sys; sys.exit(0 if json.load(open('$TMP/art9/meta.json'))['dirty_tree'] else 1)" \
+  && printf '  ok    %-42s\n' "untracked-only tree is reported dirty" || { printf '  FAIL  untracked file not reported dirty\n'; FAIL=1; }
+rm -f "$G2/untracked.txt"
+# F-10: a malformed comment fragment is a usage error, not a traceback
+chk "init: non-numeric comment fragment" 2 "must be #issuecomment"  bash "$I" --parse-only --comment "https://github.com/o/r/pull/4#discussion_rabc"
+# F-16: free text may begin with a dash
+bash "$I" --repo "$G2" --out "$TMP/art16" --request "-v is ignored" >/dev/null 2>&1 && grep -q '^-v is ignored$' "$TMP/art16/inputs/request-1.md" \
+  && printf '  ok    %-42s\n' "request text may start with a dash" || { printf '  FAIL  dash-leading request rejected\n'; FAIL=1; }
+# F-08: gh output of one JSON array per page (older gh) is merged
+FAKE2="$TMP/fakegh2"; mkdir -p "$FAKE2"; cat > "$FAKE2/gh" <<'GH'
+#!/bin/sh
+case "$1 $2" in
+  "repo view") echo '{"nameWithOwner":"own/rep"}';;
+  "pr view") echo '{"number":7,"title":"T","body":"B","state":"OPEN","url":"u","baseRefName":"main","headRefName":"f","reviews":[],"comments":[]}';;
+  "api --paginate") printf '[{"path":"a.py","line":1,"body":"first","user":{"login":"x"}}]\n[{"path":"b.py","line":2,"body":"second","user":{"login":"y"}}]\n';;
+  *) exit 1;;
+esac
+GH
+chmod +x "$FAKE2/gh"
+PATH="$FAKE2:$PATH" bash "$I" --repo "$G2" --out "$TMP/art8b" --pr 7 >/dev/null 2>&1; code=$?
+[ $code -eq 0 ] && grep -q 'first' "$TMP/art8b/inputs/pr-7.md" && grep -q 'second' "$TMP/art8b/inputs/pr-7.md" \
+  && printf '  ok    %-42s\n' "paginated arrays are merged" || { printf '  FAIL  paginated arrays exit=%s\n' "$code"; FAIL=1; }
+
 echo "deep-plan: check-citations.py string-matches quotes against git show"
 C="$DS/check-citations.py"; L="$DS/lint-claims.py"
 chk "citations: no file"               2 "usage"                python3 "$C"
@@ -144,7 +173,7 @@ chk "citations: wrong quote fails"     1 "quote not found"      python3 "$C" --r
 printf '| F-1 | [FACT] | oob | `f.txt:9-12@%s` "line two" |\n' "$SHA2" > "$TMP/ev-oob.md"
 chk "citations: out-of-range fails"    1 "out of range"         python3 "$C" --repo "$G2" "$TMP/ev-oob.md"
 printf '| F-1 | [FACT] | nosha | `f.txt:2-2@0123456789abcdef` "line two" |\n' > "$TMP/ev-nosha.md"
-chk "citations: unknown sha fails"     1 "not found at"         python3 "$C" --repo "$G2" "$TMP/ev-nosha.md"
+chk "citations: unknown sha fails"     1 "is not a commit"      python3 "$C" --repo "$G2" "$TMP/ev-nosha.md"
 printf '| F-1 | [FACT] | noquote | `f.txt:2-2@%s` |\n' "$SHA2" > "$TMP/ev-noq.md"
 chk "citations: missing quote fails"   1 "no verbatim"          python3 "$C" --repo "$G2" "$TMP/ev-noq.md"
 printf 'no citations here\n' > "$TMP/ev-empty.md"
@@ -152,6 +181,15 @@ chk "citations: zero citations fails"  1 "zero citations"       python3 "$C" --r
 chk "citations: --allow-empty"         0 "OK"                   python3 "$C" --repo "$G2" --allow-empty "$TMP/ev-empty.md"
 cp "$TMP/ev-ok.md" "$A/01-evidence.md"
 chk "citations: repo taken from meta.json" 0 "OK"               python3 "$C" "$A/01-evidence.md"
+# F-02: a citation must pin the run's base commit, not just any commit
+( cd "$G2" && echo extra >> f.txt && git commit -qam later )
+SHA_LATER=$(git -C "$G2" rev-parse HEAD)
+printf '| F-1 | [FACT] | later | `f.txt:2-2@%s` "line two" |\n' "$SHA_LATER" > "$TMP/ev-later.md"
+chk "citations: non-base sha rejected"  1 "base SHA"             python3 "$C" --repo "$G2" --base-sha "$SHA2" "$TMP/ev-later.md"
+chk "citations: base sha accepted"      0 "OK"                   python3 "$C" --repo "$G2" --base-sha "$SHA2" "$TMP/ev-ok.md"
+cp "$TMP/ev-later.md" "$A/01-evidence-later.md"
+chk "citations: base sha from meta.json" 1 "base SHA"            python3 "$C" "$A/01-evidence-later.md"
+rm -f "$A/01-evidence-later.md"
 # Live-run friction 2026-09-02: `.github/workflows/x.yml` could not be cited because the path
 # regex demanded a letter first. Dot-paths are ordinary repository paths.
 ( cd "$G2" && mkdir -p .github && printf 'name: ci\n' > .github/ci.yml && git add .github && git commit -qm dotpath )
@@ -180,7 +218,20 @@ chk "lint: FACT without citation"      1 "without path:lines@sha" python3 "$L" "
 printf '| V-1 | [VERIFIED] | ran it |\n' > "$TMP/l-ver.md"
 chk "lint: VERIFIED without cmd"       1 "without \`cmd:\`"     python3 "$L" "$TMP/l-ver.md"
 printf 'Decision: use the cache\n' > "$TMP/l-dec.md"
-chk "lint: decision without id"        1 "cites no evidence id" python3 "$L" "$TMP/l-dec.md"
+chk "lint: decision without id"        1 "cites no F-/V-"       python3 "$L" "$TMP/l-dec.md"
+# F-03: an evidence row without its tag, or with the wrong tag, fails
+printf '| F-1 | | handler drops jobs | `f.txt:1-1@%s` "line one" |\n' "$SHA2" > "$TMP/l-untagged.md"
+chk "lint: untagged evidence row"      1 "must carry exactly"   python3 "$L" "$TMP/l-untagged.md"
+printf '| V-1 | [FACT] | mislabelled | `f.txt:1-1@%s` "line one" |\n' "$SHA2" > "$TMP/l-mistag.md"
+chk "lint: mis-tagged evidence row"    1 "must carry exactly"   python3 "$L" "$TMP/l-mistag.md"
+# F-04: a decision resting only on an inference fails
+printf '| I-1 | [INFERENCE] | x | from: F-1 |\n| F-1 | [FACT] | y | `f.txt:1-1@%s` "line one" |\nDecision: use the cache (I-1)\n' "$SHA2" > "$TMP/l-infdec.md"
+chk "lint: decision on inference only" 1 "cites no F-/V-"       python3 "$L" "$TMP/l-infdec.md"
+printf '| F-1 | [FACT] | y | `f.txt:1-1@%s` "line one" |\nDecision: use the cache (F-1)\n' "$SHA2" > "$TMP/l-factdec.md"
+chk "lint: decision on a fact passes"  0 "OK"                   python3 "$L" "$TMP/l-factdec.md"
+# F-15: a table header cell is not a decision line
+printf '| Decision | Because |\n|---|---|\n| x | y |\n' > "$TMP/l-hdr.md"
+chk "lint: table header is not a decision" 0 "OK"               python3 "$L" "$TMP/l-hdr.md"
 printf 'Decision: use the cache (F-9)\n' > "$TMP/l-dang.md"
 chk "lint: dangling id"                1 "never defined"        python3 "$L" "$TMP/l-dang.md"
 printf '```\nthis should be ignored inside a fence\n```\n' > "$TMP/l-fence.md"
@@ -196,7 +247,7 @@ mkobj() { cat > "$1" <<JSON
  "root_causes":[{"id":"RC-1","explains":["request-1"],"cause_class":"absent_constraint","statement":"no limiter","evidence":["f.txt:2-2@$SHA2 \\"line two\\""]}],
  "designs":[{"id":"DS-1","one_sentence":"a","addresses":["RC-1"],"files":["f.txt"],"blast_radius":"1","reversibility":"yes","risks":"none","preferred":true},
             {"id":"DS-2","one_sentence":"b","addresses":["RC-1"],"files":["f.txt"],"blast_radius":"2","reversibility":"yes","risks":"none","preferred":false}],
- "single_pr_recommendation":{"verdict":"ONE_PR","because":"one cause"},
+ "single_pr_recommendation":{"verdict":"ONE_PR","because":"one cause (RC-1)"},
  "objections":$4,"changed_positions":[],"evidence_requests":[],
  "attestations":{"files_read":["f.txt"],"checks_performed":["git show -> ok","git grep -> 0","git log -> 1"],"adversarial_attempt":"$5"}}
 JSON
@@ -216,6 +267,32 @@ mkobj "$TMP/v-praise.json" 0 APPROVE '[]' "great plan, I agree"
 chk "verdict: praise language rejected" 1 "praise"              python3 "$V" --extract "$TMP/v-praise.json" --round 0
 mkobj "$TMP/v-badcite.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"MAJOR","claim":"c","evidence":["f.txt:2-2@'"$SHA2"' \"line nine\""],"proposed_change":"p","falsifier":"f"}]' "x"
 chk "verdict: fabricated citation caught" 1 "quote not found"   python3 "$V" --extract "$TMP/v-badcite.json" --round 0 --repo "$G2"
+# F-02: an unpinned path citation is not evidence
+mkobj "$TMP/v-unpinned.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"BLOCKER","claim":"c","evidence":["src/x.py:9999"],"proposed_change":"p","falsifier":"f"}]' "x"
+chk "verdict: unpinned citation rejected" 1 "no sha-pinned"     python3 "$V" --extract "$TMP/v-unpinned.json" --round 0
+# F-02: a citation to a commit other than the base is rejected
+mkobj "$TMP/v-later.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"MAJOR","claim":"c","evidence":["f.txt:2-2@'"$SHA_LATER"' \"line two\""],"proposed_change":"p","falsifier":"f"}]' "x"
+chk "verdict: non-base sha rejected"   1 "base SHA"             python3 "$V" --extract "$TMP/v-later.json" --round 0 --repo "$G2" --base-sha "$SHA2"
+# F-11: extensionless paths are ordinary paths
+mkobj "$TMP/v-noext.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"MAJOR","claim":"c","evidence":["Dockerfile:1-1@'"$SHA2"' \"FROM python\""],"proposed_change":"p","falsifier":"f"}]' "x"
+chk "verdict: extensionless path accepted" 0 "OK"               python3 "$V" --extract "$TMP/v-noext.json" --round 0 --repo "$G2" --base-sha "$SHA2"
+# F-13: praise words inside a quoted evidence line are not Codex's praise
+mkobj "$TMP/v-quote.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"MAJOR","claim":"c","evidence":["cmd: grep great -> a great line"],"proposed_change":"p","falsifier":"f"}]' "x"
+chk "verdict: praise inside evidence ignored" 0 "OK"            python3 "$V" --extract "$TMP/v-quote.json" --round 0
+# F-05: empty design objects, two preferred designs, unknown root-cause references
+python3 - "$TMP/v-ok.json" "$TMP/v-empty.json" "$TMP/v-twopref.json" "$TMP/v-badref.json" <<'PY2'
+import json,sys
+v=json.load(open(sys.argv[1])); v["objections"]=[]; v["verdict"]="REJECT"
+e=dict(v); e["designs"]=[{},{}]; json.dump(e,open(sys.argv[2],"w"))
+t=json.loads(json.dumps(v)); t["designs"][1]["preferred"]=True; json.dump(t,open(sys.argv[3],"w"))
+b=json.loads(json.dumps(v)); b["designs"][0]["addresses"]=["RC-9"]; json.dump(b,open(sys.argv[4],"w"))
+PY2
+chk "verdict: empty designs rejected"  1 "design without an id" python3 "$V" --extract "$TMP/v-empty.json" --round 0
+chk "verdict: two preferred designs"   1 "exactly one design"   python3 "$V" --extract "$TMP/v-twopref.json" --round 0
+chk "verdict: unknown root cause ref"  1 "unknown root cause"   python3 "$V" --extract "$TMP/v-badref.json" --round 0
+# F-06: round 1 must resolve round-0 objections
+mkobj "$TMP/v-r1-none.json" 1 APPROVE '[]' "x"
+chk "verdict: round 1 must resolve r0" 1 "must resolve every prior" python3 "$V" --extract "$TMP/v-r1-none.json" --round 1 --prior "$TMP/v-hyp.json"
 printf 'no json here\n' > "$TMP/v-none.txt"
 chk "verdict: no JSON block"           1 "no parseable JSON"    python3 "$V" --extract "$TMP/v-none.txt" --round 0
 mkobj "$TMP/v-r1.json" 1 REJECT '[{"id":"X-1","class":"SCOPE","severity":"MINOR","claim":"c","evidence":["cmd: git grep x -> 0 hits"],"proposed_change":"p","falsifier":"f"}]' "x"
@@ -284,6 +361,19 @@ json.dump(v,open(sys.argv[1],"w"))
 PY2
 out=$(python3 "$DSY" --art "$A" 2>&1)
 printf '%s' "$out" | grep -q 'OPEN_MAJORS: X-1: brand new claim' && printf '  ok    %-42s\n' "re-used objection id shows latest claim" || { printf '  FAIL  id reuse: %s\n' "$out"; FAIL=1; }
+# F-07: a withdrawn objection stays withdrawn when a later round does not repeat it
+A7="$TMP/art7"; mkdir -p "$A7/debate"; echo '{"rounds":3}' > "$A7/meta.json"
+mkobj "$A7/debate/r0-codex.json" 0 REJECT '[{"id":"X-1","class":"SCOPE","severity":"MAJOR","claim":"old","evidence":["cmd: a -> b"],"proposed_change":"p","falsifier":"f"},{"id":"X-2","class":"TEST_GAP","severity":"MAJOR","claim":"c2","evidence":["cmd: a -> b"],"proposed_change":"p","falsifier":"f"}]' "x"
+python3 - "$A7/debate/r0-codex.json" "$A7/debate/r1-codex.json" "$A7/debate/r2-codex.json" <<'PY2'
+import json,sys
+v=json.load(open(sys.argv[1])); v["objections"]=[]; v["round"]=1; v["verdict"]="REJECT"
+v["objection_resolutions"]=[{"id":"X-1","status":"WITHDRAWN","because":"F-1"},{"id":"X-2","status":"SUSTAINED","because":"F-2"}]; json.dump(v,open(sys.argv[2],"w"))
+v["round"]=2; v["verdict"]="APPROVE"; v["objection_resolutions"]=[{"id":"X-2","status":"WITHDRAWN","because":"F-3"}]; json.dump(v,open(sys.argv[3],"w"))
+PY2
+out=$(python3 "$DSY" --art "$A7" 2>&1)
+printf '%s' "$out" | grep -q 'OPEN_MAJORS: none' && printf '%s' "$out" | grep -q 'termination=T1' && printf '  ok    %-42s\n' "withdrawn objection stays withdrawn (T1)" || { printf '  FAIL  withdrawn state: %s\n' "$out"; FAIL=1; }
+# F-Q1: build-prompt refuses a round beyond the run's cap
+chk "prompt: round beyond cap refused" 2 "exceeds the run"      bash "$BP" --art "$A" --round 3
 
 echo
 [ $FAIL -eq 0 ] && { echo "ALL ARGUMENT AND BUILDER TESTS PASSED"; exit 0; } || { echo "TESTS FAILED"; exit 1; }

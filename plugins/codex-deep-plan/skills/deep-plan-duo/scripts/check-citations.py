@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""check-citations.py — every `path:lines@sha` citation must resolve at that SHA AND the
-verbatim quote that follows it must appear inside the cited line range.
+"""check-citations.py — every `path:lines@sha` citation must resolve at that SHA, that SHA must
+be the run's base commit, AND the verbatim quote that follows must appear inside the cited range.
 
-usage: check-citations.py [--repo <path>] [--allow-empty] <file>...
+usage: check-citations.py [--repo <path>] [--base-sha <sha>] [--allow-empty] <file>...
 
-This is what turns "no assumptions" into a constraint: a citation without a SHA drifts,
-a citation without a quote cannot be checked, and a quote that is not in the range is a
-fabrication. Exit 0 = all citations verified, 1 = at least one failure (or zero
-citations without --allow-empty), 2 = usage error.
+--repo and --base-sha default to the run's meta.json (beside the file or one level up).
+Exit 0 = all citations verified, 1 = at least one failure (or zero citations without
+--allow-empty), 2 = usage error.
 """
 import json, os, re, subprocess, sys, unicodedata
 
-CITE = re.compile(r"`?(?P<path>[A-Za-z_.][\w./\-]*):(?P<a>\d+)(?:-(?P<b>\d+))?@(?P<sha>[0-9a-f]{7,40})`?")
+sys.dont_write_bytecode = True   # never write __pycache__ into the plugin (validator check 5, review F-14)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from duo_common import CITE_RE  # noqa: E402
+
 QUOTE = re.compile(r'"([^"\n]{3,300})"')
 MAX_WORDS = 15
 
@@ -20,7 +22,7 @@ def norm(s):
     return re.sub(r"\s+", " ", unicodedata.normalize("NFKC", s)).strip().lower()
 
 
-_cache = {}
+_cache, _resolved = {}, {}
 
 
 def blob(repo, sha, path):
@@ -31,33 +33,51 @@ def blob(repo, sha, path):
     return _cache[key]
 
 
-def repo_for(path, explicit):
-    """--repo wins; else meta.json beside the file or one level up; else the cwd's repo."""
-    if explicit:
-        return explicit
+def resolve(repo, sha):
+    key = (repo, sha)
+    if key not in _resolved:
+        r = subprocess.run(["git", "-C", repo, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"], capture_output=True, text=True)
+        _resolved[key] = r.stdout.strip() if r.returncode == 0 else None
+    return _resolved[key]
+
+
+def meta_for(path):
     d = os.path.dirname(os.path.abspath(path))
     for cand in (d, os.path.dirname(d)):
         m = os.path.join(cand, "meta.json")
         if os.path.isfile(m):
             try:
-                return json.load(open(m, encoding="utf-8"))["repo"]
+                return json.load(open(m, encoding="utf-8"))
             except Exception:
                 pass
+    return {}
+
+
+def repo_for(path, explicit):
+    if explicit:
+        return explicit
+    m = meta_for(path)
+    if m.get("repo"):
+        return m["repo"]
     r = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
     return r.stdout.strip() if r.returncode == 0 else os.getcwd()
 
 
+def base_for(path, explicit, repo_explicit):
+    """Explicit --base-sha wins; else meta.json's base_sha; else none (only when --repo was explicit)."""
+    if explicit:
+        return explicit
+    return meta_for(path).get("base_sha")
+
+
 def candidates(line, start):
     """Quote candidates after a citation. A quoted line of code may itself contain double
-    quotes (`note ok "no machine-specific paths"`), so besides the shortest "..." we also try
-    the greedy span to the last quote on the line, each with \\" unescaped. Live-run friction,
-    2026-09-02."""
+    quotes (`note ok "no machine-specific paths"`), so when more than one pair follows the
+    citation the intended quote is the whole span; the shortest pair would match trivially."""
     out = []
     tail = line[start:]
     nq = tail.count('"')
     if nq > 2:
-        # More than one pair after the citation: the author quoted a line that contains quotes.
-        # The intended quote is the whole span; the shortest pair would match trivially.
         out.append(tail[tail.find('"') + 1:tail.rfind('"')])
     else:
         q = QUOTE.search(tail) or QUOTE.search(line)
@@ -71,13 +91,20 @@ def candidates(line, start):
     return uniq
 
 
-def check_line(repo, where, line):
+def check_line(repo, base, where, line):
     """Return (checked, failures) for one text line."""
     fails, n = [], 0
-    for m in CITE.finditer(line):
+    for m in CITE_RE.finditer(line):
         n += 1
-        lines = blob(repo, m["sha"], m["path"])
         a, b = int(m["a"]), int(m["b"] or m["a"])
+        full = resolve(repo, m["sha"])
+        if full is None:
+            fails.append(f"{where}: {m['sha']} is not a commit in {repo}"); continue
+        if base:
+            base_full = resolve(repo, base) or base
+            if full != base_full:
+                fails.append(f"{where}: {m['path']}:{a}-{b} cites {m['sha'][:12]}, but the run's base SHA is {base_full[:12]} — cite the base commit"); continue
+        lines = blob(repo, m["sha"], m["path"])
         if lines is None:
             fails.append(f"{where}: {m['path']} not found at {m['sha']} (git show failed)"); continue
         if a < 1 or b > len(lines) or a > b:
@@ -95,28 +122,33 @@ def check_line(repo, where, line):
 
 
 def main(argv):
-    repo, allow_empty, paths = None, False, []
+    repo, base, allow_empty, paths = None, None, False, []
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a == "--repo":
+        if a in ("--repo", "--base-sha"):
             if i + 1 >= len(argv) or argv[i + 1].startswith("-"):
-                print("check-citations.py: --repo requires a value", file=sys.stderr); return 2
-            repo = argv[i + 1]; i += 2; continue
+                print(f"check-citations.py: {a} requires a value", file=sys.stderr); return 2
+            if a == "--repo":
+                repo = argv[i + 1]
+            else:
+                base = argv[i + 1]
+            i += 2; continue
         if a == "--allow-empty":
             allow_empty = True; i += 1; continue
         if a.startswith("-"):
             print(f"check-citations.py: unknown arg {a}", file=sys.stderr); return 2
         paths.append(a); i += 1
     if not paths:
-        print(__doc__.strip().splitlines()[3], file=sys.stderr); return 2
+        print("usage: check-citations.py [--repo <path>] [--base-sha <sha>] [--allow-empty] <file>...", file=sys.stderr); return 2
     fails, checked = [], 0
     for f in paths:
         if not os.path.isfile(f):
             print(f"check-citations.py: not a file: {f}", file=sys.stderr); return 2
         r = repo_for(f, repo)
+        b = base_for(f, base, repo)
         for i, line in enumerate(open(f, encoding="utf-8", errors="replace"), 1):
-            n, ff = check_line(r, f"{f}:{i}", line)
+            n, ff = check_line(r, b, f"{f}:{i}", line)
             checked += n; fails.extend(ff)
     print(f"checked {checked} citation(s) in {len(paths)} file(s)")
     if fails:

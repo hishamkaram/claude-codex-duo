@@ -60,9 +60,9 @@ while IFS= read -r s; do
 done < <(find plugins scripts -name '*.sh' | sort)
 while IFS= read -r s; do
   [ -x "$s" ] || note FAIL "$s is not executable"
-  python3 -m py_compile "$s" 2>/dev/null && note ok "$s" || note FAIL "$s has a python syntax error"
+  # ast.parse, not py_compile: the validator must not write __pycache__ into the tree it validates.
+  python3 -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' "$s" 2>/dev/null && note ok "$s" || note FAIL "$s has a python syntax error"
 done < <(find plugins -name '*.py' | sort)
-rm -rf plugins/*/skills/*/scripts/__pycache__
 
 echo "4b. Every plugin ships the same monitored runner"
 REF=plugins/codex-pr-review/scripts/codex-run.sh

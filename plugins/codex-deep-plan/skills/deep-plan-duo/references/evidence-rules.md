@@ -10,13 +10,15 @@
 | `[UNKNOWN]` | Not established | a row in the unknowns register |
 
 Ids: `F-` facts, `V-` verified, `I-` inferences, `U-` unknowns, `R-` risks. Define each id once as a
-table row (`| F-3 | ...`); reference it anywhere. `lint-claims.py` fails on a referenced id that was
+table row (`| F-3 | [FACT] | ...`) carrying exactly the tag its letter implies; reference it anywhere.
+A decision line cites an `F-` or `V-` id; an `I-`/`U-` id alone is not support. `lint-claims.py` fails on a referenced id that was
 never defined, and `check-citations.py` resolves every `path:lines@sha` with `git show` and
 string-matches the quote against the cited range. Both must exit 0 before Phase 2.
 
 ## Hard rules
 
-1. Citations pin the base SHA from `meta.json`. Never cite a line you have not read this run.
+1. Citations pin the base SHA from `meta.json`; `check-citations.py` rejects any other commit. Never
+   cite a line you have not read this run.
 2. Quotes are verbatim and at most 15 words: long enough to be unique, short enough to match.
 3. Comments and docs are evidence about intent, not behaviour. Verify behaviour separately.
 4. Your memory of a library's semantics is `[INFERENCE]`. Promote it by citing the vendored source,
@@ -52,6 +54,7 @@ CONFIRMED / REFUTED / INDETERMINATE with its own citations; record those as `F-`
 
 | id | Question | Why it matters | Blocking? | How to resolve | Owner |
 |---|---|---|---|---|---|
+| U-1 | [UNKNOWN] ... | ... | no | ... | |
 
 `Blocking? = yes` means the design choice changes with the answer. Phase 8 cannot write `PLAN.md`
 while a blocking unknown is open; it writes `DECISION-REQUIRED.md` instead.

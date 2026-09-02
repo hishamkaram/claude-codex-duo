@@ -44,7 +44,7 @@ These plugins make the second model useful by forcing structure around it:
 - **Blind first pass.** Codex forms its view from the code alone; it is never told another reviewer exists.
 - **Every claim is checked.** Agreement between the two models is not evidence. Every finding of severity P0 to P3 is verified against the code, whoever raised it.
 - **Written trail.** Every phase writes an artifact. The verdict follows from the ledger and a fixed policy, not from whoever spoke last.
-- **Nothing is touched.** Both plugins are strictly read-only, including when reviewing uncommitted work.
+- **Nothing is touched.** All plugins are strictly read-only, including when reviewing uncommitted work.
 
 ## What is in the box
 
@@ -61,7 +61,7 @@ All plugins also trigger from plain language ("review PR 123 with Codex", "debat
 | Requirement | Notes |
 |---|---|
 | Claude Code | With plugins enabled |
-| OpenAI Codex plugin | `claude plugin install codex@openai-codex`, then `/codex:setup` and log in. Both plugins drive Codex through that plugin's companion script in its read-only sandbox. |
+| OpenAI Codex plugin | `claude plugin install codex@openai-codex`, then `/codex:setup` and log in. All plugins drive Codex through that plugin's companion script in its read-only sandbox. |
 | `git`, `python3`, `node` | Standard tooling; macOS and Linux |
 | `gh` (deep-plan only) | Fetches issues, PRs and comments verbatim. Without it, paste the text with `--request-file`. |
 
@@ -255,7 +255,7 @@ Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at th
 
 **Does the debate plugin need the review plugin?** No. It debates any motion. `--seed` is an optional way to import a review's verification record.
 
-**Can I use a Claude subagent instead of Codex?** No. Both plugins refuse to simulate the second model; a same-model second opinion is exactly the failure mode they exist to avoid.
+**Can I use a Claude subagent instead of Codex?** No. All plugins refuse to simulate the second model; a same-model second opinion is exactly the failure mode they exist to avoid.
 
 **Why does the deep plan run outside plan mode and only enter it at the end?** Plan mode blocks every write except the plan file, and the skill has to write artifacts, run linters and launch 10–30 minute Codex jobs. It finishes the work, then enters plan mode with `PLAN.md` verbatim so you approve the same document that carries the evidence.
 

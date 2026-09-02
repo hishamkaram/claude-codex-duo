@@ -27,7 +27,8 @@ while [ $# -gt 0 ]; do
     --rounds) need "$@"; ROUNDS="$2"; shift;;
     --solo) SOLO=true;;
     --parse-only) PARSE_ONLY=true;;
-    --issue|--pr|--comment|--request|--request-file) need "$@"; PAIRS+=("${1#--}" "$2"); shift;;
+    --request) [ $# -ge 2 ] || die2 "--request requires a value"; PAIRS+=("request" "$2"); shift;;   # free text may begin with "-"
+    --issue|--pr|--comment|--request-file) need "$@"; PAIRS+=("${1#--}" "$2"); shift;;
     *) die2 "unknown arg $1";;
   esac; shift
 done
@@ -43,10 +44,11 @@ else
   [ -d "$REPO" ] || die2 "--repo is not a directory: $REPO"
   git -C "$REPO" rev-parse --show-toplevel >/dev/null 2>&1 || die2 "--repo is not a git repository: $REPO"
   REPO="$(cd "$REPO" && pwd -P)"
-  mkdir -p "$OUT" || die2 "cannot create --out: $OUT"
-  OUTP="$(cd "$OUT" && pwd -P)"
+  # Resolve --out WITHOUT creating it: a refused path must leave no directory behind (review finding F-01).
+  OUTP="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$OUT")"
   case "$OUTP" in "$REPO"/*|"$REPO") echo "refusing: --out must be outside the repository (the working tree must stay untouched)" >&2; exit 2;; esac
   [ -e "$OUTP/meta.json" ] && die2 "--out already holds a run (meta.json exists): $OUTP"
+  mkdir -p "$OUTP" || die2 "cannot create --out: $OUT"
   i=0; while [ $i -lt ${#PAIRS[@]} ]; do
     if [ "${PAIRS[$i]}" = "request-file" ]; then [ -r "${PAIRS[$((i+1))]}" ] || die2 "--request-file not readable: ${PAIRS[$((i+1))]}"; fi
     i=$((i+2))
@@ -82,17 +84,16 @@ def parse(kind, value):
         if not m or not frag:
             die(f"--comment must be a github.com issue/PR URL with a #issuecomment-, #discussion_r or #pullrequestreview- fragment (got {value!r})", 2)
         ref = {"kind": "comment", "owner": m["owner"], "repo": m["repo"], "number": int(m["number"]), "url": v}
-        if frag.startswith("issuecomment-"):
-            ref.update(comment_kind="issue_comment", comment_id=int(frag[len("issuecomment-"):]),
-                       api=f"repos/{m['owner']}/{m['repo']}/issues/comments/{frag[len('issuecomment-'):]}")
-        elif frag.startswith("discussion_r"):
-            ref.update(comment_kind="review_comment", comment_id=int(frag[len("discussion_r"):]),
-                       api=f"repos/{m['owner']}/{m['repo']}/pulls/comments/{frag[len('discussion_r'):]}")
-        elif frag.startswith("pullrequestreview-"):
-            ref.update(comment_kind="review", comment_id=int(frag[len("pullrequestreview-"):]),
-                       api=f"repos/{m['owner']}/{m['repo']}/pulls/{m['number']}/reviews/{frag[len('pullrequestreview-'):]}")
+        fm = re.fullmatch(r"(issuecomment-|discussion_r|pullrequestreview-)(\d+)", frag)
+        if not fm:
+            die(f"--comment fragment must be #issuecomment-<digits>, #discussion_r<digits> or #pullrequestreview-<digits> (got #{frag})", 2)
+        prefix, cid = fm.group(1), int(fm.group(2))
+        if prefix == "issuecomment-":
+            ref.update(comment_kind="issue_comment", comment_id=cid, api=f"repos/{m['owner']}/{m['repo']}/issues/comments/{cid}")
+        elif prefix == "discussion_r":
+            ref.update(comment_kind="review_comment", comment_id=cid, api=f"repos/{m['owner']}/{m['repo']}/pulls/comments/{cid}")
         else:
-            die(f"--comment fragment not recognised: #{frag}", 2)
+            ref.update(comment_kind="review", comment_id=cid, api=f"repos/{m['owner']}/{m['repo']}/pulls/{m['number']}/reviews/{cid}")
         return ref
     return {"kind": kind, "value": value}
 
@@ -116,8 +117,23 @@ def gh_json(args):
         return None, err
     try:
         return json.loads(out), None
+    except json.JSONDecodeError:
+        pass
+    # Older gh printed one JSON document per page under --paginate; concatenate them.
+    docs, pos, dec = [], 0, json.JSONDecoder()
+    try:
+        while pos < len(out):
+            while pos < len(out) and out[pos].isspace():
+                pos += 1
+            if pos >= len(out):
+                break
+            d, pos = dec.raw_decode(out, pos)
+            docs.append(d)
     except json.JSONDecodeError as e:
         return None, f"gh returned non-JSON: {e}"
+    if all(isinstance(d, list) for d in docs):
+        return [x for d in docs for x in d], None
+    return docs, None
 
 
 def shutil_which(x):
@@ -199,11 +215,12 @@ branch, _ = run(["git", "-C", repo, "rev-parse", "--abbrev-ref", "HEAD"])
 if sha is None:
     die("cannot resolve HEAD in --repo (empty repository?)", 2)
 sha, branch = sha.strip(), (branch or "").strip()
-dirty = subprocess.run(["git", "-C", repo, "diff", "--quiet"]).returncode != 0 or \
-        subprocess.run(["git", "-C", repo, "diff", "--cached", "--quiet"]).returncode != 0
+baseline = subprocess.run(["git", "-C", repo, "--no-optional-locks", "status", "--porcelain=v1", "-z",
+                           "--untracked-files=all", "--ignore-submodules=none"], capture_output=True).stdout
 with open(os.path.join(out, "00-scope.md.baseline"), "wb") as f:
-    f.write(subprocess.run(["git", "-C", repo, "--no-optional-locks", "status", "--porcelain=v1", "-z",
-                            "--untracked-files=all", "--ignore-submodules=none"], capture_output=True).stdout)
+    f.write(baseline)
+# dirty = anything the baseline lists, untracked files included: such a file cannot be cited at the pinned SHA.
+dirty = len(baseline.strip(b"\0")) > 0
 
 records, failures, req_n = [], [], 0
 owner_repo_cache = {}
@@ -282,7 +299,7 @@ print(f"ART={out}")
 for r in records:
     print(f"input {r['kind']}-{r['id']} -> {r['file']}")
 if dirty:
-    print("WARNING: dirty working tree — citations pin HEAD, and uncommitted edits are not at that SHA")
+    print("WARNING: dirty working tree (tracked edits or untracked files) — citations pin HEAD, and uncommitted content is not at that SHA")
 if failures:
     print("FETCH FAILED for %d input(s):" % len(failures), file=sys.stderr)
     for f in failures:

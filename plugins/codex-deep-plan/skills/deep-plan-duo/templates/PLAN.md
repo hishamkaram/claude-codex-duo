@@ -55,7 +55,7 @@ Decision: {{DS-n}} because {{F-/V- ids}}.
 
 | id | Question | Why it matters | Blocking? | How to resolve |
 |---|---|---|---|---|
-| U-1 | {{...}} | {{...}} | no | {{...}} |
+| U-1 | [UNKNOWN] {{question}} | {{...}} | no | {{...}} |
 
 ## 9. Debate closure
 

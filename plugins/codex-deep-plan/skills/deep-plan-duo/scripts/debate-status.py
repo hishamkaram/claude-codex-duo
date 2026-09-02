@@ -5,14 +5,19 @@ caller never has to read a raw Codex transcript to decide what happens next.
 usage: debate-status.py --art <artifact-dir>
 
 Reads debate/r<n>-codex.json (validated verdicts), meta.json (round cap) and
-05-disagreements.md (the caller's side of the ledger). Prints the termination condition
-reached, if any: T1 converged · T2 round cap · T3 no new information for two rounds ·
-T4 a BLOCKER whose falsifier needs a human decision. T5 (Codex unavailable) is decided by
-the runner's exit code, not here. Exit 0 always unless usage (2) or no rounds (1).
+05-disagreements.md (the caller's side of the ledger). Objection state is folded
+cumulatively across rounds (duo_common.fold): a WITHDRAWN objection stays withdrawn unless
+re-raised. Prints the termination condition reached, if any: T1 converged · T2 round cap ·
+T3 no new information for two rounds · T4 a BLOCKER whose falsifier needs a human decision.
+T5 (Codex unavailable) is decided by the runner's exit code, not here.
+Exit 0 always unless usage (2) or no rounds (1).
 """
-import glob, json, os, re, sys
+import json, os, re, sys
 
-CITE = re.compile(r"[A-Za-z_.][\w./\-]*:\d+(-\d+)?(@[0-9a-f]{7,40})?")
+sys.dont_write_bytecode = True   # never write __pycache__ into the plugin (validator check 5, review F-14)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from duo_common import CITE_RE, load_rounds, fold, outstanding  # noqa: E402
+
 HUMAN = re.compile(r"\b(human|product|business|stakeholder|owner)\b.*\b(decide|decision|choose|choice|prefer)\b|"
                    r"\b(decide|decision|choose|choice)\b.*\b(human|product|business|stakeholder|owner)\b", re.I)
 
@@ -21,29 +26,19 @@ def norm(s):
     return re.sub(r"\W+", " ", str(s)).strip().lower()
 
 
-def load_rounds(art):
-    rounds = {}
-    for f in glob.glob(os.path.join(art, "debate", "r*-codex.json")):
-        m = re.search(r"r(\d+)-codex\.json$", f)
-        if m:
-            rounds[int(m.group(1))] = json.load(open(f, encoding="utf-8"))
-    return dict(sorted(rounds.items()))
-
-
 def citations(v):
     out = set()
     for o in v.get("objections") or []:
         for x in o.get("evidence") or []:
-            out.update(c.group(0) for c in CITE.finditer(str(x)))
+            out.update(c.group(0) for c in CITE_RE.finditer(str(x)))
     for rc in v.get("root_causes") or []:
         for x in rc.get("evidence") or []:
-            out.update(c.group(0) for c in CITE.finditer(str(x)))
+            out.update(c.group(0) for c in CITE_RE.finditer(str(x)))
     return out
 
 
 def open_ledger_rows(art):
-    """Rows of 05-disagreements.md whose status column is OPEN. Format is documented in
-    references/debate-protocol.md: | D-nn | ... | <verdict> | <status> | ..."""
+    """Rows of 05-disagreements.md whose status column is OPEN (format in references/debate-protocol.md)."""
     f = os.path.join(art, "05-disagreements.md")
     if not os.path.isfile(f):
         return None
@@ -70,10 +65,10 @@ def main(argv):
         meta = json.load(open(mp, encoding="utf-8"))
     cap = int(meta.get("rounds") or 2)
 
+    # New-information streak: a round adds information if it raises a new claim, a new class,
+    # a new citation, or records a changed position.
     prev_claims, prev_classes, prev_cites = set(), set(), set()
-    streak = 0
-    latest_n, latest = max(rounds), rounds[max(rounds)]
-    per_round = []
+    streak, per_round = 0, []
     for n, v in rounds.items():
         objs = v.get("objections") or []
         claims = {norm(o.get("claim")) for o in objs}
@@ -88,23 +83,8 @@ def main(argv):
         prev_claims |= claims; prev_classes |= classes; prev_cites |= cites
 
     n, v, new_objs, changed, new_info = per_round[-1]
-    resolved = {r.get("id"): r.get("status") for r in v.get("objection_resolutions") or []}
-    # Objections raised in the latest round are open; earlier ones are open unless withdrawn there.
-    # Codex may reuse an id in a later round for a new claim (observed 2026-09-02): the latest
-    # round's text for an id wins, and an id raised again in the latest round is open regardless
-    # of how its earlier incarnation was resolved.
-    latest = {}
-    for m, pv, _, _, _ in per_round:
-        for o in pv.get("objections") or []:
-            latest[o.get("id")] = (m, o)
-    open_objs = []
-    for oid, (m, o) in latest.items():
-        st = resolved.get(oid)
-        if m == n or st in (None, "SUSTAINED", "DOWNGRADED"):
-            sev = o.get("severity")
-            if m != n and st == "DOWNGRADED":
-                sev = next((r.get("severity") for r in v.get("objection_resolutions") or [] if r.get("id") == oid), sev) or sev
-            open_objs.append((oid, sev, o.get("claim", ""), o.get("falsifier", "")))
+    state = outstanding(fold(rounds))
+    open_objs = [(oid, s["severity"], s["obj"].get("claim", ""), s["obj"].get("falsifier", "")) for oid, s in state.items()]
     blockers = [r for r in open_objs if r[1] == "BLOCKER"]
     majors = [r for r in open_objs if r[1] == "MAJOR"]
     ledger_open = open_ledger_rows(art)
