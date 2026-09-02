@@ -1,7 +1,9 @@
 {
   "name": "claude-codex-duo",
-  "description": "Claude Code + OpenAI Codex working as a pair: blind cross-model PR review and structured adversarial debate.",
-  "owner": { "name": "Hesham Karm" },
+  "description": "Claude Code + OpenAI Codex working as a pair: blind cross-model PR review, structured adversarial debate, and evidence-only deep planning.",
+  "owner": {
+    "name": "Hesham Karm"
+  },
   "plugins": [
     {
       "name": "codex-pr-review",
@@ -9,7 +11,11 @@
       "source": "./plugins/codex-pr-review",
       "version": "1.0.5",
       "category": "code-review",
-      "tags": ["code-review", "codex", "pr-review"]
+      "tags": [
+        "code-review",
+        "codex",
+        "pr-review"
+      ]
     },
     {
       "name": "codex-debate",
@@ -17,7 +23,24 @@
       "source": "./plugins/codex-debate",
       "version": "1.0.5",
       "category": "productivity",
-      "tags": ["debate", "codex", "decision"]
+      "tags": [
+        "debate",
+        "codex",
+        "decision"
+      ]
+    },
+    {
+      "name": "codex-deep-plan",
+      "description": "Evidence-only deep planning for issues, PR comments, or a request, with a blind Codex second opinion and a bounded debate, ending in one reviewed PR plan.",
+      "source": "./plugins/codex-deep-plan",
+      "version": "1.0.0",
+      "category": "planning",
+      "tags": [
+        "planning",
+        "codex",
+        "root-cause",
+        "issues"
+      ]
     }
   ]
 }

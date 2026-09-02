@@ -58,18 +58,31 @@ while IFS= read -r s; do
   [ -x "$s" ] || note FAIL "$s is not executable"
   bash -n "$s" 2>/dev/null && note ok "$s" || note FAIL "$s has a bash syntax error"
 done < <(find plugins scripts -name '*.sh' | sort)
+while IFS= read -r s; do
+  [ -x "$s" ] || note FAIL "$s is not executable"
+  python3 -m py_compile "$s" 2>/dev/null && note ok "$s" || note FAIL "$s has a python syntax error"
+done < <(find plugins -name '*.py' | sort)
+rm -rf plugins/*/skills/*/scripts/__pycache__
+
+echo "4b. Every plugin ships the same monitored runner"
+REF=plugins/codex-pr-review/scripts/codex-run.sh
+for r in plugins/*/scripts/codex-run.sh; do
+  [ "$r" = "$REF" ] && continue
+  cmp -s "$REF" "$r" && note ok "$r identical to $REF" || note FAIL "$r differs from $REF (the runner is shared by copy; keep the copies byte-identical)"
+done
 
 echo "5. No absolute or home-relative paths leak into shipped files"
 if grep -rn '~/\.claude/skills/\|~/\.claude/scripts/\|/Users/' plugins >/dev/null 2>&1; then
   grep -rn '~/\.claude/skills/\|~/\.claude/scripts/\|/Users/' plugins | sed 's/^/  FAIL    /'; FAIL=1
 else note ok "no machine-specific paths"; fi
 
-echo "6. Every runner exit code is documented in both skills and the README"
+echo "6. Every runner exit code is documented in every skill and the README"
 CODES=$(grep -oE 'RC=[0-9]|exit [0-9]' plugins/codex-pr-review/scripts/codex-run.sh | grep -oE '[0-9]' | sort -u)
 for c in $CODES; do
   miss=""
   grep -q "^| $c |" plugins/codex-pr-review/skills/two-model-pr-review/references/codex-protocol.md || miss="$miss codex-protocol.md"
   grep -q "^| $c |" plugins/codex-debate/skills/codex-debate/references/codex-invocation.md || miss="$miss codex-invocation.md"
+  grep -q "^| $c |" plugins/codex-deep-plan/skills/deep-plan-duo/references/codex-invocation.md || miss="$miss deep-plan-duo/codex-invocation.md"
   grep -q "\`$c\`" README.md || miss="$miss README.md"
   [ -z "$miss" ] && note ok "exit $c documented" || note FAIL "exit $c undocumented in:$miss"
 done

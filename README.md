@@ -2,7 +2,7 @@
 
 # claude-codex-duo
 
-**Claude Code and OpenAI Codex as an adversarial pair: blind two-model code review and structured debate, with evidence on disk.**
+**Claude Code and OpenAI Codex as an adversarial pair: blind two-model code review, structured debate, and evidence-only deep planning, with evidence on disk.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Claude Code plugins](https://img.shields.io/badge/Claude%20Code-plugins-7c3aed)](https://docs.anthropic.com/en/docs/claude-code)
@@ -23,6 +23,7 @@
 - [How it works](#how-it-works)
   - [codex-pr-review](#codex-pr-review)
   - [codex-debate](#codex-debate)
+  - [codex-deep-plan](#codex-deep-plan)
   - [Reviewing uncommitted changes](#reviewing-uncommitted-changes)
   - [The monitored runner](#the-monitored-runner)
 - [Artifacts](#artifacts)
@@ -51,8 +52,9 @@ These plugins make the second model useful by forcing structure around it:
 |---|---|---|
 | **codex-pr-review** | Two-model code review of a PR, branch, commit range, or uncommitted local changes. Ends in exactly one merge decision. | `/codex-pr-review:review-pr <target> <base> "<intent>"` |
 | **codex-debate** | Adversarial debate on any falsifiable motion or choice between named options: architecture decisions, migration plans, root-cause hypotheses, disputed review findings. | `/codex-debate:debate "<motion>" <mode> <rounds> [--seed <file>]` |
+| **codex-deep-plan** | Evidence-only planning for GitHub issues, PR review comments, a single comment, or a plain request: cited facts, root causes, real fixes scored against workarounds, a blind Codex diagnosis and a bounded debate. Ends in one PR plan handed to Claude Code plan mode. | `/codex-deep-plan:plan <issues \| pr N \| comment-url \| "request">... [--rounds N] [--solo]` |
 
-Both plugins also trigger from plain language ("review PR 123 with Codex", "debate with Codex whether ...").
+All plugins also trigger from plain language ("review PR 123 with Codex", "debate with Codex whether ...", "plan a real fix for issues 12 and 13, no assumptions, and get Codex's take").
 
 ## Prerequisites
 
@@ -61,8 +63,9 @@ Both plugins also trigger from plain language ("review PR 123 with Codex", "deba
 | Claude Code | With plugins enabled |
 | OpenAI Codex plugin | `claude plugin install codex@openai-codex`, then `/codex:setup` and log in. Both plugins drive Codex through that plugin's companion script in its read-only sandbox. |
 | `git`, `python3`, `node` | Standard tooling; macOS and Linux |
+| `gh` (deep-plan only) | Fetches issues, PRs and comments verbatim. Without it, paste the text with `--request-file`. |
 
-Sending repository content to Codex means sending it to OpenAI. Both plugins ask for confirmation that this is permitted for the repository before the first Codex call.
+Sending repository content to Codex means sending it to OpenAI. All plugins ask for confirmation that this is permitted for the repository before the first Codex call.
 
 ## Installation
 
@@ -70,9 +73,10 @@ Sending repository content to Codex means sending it to OpenAI. Both plugins ask
 claude plugin marketplace add hishamkaram/claude-codex-duo
 claude plugin install codex-pr-review@claude-codex-duo --scope user
 claude plugin install codex-debate@claude-codex-duo --scope user
+claude plugin install codex-deep-plan@claude-codex-duo --scope user
 ```
 
-Install only the one you need; each plugin is standalone.
+Install only the ones you need; each plugin is standalone.
 
 Update later:
 
@@ -80,6 +84,7 @@ Update later:
 claude plugin marketplace update claude-codex-duo
 claude plugin update codex-pr-review@claude-codex-duo
 claude plugin update codex-debate@claude-codex-duo
+claude plugin update codex-deep-plan@claude-codex-duo
 ```
 
 ## Quick start
@@ -106,6 +111,16 @@ claude plugin update codex-debate@claude-codex-duo
 # Debate a disputed review finding, seeded with the review's verification record
 /codex-debate:debate "F-01 stale replay is P1, not P2" hypothesis 2 \
   --seed /tmp/two-model-pr-review/<repo>/<run>/04-verification.md
+
+# Plan one PR for three issues; a split is recommended if they do not share a root cause
+/codex-deep-plan:plan 1128 1098 1097
+
+# Plan the changes a PR review asked for (this plans, it does not review)
+/codex-deep-plan:plan pr 45
+
+# Plan from a single review comment, or from a request in your own words
+/codex-deep-plan:plan https://github.com/o/r/pull/45#discussion_r123456
+/codex-deep-plan:plan "add rate limiting to the export endpoint" --rounds 1
 ```
 
 ## How it works
@@ -148,6 +163,27 @@ flowchart LR
 - **Rules that bind both sides.** Positions move only for new evidence. Contested checkable facts are checked, not argued. Conceding to end the debate is a logged failure.
 - **Ruling.** UPHELD, OVERTURNED, REFINED, UNRESOLVED, or NO DEBATE, with mandatory sections for Claude's own concessions and the strongest surviving argument against the ruling.
 
+### codex-deep-plan
+
+```mermaid
+flowchart LR
+    A[Phase 0<br/>Scope + blind brief] --> B[Phase 1<br/>Evidence<br/>linters pass]
+    B --> C[Phase 2<br/>Root cause<br/>shared-cause verdict]
+    C --> D[Phase 3<br/>Designs<br/>rubric-scored]
+    D --> E[Phase 4<br/>Draft plan<br/>chmod 000]
+    E --> F[Phase 5<br/>Codex blind round 0]
+    F --> G[Phase 6<br/>Divergence]
+    G --> H[Phase 7<br/>Rounds 1..N]
+    H --> I[Phase 8<br/>PLAN.md → plan mode]
+```
+
+- **Inputs.** Any mix of GitHub issues, pull requests (their review comments become the work items), single issue or PR comments, quoted request text, or a file. `init-plan.sh` pins the base SHA and stores every input verbatim; input text is a claim, never a fact.
+- **Facts only, mechanically.** Every claim carries `[FACT]`, `[VERIFIED]`, `[INFERENCE]` or `[UNKNOWN]`. `check-citations.py` resolves each `path:lines@sha` with `git show` and string-matches the quote; `lint-claims.py` rejects hedge words outside inferences, facts without citations and decisions without an evidence id. No design decision may rest on an inference; an isolated `fact-checker` agent promotes inferences without seeing the reasoning behind them.
+- **Root causes, real fixes.** Each chain must end in a violated invariant, missing abstraction, wrong domain model, broken contract or absent constraint. Designs are scored on five gates (mechanism, universality, structural invariant, deletion, regression proof) with blast radius, reversibility, verifiability and cost-of-being-wrong as counterweights; do-nothing, the largest correct change and the tempting workaround are always scored and the chosen design must beat each in writing. "One PR" is a hypothesis: a split is recommended when the inputs do not share a mechanism.
+- **Blind second model.** Round 0 gives Codex only the inputs, the base SHA and the in-scope paths; the brief is generated before any evidence exists and the builder refuses wording that reveals another analysis. Codex returns its own root causes, designs and single-PR verdict as JSON. `validate-verdict.py` enforces the objection contract (evidence, falsifier, proposed change), rejects praise and evidence-free concessions, makes a bare APPROVE require an adversarial attempt, and checks Codex's sha-pinned citations against the code.
+- **Bounded debate.** Default 2 rounds, hard cap 3. `debate-status.py` stops at the first termination condition: T1 converged, T2 cap, T3 no new information for two rounds, T4 a blocker that needs a human choice, T5 Codex unavailable (plan stamped `SOLO`, never simulated).
+- **Handoff.** `PLAN.md` (or `DECISION-REQUIRED.md`) is copied verbatim into a Claude Code plan-mode plan for approval, with the artifact directory as the source of record. `--no-plan-mode` prints it instead. The plan-mode tools are built in but not a documented skill contract; if no plan file path is offered the skill prints the plan.
+
 ### Reviewing uncommitted changes
 
 Passing `local` (or `worktree`) as the target reviews the working tree as it is, without committing or stashing:
@@ -183,13 +219,18 @@ Everything is written outside the repository:
 
 /tmp/codex-debate/<repo>/<motion-slug>-<timestamp>/
   00-frame.md  01-claude-position.md  02-codex-blind.md  03-round-<k>.md  DEBATE.md
+
+/tmp/deep-plan-duo/<repo>/<slug>-<timestamp>/
+  meta.json  inputs/<kind>-<id>.md  00-scope.md  01-evidence.md  02-root-cause.md  03-designs.md
+  04-plan-draft.md  05-disagreements.md  debate/r<n>-prompt.md  debate/r<n>-codex.{json,stdout,meta,...}
+  debate/divergence.md  PLAN.md | DECISION-REQUIRED.md
 ```
 
 Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at the first missing artifact.
 
 ## Safety guarantees
 
-- **Read-only.** Neither plugin modifies, formats, stages, stashes, commits or restores tracked files, and Codex is never invoked with `--write`. `git status` must match the starting baseline at the end of every run.
+- **Read-only.** No plugin modifies, formats, stages, stashes, commits or restores tracked files, and Codex is never invoked with `--write`. `git status` must match the starting baseline at the end of every run.
 - **Untrusted input.** Repository content, PR text and Codex output are treated as data, never as instructions.
 - **No fabricated evidence.** A command that did not run is never reported as run; failures are reported verbatim.
 - **Blindness is procedural, not structural.** Codex's sandbox can read `/tmp` and Claude Code session transcripts. What keeps the second review blind is that Codex is never told a first review exists, that Claude's findings are written before any Codex contact, and that they sit at mode 000 while Codex runs. Reports say exactly this and never claim more.
@@ -205,6 +246,10 @@ Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at th
 | "nothing to review" in local mode | The working tree equals the base tree. Make a change or pick a different base. |
 | Builder refuses `--out` | The artifact directory must be outside the repository so the scratch index cannot leak into the snapshot. |
 | Tests fail inside a monorepo repro | Build workspace dependencies first; stale `dist` output is the usual cause. |
+| `init-plan.sh` exits `3` | `gh` is missing, not logged in, or the issue/PR could not be fetched. The message names the input; paste its text with `--request-file` or run `gh auth login`. |
+| `build-prompt.sh` exits `3` (LEAK) | The in-scope paths in `00-scope.md` contain wording that would reveal another analysis to Codex. Reword the scope file; never edit the brief by hand. |
+| `validate-verdict.py` FAIL | Codex's reply broke the objection contract (no evidence, no falsifier, praise, a fabricated citation). The skill retries once with the reasons appended, then continues `SOLO` for that round. |
+| Deep plan says SPLIT | The inputs do not share a root cause or change surface; forcing them into one PR would be a workaround of the review process. Run it per group, or say the split is acceptable. |
 
 ## FAQ
 
@@ -212,13 +257,15 @@ Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at th
 
 **Can I use a Claude subagent instead of Codex?** No. Both plugins refuse to simulate the second model; a same-model second opinion is exactly the failure mode they exist to avoid.
 
+**Why does the deep plan run outside plan mode and only enter it at the end?** Plan mode blocks every write except the plan file, and the skill has to write artifacts, run linters and launch 10–30 minute Codex jobs. It finishes the work, then enters plan mode with `PLAN.md` verbatim so you approve the same document that carries the evidence.
+
 **Does local mode work on Windows?** Untested. macOS and Linux are supported.
 
 **Where do secrets go?** Nowhere. Briefs never contain credentials, and the read-only sandbox prevents Codex from writing anything back.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Run `bash scripts/validate.sh` before opening a PR; CI runs it too. Changes must keep both plugins read-only and must not add any wording that would tell Codex a second reviewer exists.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Run `bash scripts/validate.sh` before opening a PR; CI runs it too. Changes must keep all plugins read-only and must not add any wording that would tell Codex a second reviewer exists.
 
 ## License
 

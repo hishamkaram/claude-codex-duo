@@ -2,6 +2,19 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-09-02
+
+### Added
+- **codex-deep-plan** plugin (skill `deep-plan-duo`, command `/codex-deep-plan:plan`): evidence-only planning for GitHub issues, pull-request review comments, a single comment, or a plain request, ending in one reviewed PR plan. Nine phases on disk: scope → evidence → root cause → designs → draft → blind Codex round → divergence → bounded debate → `PLAN.md` or `DECISION-REQUIRED.md`.
+  - Every claim is tagged `[FACT]`/`[VERIFIED]`/`[INFERENCE]`/`[UNKNOWN]`; `check-citations.py` resolves each `path:lines@sha` with `git show` and string-matches the quote, and `lint-claims.py` rejects hedges, untagged facts and decisions that cite no evidence id.
+  - Root causes must terminate in a cause class; "one PR" is treated as a hypothesis and a split is recommended when the inputs do not share a mechanism.
+  - Designs are scored on five real-fix gates with blast radius and reversibility as counterweights; do-nothing, the largest correct change and the tempting workaround are always scored.
+  - Round 0 is blind: `build-prompt.sh` builds the brief before any evidence exists and refuses wording that reveals another analysis. `validate-verdict.py` enforces the objection contract (evidence, falsifier, proposed change), rejects praise and evidence-free concessions, makes a bare APPROVE cost an adversarial attempt, and checks Codex's sha-pinned citations against the code. `debate-status.py` reports the termination condition (T1 converged, T2 cap, T3 no new information, T4 human decision, T5 Codex unavailable).
+  - A `fact-checker` agent verifies one claim at a pinned SHA without seeing the reasoning behind it.
+  - The finished plan is handed to Claude Code plan mode verbatim for approval (`--no-plan-mode` prints it instead).
+  - Inputs are pinned verbatim by `init-plan.sh` from `gh` (issues, PRs with inline review comments, single comments) or from text and files; a fetch failure exits 3 and names the input.
+- Validator: Python scripts are checked for executability and syntax; all `codex-run.sh` copies must be byte-identical; the deep-plan skill's exit-code table is checked like the others. Regression tests cover every new script's usage errors, the citation checker against a fixture repository, the linter rules, the verdict validator's contract, the leak check and the termination logic.
+
 ## [1.0.5] - 2026-09-02
 
 Round 2 of the same Codex debate. Two of the 1.0.4 fixes had moved a defect rather than closed it; both are now closed properly.
