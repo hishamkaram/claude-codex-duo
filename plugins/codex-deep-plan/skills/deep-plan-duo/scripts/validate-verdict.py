@@ -11,8 +11,8 @@ Exit 0 = valid (summary printed), 1 = invalid (reasons on stderr), 2 = usage.
 import argparse, json, os, re, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CITE = re.compile(r"(^|[\s`(])[A-Za-z_][\w./\-]*\.\w+:\d+(-\d+)?(@[0-9a-f]{7,40})?|(^|\s)cmd:\s*\S+")
-SHA_CITE = re.compile(r"[A-Za-z_][\w./\-]*:\d+(-\d+)?@[0-9a-f]{7,40}")
+CITE = re.compile(r"(^|[\s`(])[A-Za-z_.][\w./\-]*\.\w+:\d+(-\d+)?(@[0-9a-f]{7,40})?|(^|\s)cmd:\s*\S+")
+SHA_CITE = re.compile(r"[A-Za-z_.][\w./\-]*:\d+(-\d+)?@[0-9a-f]{7,40}")
 PRAISE = re.compile(r"\b(great|excellent|as you (correctly|rightly)|well done|i (fully )?agree|"
                     r"good (catch|point|plan|idea)|solid plan|nice work|impressive)\b", re.I)
 SEV = ["BLOCKER", "MAJOR", "MINOR", "NIT"]

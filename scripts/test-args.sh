@@ -134,7 +134,7 @@ out=$(PATH="$FAKE:$PATH" bash "$I" --repo "$G2" --out "$TMP/art2" --issue 1 --re
   && printf '  ok    %-42s exit=3\n' "gh failure exits 3, names input, keeps others" || { printf '  FAIL  gh failure exit=%s: %s\n' "$code" "$out"; FAIL=1; }
 
 echo "deep-plan: check-citations.py string-matches quotes against git show"
-C="$DS/check-citations.py"
+C="$DS/check-citations.py"; L="$DS/lint-claims.py"
 chk "citations: no file"               2 "usage"                python3 "$C"
 chk "citations: --repo with no value"  2 "requires a value"     python3 "$C" --repo
 printf '| F-1 | [FACT] | second line exists | `f.txt:2-2@%s` "line two" |\n' "$SHA2" > "$TMP/ev-ok.md"
@@ -152,9 +152,23 @@ chk "citations: zero citations fails"  1 "zero citations"       python3 "$C" --r
 chk "citations: --allow-empty"         0 "OK"                   python3 "$C" --repo "$G2" --allow-empty "$TMP/ev-empty.md"
 cp "$TMP/ev-ok.md" "$A/01-evidence.md"
 chk "citations: repo taken from meta.json" 0 "OK"               python3 "$C" "$A/01-evidence.md"
+# Live-run friction 2026-09-02: `.github/workflows/x.yml` could not be cited because the path
+# regex demanded a letter first. Dot-paths are ordinary repository paths.
+( cd "$G2" && mkdir -p .github && printf 'name: ci\n' > .github/ci.yml && git add .github && git commit -qm dotpath )
+SHA3=$(git -C "$G2" rev-parse HEAD)
+printf '| F-1 | [FACT] | dotpath | `.github/ci.yml:1-1@%s` "name: ci" |\n' "$SHA3" > "$TMP/ev-dot.md"
+chk "citations: dot-path cited"        0 "OK"                   python3 "$C" --repo "$G2" "$TMP/ev-dot.md"
+# Live-run friction 2026-09-02: a quoted line that itself contains double quotes was rejected
+# because the shortest "..." match ended at the inner quote.
+( cd "$G2" && printf 'else note ok "no paths"; fi\n' > q.sh && git add q.sh && git commit -qm quotes )
+SHA4=$(git -C "$G2" rev-parse HEAD)
+printf '| F-1 | [FACT] | inner quotes | `q.sh:1-1@%s` "note ok "no paths"; fi" |\n' "$SHA4" > "$TMP/ev-inner.md"
+chk "citations: quote containing quotes" 0 "OK"                 python3 "$C" --repo "$G2" "$TMP/ev-inner.md"
+printf '| F-1 | [FACT] | inner quotes wrong | `q.sh:1-1@%s` "note ok "yes paths"; fi" |\n' "$SHA4" > "$TMP/ev-inner-bad.md"
+chk "citations: wrong inner-quote text fails" 1 "quote not found" python3 "$C" --repo "$G2" "$TMP/ev-inner-bad.md"
+chk "lint: dot-path counts as citation" 0 "OK"                  python3 "$L" "$TMP/ev-dot.md"
 
 echo "deep-plan: lint-claims.py enforces tags, hedges and evidence ids"
-L="$DS/lint-claims.py"
 chk "lint: no args"                    2 "usage"                python3 "$L"
 chk "lint: clean file passes"          0 "OK"                   python3 "$L" "$TMP/ev-ok.md"
 printf 'This probably works.\n' > "$TMP/l-hedge.md"
@@ -259,6 +273,17 @@ v=json.load(open(sys.argv[1])); v["round"]=2; json.dump(v,open(sys.argv[2],"w"))
 PY2
 out=$(python3 "$DSY" --art "$A" 2>&1)
 printf '%s' "$out" | grep -q 'termination=T2' && printf '  ok    %-42s\n' "round cap reached is T2" || { printf '  FAIL  T2: %s\n' "$out"; FAIL=1; }
+# Live-run friction 2026-09-02: Codex reused objection id X-1 in a later round for a new claim;
+# the status block must show the latest claim and treat the re-raised id as open.
+python3 - "$A/debate/r2-codex.json" <<'PY2'
+import json,sys
+v=json.load(open(sys.argv[1]))
+v["objection_resolutions"]=[{"id":"X-1","status":"WITHDRAWN","because":"cmd: git grep x -> 0"}]
+v["objections"]=[{"id":"X-1","class":"SCOPE","severity":"MAJOR","claim":"brand new claim under an old id","evidence":["cmd: git grep y -> 1"],"proposed_change":"p","falsifier":"f"}]
+json.dump(v,open(sys.argv[1],"w"))
+PY2
+out=$(python3 "$DSY" --art "$A" 2>&1)
+printf '%s' "$out" | grep -q 'OPEN_MAJORS: X-1: brand new claim' && printf '  ok    %-42s\n' "re-used objection id shows latest claim" || { printf '  FAIL  id reuse: %s\n' "$out"; FAIL=1; }
 
 echo
 [ $FAIL -eq 0 ] && { echo "ALL ARGUMENT AND BUILDER TESTS PASSED"; exit 0; } || { echo "TESTS FAILED"; exit 1; }

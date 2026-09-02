@@ -19,7 +19,7 @@ HEDGE = re.compile(r"\b(probably|likely|should be|i assume|assuming|presumably|i
                    r"typically|might be|i believe|i think|appears to|obviously|clearly)\b", re.I)
 TAG = re.compile(r"\[(FACT|VERIFIED|INFERENCE|UNKNOWN)\]")
 ID = re.compile(r"\b([FVIU])-(\d+)\b")
-CITE = re.compile(r"`?[A-Za-z_][\w./\-]*:\d+(-\d+)?@[0-9a-f]{7,40}`?")
+CITE = re.compile(r"`?[A-Za-z_.][\w./\-]*:\d+(-\d+)?@[0-9a-f]{7,40}`?")
 DECISION = re.compile(r"^\s*(\|?\s*)?(\*\*)?(decision|chosen|choice|we will|rationale)(\*\*)?\s*[:|]", re.I)
 DEFINES = re.compile(r"^\s*\|\s*([FVIU])-(\d+)\s*\|")
 SKIP_DIRS = ("inputs", "debate")

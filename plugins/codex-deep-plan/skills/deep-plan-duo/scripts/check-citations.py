@@ -11,7 +11,7 @@ citations without --allow-empty), 2 = usage error.
 """
 import json, os, re, subprocess, sys, unicodedata
 
-CITE = re.compile(r"`?(?P<path>[A-Za-z_][\w./\-]*):(?P<a>\d+)(?:-(?P<b>\d+))?@(?P<sha>[0-9a-f]{7,40})`?")
+CITE = re.compile(r"`?(?P<path>[A-Za-z_.][\w./\-]*):(?P<a>\d+)(?:-(?P<b>\d+))?@(?P<sha>[0-9a-f]{7,40})`?")
 QUOTE = re.compile(r'"([^"\n]{3,300})"')
 MAX_WORDS = 15
 
@@ -47,6 +47,30 @@ def repo_for(path, explicit):
     return r.stdout.strip() if r.returncode == 0 else os.getcwd()
 
 
+def candidates(line, start):
+    """Quote candidates after a citation. A quoted line of code may itself contain double
+    quotes (`note ok "no machine-specific paths"`), so besides the shortest "..." we also try
+    the greedy span to the last quote on the line, each with \\" unescaped. Live-run friction,
+    2026-09-02."""
+    out = []
+    tail = line[start:]
+    nq = tail.count('"')
+    if nq > 2:
+        # More than one pair after the citation: the author quoted a line that contains quotes.
+        # The intended quote is the whole span; the shortest pair would match trivially.
+        out.append(tail[tail.find('"') + 1:tail.rfind('"')])
+    else:
+        q = QUOTE.search(tail) or QUOTE.search(line)
+        if q:
+            out.append(q.group(1))
+    seen, uniq = set(), []
+    for c in out + [c.replace('\\"', '"') for c in out]:
+        c = c.strip()
+        if 3 <= len(c) <= 300 and c not in seen:
+            seen.add(c); uniq.append(c)
+    return uniq
+
+
 def check_line(repo, where, line):
     """Return (checked, failures) for one text line."""
     fails, n = [], 0
@@ -58,14 +82,15 @@ def check_line(repo, where, line):
             fails.append(f"{where}: {m['path']} not found at {m['sha']} (git show failed)"); continue
         if a < 1 or b > len(lines) or a > b:
             fails.append(f"{where}: {m['path']}:{a}-{b} out of range (file has {len(lines)} lines)"); continue
-        q = QUOTE.search(line, m.end()) or QUOTE.search(line)
-        if not q:
+        cands = candidates(line, m.end())
+        if not cands:
             fails.append(f"{where}: {m['path']}:{a}-{b}@{m['sha'][:7]} has no verbatim \"quote\""); continue
-        quote = q.group(1)
-        if len(quote.split()) > MAX_WORDS:
-            fails.append(f"{where}: quote longer than {MAX_WORDS} words ({len(quote.split())})"); continue
-        if norm(quote) not in norm(" ".join(lines[a - 1:b])):
-            fails.append(f"{where}: quote not found in {m['path']}:{a}-{b}@{m['sha'][:7]}: \"{quote}\"")
+        short = [q for q in cands if len(q.split()) <= MAX_WORDS]
+        if not short:
+            fails.append(f"{where}: quote longer than {MAX_WORDS} words ({min(len(q.split()) for q in cands)})"); continue
+        rng = norm(" ".join(lines[a - 1:b]))
+        if not any(norm(q) in rng for q in short):
+            fails.append(f"{where}: quote not found in {m['path']}:{a}-{b}@{m['sha'][:7]}: \"{short[0]}\"")
     return n, fails
 
 

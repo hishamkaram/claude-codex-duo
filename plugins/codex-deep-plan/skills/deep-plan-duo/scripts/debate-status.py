@@ -12,7 +12,7 @@ the runner's exit code, not here. Exit 0 always unless usage (2) or no rounds (1
 """
 import glob, json, os, re, sys
 
-CITE = re.compile(r"[A-Za-z_][\w./\-]*:\d+(-\d+)?(@[0-9a-f]{7,40})?")
+CITE = re.compile(r"[A-Za-z_.][\w./\-]*:\d+(-\d+)?(@[0-9a-f]{7,40})?")
 HUMAN = re.compile(r"\b(human|product|business|stakeholder|owner)\b.*\b(decide|decision|choose|choice|prefer)\b|"
                    r"\b(decide|decision|choose|choice)\b.*\b(human|product|business|stakeholder|owner)\b", re.I)
 
@@ -90,20 +90,21 @@ def main(argv):
     n, v, new_objs, changed, new_info = per_round[-1]
     resolved = {r.get("id"): r.get("status") for r in v.get("objection_resolutions") or []}
     # Objections raised in the latest round are open; earlier ones are open unless withdrawn there.
-    open_objs = []
+    # Codex may reuse an id in a later round for a new claim (observed 2026-09-02): the latest
+    # round's text for an id wins, and an id raised again in the latest round is open regardless
+    # of how its earlier incarnation was resolved.
+    latest = {}
     for m, pv, _, _, _ in per_round:
         for o in pv.get("objections") or []:
-            st = resolved.get(o.get("id"))
-            if m == n or st in (None, "SUSTAINED", "DOWNGRADED"):
-                sev = o.get("severity")
-                if st == "DOWNGRADED":
-                    sev = next((r.get("severity") for r in v.get("objection_resolutions") or [] if r.get("id") == o.get("id")), sev) or sev
-                open_objs.append((o.get("id"), sev, o.get("claim", ""), o.get("falsifier", "")))
-    seen = set(); uniq = []
-    for row in open_objs:
-        if row[0] not in seen:
-            seen.add(row[0]); uniq.append(row)
-    open_objs = uniq
+            latest[o.get("id")] = (m, o)
+    open_objs = []
+    for oid, (m, o) in latest.items():
+        st = resolved.get(oid)
+        if m == n or st in (None, "SUSTAINED", "DOWNGRADED"):
+            sev = o.get("severity")
+            if m != n and st == "DOWNGRADED":
+                sev = next((r.get("severity") for r in v.get("objection_resolutions") or [] if r.get("id") == oid), sev) or sev
+            open_objs.append((oid, sev, o.get("claim", ""), o.get("falsifier", "")))
     blockers = [r for r in open_objs if r[1] == "BLOCKER"]
     majors = [r for r in open_objs if r[1] == "MAJOR"]
     ledger_open = open_ledger_rows(art)
