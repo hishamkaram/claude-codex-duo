@@ -1,6 +1,6 @@
 ---
 name: two-model-pr-review
-description: Two-model pull request review — runs an independent review, obtains a blind second review from Codex, reconciles both, verifies contested claims against the code, and emits one merge decision with a written audit trail. Use when asked to review a PR, diff, branch, or uncommitted local changes (working tree); for a second-opinion or cross-model code review; to adjudicate disagreeing review findings; or to decide whether a change is safe to merge. Review-only: never use to implement fixes.
+description: Two-model pull request review — runs an independent review, obtains a blind second review from Codex, reconciles both, verifies contested claims against the code, and emits one merge decision with a written audit trail. Use when asked to review a PR, diff, branch, or uncommitted local changes (working tree); for a second-opinion or cross-model code review; to adjudicate disagreeing review findings; or to decide whether a change is safe to merge. Review-only — never use to implement fixes.
 ---
 
 # Two-Model PR Review

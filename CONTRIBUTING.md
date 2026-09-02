@@ -11,7 +11,7 @@ Both plugins are Markdown skills plus two shell scripts. There is no build step.
 
 ## Testing a change
 
-1. Validate manifests: `claude plugin validate .` and `claude plugin validate plugins/<name>`.
+1. Run `bash scripts/validate.sh` — frontmatter YAML, manifest agreement, path resolution, script syntax. CI runs the same script. Then `claude plugin validate .` and `claude plugin validate plugins/<name>`.
 2. Install locally: `claude plugin marketplace add /path/to/claude-codex-duo` then `claude plugin install <name>@claude-codex-duo`.
 3. Builder smoke test (no Codex needed): run `build-brief.sh --head WORKTREE` against a throwaway clone with staged, unstaged, deleted and untracked changes; assert the repo's `.git/index` checksum and `git status` are unchanged afterwards and that a clean clone exits 3.
 4. Runner smoke test: `scripts/codex-run.sh --probe`.

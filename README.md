@@ -217,7 +217,7 @@ Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at th
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Changes must keep both plugins read-only and must not add any wording that would tell Codex a second reviewer exists.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Run `bash scripts/validate.sh` before opening a PR; CI runs it too. Changes must keep both plugins read-only and must not add any wording that would tell Codex a second reviewer exists.
 
 ## License
 

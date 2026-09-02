@@ -2,6 +2,15 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.2] - 2026-09-02
+
+### Fixed
+- `two-model-pr-review` skill frontmatter was not valid strict YAML: the description ended with `Review-only: never use to implement fixes.`, and an unquoted scalar containing `": "` parses as a nested mapping. Same defect class as 1.0.1, in the review plugin's main skill.
+
+### Added
+- `scripts/validate.sh`: dependency-free packaging checks — strict-YAML frontmatter, manifest agreement, `${CLAUDE_PLUGIN_ROOT}` path resolution, script executability and shell syntax, and machine-specific path leaks. Run before every release.
+- GitHub Actions workflow running the validator on push and pull request.
+
 ## [1.0.1] - 2026-09-02
 
 ### Fixed
