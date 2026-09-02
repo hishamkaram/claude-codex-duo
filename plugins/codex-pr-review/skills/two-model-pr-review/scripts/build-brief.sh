@@ -9,10 +9,22 @@
 #     Writes <out>.tree (the tree SHA) and <out>.baseline (NUL-separated status). Exit 3 = nothing to review.
 set -euo pipefail
 SK="$(cd "$(dirname "$0")/.." && pwd)"
+USAGE='usage: build-brief.sh --repo <path> --base-ref <name> --base <sha> (--head-ref <name> --head <sha> | --head WORKTREE) \\
+                       --intent-file <file> --conventions-file <file> --out <file>'
+# Every usage error exits 2, as documented in references/codex-protocol.md.
+die2() { echo "build-brief.sh: $1" >&2; echo "$USAGE" >&2; exit 2; }
+need() { [ $# -ge 2 ] || die2 "$1 requires a value"; case "$2" in -*) die2 "$1 requires a value (got option $2)";; esac; }
 while [ $# -gt 0 ]; do case "$1" in
-  --repo) REPO="$2";; --base-ref) BREF="$2";; --base) BSHA="$2";; --head-ref) HREF="$2";; --head) HSHA="$2";;
-  --intent-file) INTENT="$2";; --conventions-file) CONV="$2";; --out) OUT="$2";; *) echo "unknown arg $1" >&2; exit 2;; esac; shift 2; done
-: "${REPO:?}" "${BREF:?}" "${BSHA:?}" "${HSHA:?}" "${INTENT:?}" "${CONV:?}" "${OUT:?}"
+  --repo) need "$@"; REPO="$2";; --base-ref) need "$@"; BREF="$2";; --base) need "$@"; BSHA="$2";;
+  --head-ref) need "$@"; HREF="$2";; --head) need "$@"; HSHA="$2";;
+  --intent-file) need "$@"; INTENT="$2";; --conventions-file) need "$@"; CONV="$2";; --out) need "$@"; OUT="$2";;
+  *) die2 "unknown arg $1";; esac; shift 2; done
+for v in REPO BREF BSHA HSHA INTENT CONV OUT; do
+  eval "val=\${$v:-}"; [ -n "$val" ] || die2 "--$(echo "$v" | tr 'A-Z' 'a-z') is required"
+done
+[ -d "$REPO" ] || die2 "--repo is not a directory: $REPO"
+[ -r "$INTENT" ] || die2 "--intent-file not readable: $INTENT"
+[ -r "$CONV" ] || die2 "--conventions-file not readable: $CONV"
 REPO="$(cd "$REPO" && pwd -P)"; OUTDIR="$(cd "$(dirname "$OUT")" && pwd -P)"
 case "$OUTDIR" in "$REPO"/*|"$REPO") echo "refusing: --out must be outside the repository (scratch index would leak into the snapshot)" >&2; exit 2;; esac
 HEADNOTE=""

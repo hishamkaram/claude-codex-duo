@@ -170,7 +170,7 @@ Every Codex call goes through `scripts/codex-run.sh`, which wraps the Codex plug
 | Refusals | Exits immediately if `--write` is requested |
 | Probe | `--probe` checks the Codex plugin is installed, logged in and ready before a review spends any effort |
 
-Exit codes: `0` completed, `1` failed, `2` stalled, `3` timeout, `4` launch error.
+Exit codes: `0` completed, `1` failed, `2` stalled, `3` timeout, `4` launch error or invalid invocation. A bad command line never exits 1, so a typo cannot be mistaken for an upstream failure.
 
 ## Artifacts
 

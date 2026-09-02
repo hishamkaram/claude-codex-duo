@@ -33,20 +33,33 @@ print(label, "ready=%s loggedIn=%s codex=%s" % (d.get("ready"), d.get("auth",{})
 raise SystemExit(0 if ok else 1)'
   exit $?
 fi
-PREFIX="${1:?out-prefix required}"; shift
+USAGE='usage: codex-run.sh <out-prefix> [--fresh|--resume-last] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S]
+       codex-run.sh --probe'
+# Every invocation error exits 4 (LAUNCH-ERROR). Never exit 1 for a bad command line:
+# 1 means "Codex failed, retry once" in the documented contract, and a typo must not look like that.
+PREFIX="${1:-}"
+case "$PREFIX" in ""|-*) echo "codex-run.sh: first argument must be an out-prefix path" >&2; echo "$USAGE" >&2; exit 4;; esac
+shift
+die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
+need() { [ $# -ge 2 ] || die4 "$1 requires a value"; case "$2" in -*) die4 "$1 requires a value (got option $2)";; esac; }
 MODE="--fresh"; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15
 while [ $# -gt 0 ]; do
   case "$1" in
     --fresh|--resume-last) MODE="$1";;
-    --prompt-file) PROMPT_FILE="$2"; shift;;
-    --stall-min) STALL_MIN="$2"; shift;;
-    --max-min) MAX_MIN="$2"; shift;;
-    --poll-sec) POLL="$2"; shift;;
-    --write) echo "codex-run.sh: --write is refused; this runner is read-only" >&2; echo 4 > "$PREFIX.exit"; exit 4;;
-    *) echo "codex-run.sh: unknown arg $1" >&2; echo 4 > "$PREFIX.exit"; exit 4;;
+    --prompt-file) need "$@"; PROMPT_FILE="$2"; shift;;
+    --stall-min) need "$@"; STALL_MIN="$2"; shift;;
+    --max-min) need "$@"; MAX_MIN="$2"; shift;;
+    --poll-sec) need "$@"; POLL="$2"; shift;;
+    --write) die4 "--write is refused; this runner is read-only";;
+    *) die4 "unknown arg $1";;
   esac; shift
 done
-[ -r "$PROMPT_FILE" ] || { echo "codex-run.sh: prompt file not readable: $PROMPT_FILE" >&2; echo 4 > "$PREFIX.exit"; exit 4; }
+for v in STALL_MIN MAX_MIN POLL; do
+  eval "val=\$$v"
+  case "$val" in ''|*[!0-9]*) die4 "--$(echo "$v" | tr 'A-Z_' 'a-z-') requires a whole number of minutes/seconds (got '$val')";; esac
+done
+[ -n "$PROMPT_FILE" ] || die4 "--prompt-file is required"
+[ -r "$PROMPT_FILE" ] || die4 "prompt file not readable: $PROMPT_FILE"
 
 CODEX_ROOT=$(python3 -c 'import json,os,glob
 p=os.path.expanduser("~/.claude/plugins/installed_plugins.json")

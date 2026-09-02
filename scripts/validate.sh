@@ -64,5 +64,13 @@ if grep -rn '~/\.claude/skills/\|~/\.claude/scripts/\|/Users/' plugins >/dev/nul
   grep -rn '~/\.claude/skills/\|~/\.claude/scripts/\|/Users/' plugins | sed 's/^/  FAIL    /'; FAIL=1
 else note ok "no machine-specific paths"; fi
 
+echo "6. Command-line handling regression tests (executed)"
+if bash scripts/test-args.sh > /tmp/ccd-test-args.$$ 2>&1; then
+  sed 's/^/  /' /tmp/ccd-test-args.$$ | grep -E 'ok|PASSED' | tail -3
+else
+  sed 's/^/  /' /tmp/ccd-test-args.$$; FAIL=1
+fi
+rm -f /tmp/ccd-test-args.$$
+
 echo
 [ $FAIL -eq 0 ] && { echo "ALL CHECKS PASSED"; exit 0; } || { echo "VALIDATION FAILED"; exit 1; }

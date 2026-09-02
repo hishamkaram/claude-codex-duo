@@ -2,6 +2,20 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.3] - 2026-09-02
+
+Found by a Codex debate on packaging and portability; both claims were reproduced before being accepted.
+
+### Fixed
+- `codex-run.sh` and `build-brief.sh` dereferenced `"$2"` for every value-taking option under `set -u`. A missing operand (`--stall-min` with no number, `--repo` with no path) aborted with a raw `unbound variable` message and exit 1. Exit 1 is the code the runner's own contract reserves for "Codex failed, retry once", so a typo was indistinguishable from an upstream failure. All invalid runner invocations now exit 4 (LAUNCH-ERROR) and all builder usage errors exit 2, each with a usage message.
+- Added operand and type validation: numeric options reject non-numbers, `--prompt-file` is required and must be readable, `--repo` must be a directory, and intent and conventions files must be readable.
+
+### Added
+- `scripts/test-args.sh`: executed regression tests for every argument-handling path plus a builder happy-path fixture (clean tree exits 3, dirty tree captures a deterministic snapshot, the repository index is untouched, untracked files reach the brief, the scratch index is cleaned up). Wired into `scripts/validate.sh` and CI, so the contract is verified on Linux as well as macOS.
+
+### Changed
+- The exit-code tables in both skills now state that 4 covers any invalid invocation and that a usage message means fix the call rather than retry.
+
 ## [1.0.2] - 2026-09-02
 
 ### Fixed

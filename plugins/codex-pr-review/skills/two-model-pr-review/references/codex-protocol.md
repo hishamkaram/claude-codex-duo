@@ -100,7 +100,7 @@ time with `tail -n 5 "$ART/02-codex.progress"`. The runner exits with:
 | 1 | FAILED (plugin reported failure, or worker process died) | retry once with the same command; if it fails again record FAILED |
 | 2 | STALLED (no job-log activity for `--stall-min`) | retry once; then FAILED |
 | 3 | TIMEOUT (`--max-min` reached) | do not retry; record FAILED with the partial `.stdout` if any |
-| 4 | LAUNCH-ERROR | record UNAVAILABLE with `.stderr` |
+| 4 | LAUNCH-ERROR, or any invalid invocation (missing option value, unknown argument, unreadable prompt file, `--write`) | record UNAVAILABLE with `.stderr`; a usage message means fix the call, not retry |
 
 Sidecars written by the runner: `02-codex.stdout` (final message, verbatim;
 the helper appends two trailer lines "Codex session ID …" / "Resume in Codex …"
