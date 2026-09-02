@@ -43,20 +43,8 @@ if [ "$HSHA" = "WORKTREE" ]; then
   HSHA="$TREE"
   IDX_DIFFERS="no"; git -C "$REPO" diff --quiet --cached || IDX_DIFFERS="yes"
   SUBS=$(git -C "$REPO" submodule status --recursive 2>/dev/null | awk '{print $2}' | tr '\n' ' ' || true)
-  HEADNOTE="Head is a SNAPSHOT TREE of the uncommitted working tree (staged, unstaged, deleted and non-ignored untracked files), not a commit. It is authoritative: read a file exactly as reviewed with \`git show ${TREE}:<path>\`; the working tree should match it. Ignored files are out of scope. Staged intermediate state is not a separate review target (index differs from working tree: ${IDX_DIFFERS}). Submodules present: ${SUBS:-none}; an outer gitlink change is in scope, uncommitted contents inside a submodule are not."
-  FILES=$(git -C "$REPO" diff --name-status -M -z "$BSHA" "$TREE" | python3 -c '
-import sys
-def name(b):
-    # Git paths are bytes. Never crash on non-UTF-8, and never emit a newline or
-    # carriage return: one changed file must stay one line of the brief file list.
-    s=b.decode("utf-8","backslashreplace")
-    return s.replace("\\","\\\\").replace("\n","\\n").replace("\r","\\r") if ("\n" in s or "\r" in s or "\\" in s) else s
-t=sys.stdin.buffer.read().split(b"\0"); out=[]; i=0
-while i<len(t) and t[i]:
-    st=t[i].decode("ascii","replace"); i+=1
-    if st[0] in "RC": old=name(t[i]); new=name(t[i+1]); i+=2; out.append(f"  - {new}  ({st[0]} from {old}, similarity {st[1:]})")
-    else: out.append(f"  - {name(t[i])}  ({st})"); i+=1
-print("\n".join(sorted(out)))')
+  HEADNOTE="Head is a SNAPSHOT TREE of the uncommitted working tree (staged, unstaged, deleted and non-ignored untracked files), not a commit. It is authoritative: read a file exactly as reviewed with \`git show ${TREE}:<path>\`; the working tree should match it. A path printed in double quotes in the file list below is quoted the way git quotes unusual paths (C escapes, \\ooo octal for raw bytes); read such a file with \`git diff ${BSHA} ${TREE} -- <path>\` or list it with \`git ls-tree -r -z ${TREE}\` rather than pasting the quoted text into \`git show\`. Ignored files are out of scope. Staged intermediate state is not a separate review target (index differs from working tree: ${IDX_DIFFERS}). Submodules present: ${SUBS:-none}; an outer gitlink change is in scope, uncommitted contents inside a submodule are not."
+  FILES=$(git -C "$REPO" diff --name-status -M -z "$BSHA" "$TREE" | python3 "$SK/scripts/quote-name-status.py")
   DIFFCMD="git diff ${BSHA} ${TREE}"
 else
   FILES=$(git -C "$REPO" diff --name-only "$BSHA..$HSHA" | LC_ALL=C sort | sed 's/^/  - /')

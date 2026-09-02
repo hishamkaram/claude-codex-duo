@@ -128,6 +128,7 @@ while :; do
   esac
 done
 
+UNCONFIRMED_CANCEL=0
 if [ "$OUTCOME" = "STALLED" ] || [ "$OUTCOME" = "TIMEOUT" ] || { [ "$OUTCOME" = "FAILED" ] && [ "${STATUS:-}" = "running" ]; }; then
   CANCEL_RC=0; cc cancel "$JOB" >>"$PREFIX.stderr" 2>&1 || CANCEL_RC=$?
   # Verify the cancel instead of asserting it: re-read status and look for a live
@@ -141,8 +142,11 @@ if [ "$OUTCOME" = "STALLED" ] || [ "$OUTCOME" = "TIMEOUT" ] || { [ "$OUTCOME" = 
   done
   if pgrep -f "task-worker.*--job-id $JOB" >/dev/null 2>&1; then PHANTOM="${PHANTOM:+$PHANTOM }worker-process-alive"; fi
   if [ -n "$PHANTOM" ]; then
+    # Exit 5, not the outcome's own code: a live worker must never be retried,
+    # and 1/2/3 all tell the caller to retry or to treat the job as finished.
+    UNCONFIRMED_CANCEL=1
     echo "$(elapsed)s $OUTCOME → cancel of $JOB NOT confirmed (cancel_rc=$CANCEL_RC $PHANTOM); a worker may still be running" >> "$PREFIX.progress"
-    echo "codex-run.sh: cancel of $JOB not confirmed ($PHANTOM); check with: node <codex-plugin>/scripts/codex-companion.mjs status $JOB --json" >&2
+    echo "codex-run.sh: cancel of $JOB not confirmed ($PHANTOM); DO NOT retry — a worker may still be running. Check with: node <codex-plugin>/scripts/codex-companion.mjs status $JOB --json" >&2
   else
     echo "$(elapsed)s $OUTCOME → cancelled $JOB (confirmed: no running job, no worker process)" >> "$PREFIX.progress"
   fi
@@ -156,9 +160,12 @@ THREAD=$(grep -oE 'Codex session ID: [0-9a-f-]+' "$PREFIX.stdout" | head -1 | aw
   echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"
   echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
   LASTERR=""; [ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && LASTERR=$(grep -E "Codex error:|Turn failed" "$LOGFILE" | tail -1 | cut -c1-300)
-  echo "last_error=${LASTERR:-none}"
+  echo "last_error=${LASTERR:-none}"; echo "cancel_confirmed=$([ "${UNCONFIRMED_CANCEL:-0}" = "1" ] && echo no || echo "$([ "$OUTCOME" = "STALLED" ] || [ "$OUTCOME" = "TIMEOUT" ] && echo yes || echo n/a)")"
 } > "$PREFIX.meta"
 case "$OUTCOME" in COMPLETED) RC=0;; FAILED) RC=1;; STALLED) RC=2;; TIMEOUT) RC=3;; *) RC=1;; esac
+# An unconfirmed cancel outranks the outcome: 1, 2 and 3 all invite a retry or
+# treat the job as finished, and neither is safe while a worker may be alive.
+[ "${UNCONFIRMED_CANCEL:-0}" = "1" ] && RC=5
 echo "$RC" > "$PREFIX.exit"
 echo "codex-run.sh: $OUTCOME job=$JOB elapsed=$(elapsed)s stdout=$(wc -c < "$PREFIX.stdout" | tr -d ' ')B → $PREFIX.{stdout,progress,meta}"
 exit "$RC"

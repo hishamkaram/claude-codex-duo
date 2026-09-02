@@ -165,12 +165,12 @@ Every Codex call goes through `scripts/codex-run.sh`, which wraps the Codex plug
 |---|---|
 | Background execution | Never a foreground call, so long reviews cannot be killed by shell timeouts |
 | Liveness | Polls job status and the worker process; a dead worker with a "running" job is detected and cancelled |
-| Stall and timeout | Configurable (`--stall-min`, `--max-min`); stalls and timeouts cancel the job |
+| Stall and timeout | Configurable (`--stall-min`, `--max-min`); a stall or timeout cancels the job, then verifies the cancel by re-reading job status and looking for a live worker. An unverified cancel is reported, never asserted. |
 | Evidence | Raw stdout, stderr, job log, progress and metadata (job ID, thread ID, timings, last error) saved as sidecars; retries rotate to `.attemptN.*` |
 | Refusals | Exits immediately if `--write` is requested |
 | Probe | `--probe` checks the Codex plugin is installed, logged in and ready before a review spends any effort |
 
-Exit codes: `0` completed, `1` failed, `2` stalled, `3` timeout, `4` launch error or invalid invocation. A bad command line never exits 1, so a typo cannot be mistaken for an upstream failure.
+Exit codes: `0` completed, `1` failed, `2` stalled, `3` timeout, `4` launch error or invalid invocation, `5` stalled or timed out with the cancel unconfirmed. A bad command line never exits 1, so a typo cannot be mistaken for an upstream failure, and `5` means do not retry because a worker may still be running.
 
 ## Artifacts
 
@@ -199,6 +199,7 @@ Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at th
 | Symptom | Cause and fix |
 |---|---|
 | `PROBE` reports UNAVAILABLE | The Codex plugin is not installed or not logged in. Run `/codex:setup`. |
+| Runner exit `5` | The job stalled or timed out and the cancel could not be confirmed. Do not retry; check the job with the companion's `status` command, because a worker may still be running. |
 | Runner exit `2` (STALLED) | No job-log activity for `--stall-min` minutes. Check the `.joblog` sidecar; upstream capacity errors are recorded in `.meta` as `last_error`. Rerun; attempts rotate. |
 | Runner exit `3` (TIMEOUT) | Review exceeded `--max-min`. Large diffs should be split by subsystem in Phase 0. |
 | "nothing to review" in local mode | The working tree equals the base tree. Make a change or pick a different base. |

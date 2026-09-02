@@ -2,6 +2,22 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.0.5] - 2026-09-02
+
+Round 2 of the same Codex debate. Two of the 1.0.4 fixes had moved a defect rather than closed it; both are now closed properly.
+
+### Fixed
+- File-list paths are quoted the way git's own `core.quotePath` does: plain when ordinary, otherwise double-quoted with C escapes and `\ooo` octal for raw bytes. The 1.0.4 escaping was ambiguous — a path holding an invalid byte and a path whose own characters were a backslash and an x rendered identically — and the escaped text could not be used with the `git show <tree>:<path>` form the brief documents. The brief's snapshot note now explains the quoting and points at `git diff <base> <tree> -- <path>` and `git ls-tree -r -z <tree>` for such paths.
+- A stalled or timed-out job whose cancel could not be confirmed now exits 5, not 2 or 3. Exits 2 and 3 tell the caller to retry or to treat the job as finished, and neither is safe while a worker may still be running. Both skills' exit tables and the README document 5 as "do not retry". The metadata sidecar records `cancel_confirmed`.
+- The README no longer claims categorically that stalls and timeouts cancel the job; it states that the cancel is verified and that an unverified cancel is reported rather than asserted.
+
+### Changed
+- The file-list formatter moved out of an inline `python3 -c` string into `skills/two-model-pr-review/scripts/quote-name-status.py`. The inline form could not hold a single quote, which is how the 1.0.4 escaping came to be written incorrectly in the first place.
+
+### Added
+- Tests that the quoting is reversible and that ordinary paths are left untouched.
+- A validator check that every exit code the runner can emit is documented in both skills and the README.
+
 ## [1.0.4] - 2026-09-02
 
 Round 1 of the same Codex debate. Every claim was reproduced before being accepted.

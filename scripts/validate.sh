@@ -64,7 +64,17 @@ if grep -rn '~/\.claude/skills/\|~/\.claude/scripts/\|/Users/' plugins >/dev/nul
   grep -rn '~/\.claude/skills/\|~/\.claude/scripts/\|/Users/' plugins | sed 's/^/  FAIL    /'; FAIL=1
 else note ok "no machine-specific paths"; fi
 
-echo "6. Command-line handling regression tests (executed)"
+echo "6. Every runner exit code is documented in both skills and the README"
+CODES=$(grep -oE 'RC=[0-9]|exit [0-9]' plugins/codex-pr-review/scripts/codex-run.sh | grep -oE '[0-9]' | sort -u)
+for c in $CODES; do
+  miss=""
+  grep -q "^| $c |" plugins/codex-pr-review/skills/two-model-pr-review/references/codex-protocol.md || miss="$miss codex-protocol.md"
+  grep -q "^| $c |" plugins/codex-debate/skills/codex-debate/references/codex-invocation.md || miss="$miss codex-invocation.md"
+  grep -q "\`$c\`" README.md || miss="$miss README.md"
+  [ -z "$miss" ] && note ok "exit $c documented" || note FAIL "exit $c undocumented in:$miss"
+done
+
+echo "7. Command-line handling regression tests (executed)"
 if bash scripts/test-args.sh > /tmp/ccd-test-args.$$ 2>&1; then
   sed 's/^/  /' /tmp/ccd-test-args.$$ | grep -E 'ok|PASSED' | tail -3
 else

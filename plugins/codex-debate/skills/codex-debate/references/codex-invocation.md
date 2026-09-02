@@ -28,9 +28,10 @@ Exit codes and what to do:
 |---|---|---|
 | 0 | COMPLETED | rule on the reply |
 | 1 | FAILED (plugin failure or worker died) | retry the same call once; then apply the mid-debate failure rule |
-| 2 | STALLED | retry once with a `<time_budget>` block tightened; then failure rule |
+| 2 | STALLED (cancel confirmed) | retry once with a `<time_budget>` block tightened; then failure rule |
 | 3 | TIMEOUT | do not retry; failure rule, keep any partial `.stdout` |
 | 4 | LAUNCH-ERROR, or any invalid invocation (missing option value, unknown argument, unreadable prompt file, `--write`) | record UNAVAILABLE with `.stderr`; a usage message means fix the call, not retry |
+| 5 | STALLED or TIMEOUT **and the cancel could not be confirmed** — a Codex worker may still be running | DO NOT retry: a second job would run alongside the first. Report the job id, quote `.progress`, and treat the phase as failed. |
 
 Sidecars: `<name>.stdout` (final message verbatim, plus two helper trailer
 lines "Codex session ID …" / "Resume in Codex …"), `.stderr`, `.progress`,

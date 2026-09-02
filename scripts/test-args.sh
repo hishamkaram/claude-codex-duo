@@ -61,8 +61,7 @@ chk "oversized --max-min rejected" 4 "between 1 and"  bash "$R" "$PFX" --max-min
 echo "builder: the file-list parser survives awkward filenames"
 # X-09 / X-10: a git path is bytes and may contain a newline; one changed file
 # must stay one line of the brief, and a non-UTF-8 byte must not crash the run.
-PARSER="$TMP/parser.py"
-awk "/FILES=\\\$\(git -C .*name-status -M -z/,/^print/" "$B" | sed -n '2,$p' | sed "s/')$//" > "$PARSER"
+PARSER=plugins/codex-pr-review/skills/two-model-pr-review/scripts/quote-name-status.py
 out=$(printf 'M\0bad\xffname.txt\0' | python3 "$PARSER" 2>&1); code=$?
 [ $code -eq 0 ] && printf '  ok    %-42s\n' "non-UTF-8 filename does not crash" || { printf '  FAIL  non-UTF-8 filename: %s\n' "$out"; FAIL=1; }
 out=$(printf 'M\0dir/first\nsecond.md\0' | python3 "$PARSER" 2>&1); code=$?
@@ -71,6 +70,16 @@ n=$(printf '%s\n' "$out" | wc -l | tr -d ' ')
 out=$(printf 'M\0a file with spaces.md\0R100\0old n.md\0new n.md\0' | python3 "$PARSER" 2>&1)
 printf '%s' "$out" | grep -q 'a file with spaces.md  (M)' && printf '%s' "$out" | grep -q 'new n.md  (R from old n.md, similarity 100)' \
   && printf '  ok    %-42s\n' "spaces and renames parse correctly" || { printf '  FAIL  parser: %s\n' "$out"; FAIL=1; }
+# X-16 / X-17: the quoting must be reversible — a raw byte or a real newline must
+# not render identically to a path whose own characters are a backslash and x/n.
+a=$(printf 'M\0bad\xffname.txt\0'      | python3 "$PARSER")
+b=$(printf 'M\0bad\\xffname.txt\0'    | python3 "$PARSER")
+c=$(printf 'M\0dir/f\nsecond.md\0'     | python3 "$PARSER")
+d=$(printf 'M\0dir/f\\nsecond.md\0'   | python3 "$PARSER")
+[ "$a" != "$b" ] && [ "$c" != "$d" ] && printf '  ok    %-42s\n' "quoting distinguishes raw bytes from text" || { printf '  FAIL  quoting is ambiguous: [%s] vs [%s]; [%s] vs [%s]\n' "$a" "$b" "$c" "$d"; FAIL=1; }
+printf '%s' "$a$c" | grep -q '^  - "' && printf '  ok    %-42s\n' "unusual paths are git-quoted" || { printf '  FAIL  unusual path not quoted: %s\n' "$a"; FAIL=1; }
+out=$(printf 'M\0normal.md\0' | python3 "$PARSER")
+[ "$out" = "  - normal.md  (M)" ] && printf '  ok    %-42s\n' "ordinary paths stay unquoted" || { printf '  FAIL  ordinary path altered: %s\n' "$out"; FAIL=1; }
 
 echo "builder: happy path on a throwaway repo"
 G="$TMP/repo"; mkdir -p "$G"; ( cd "$G" && git init -q && git config user.email t@t && git config user.name t && echo a > a.txt && git add a.txt && git commit -qm init ) || { echo "  FAIL  fixture"; FAIL=1; }
