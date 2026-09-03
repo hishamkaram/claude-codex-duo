@@ -29,7 +29,8 @@ CLASSES = {"FACT_ERROR", "MISSING_EVIDENCE", "ROOT_CAUSE_WRONG", "SUPERIOR_ALTER
            "RISK_UNMANAGED", "SCOPE", "TEST_GAP", "MIGRATION_UNSAFE"}
 VERDICTS = {"APPROVE", "APPROVE_WITH_CONDITIONS", "REJECT", "NO_OPINION_INSUFFICIENT_EVIDENCE"}
 RESOLUTIONS = {"SUSTAINED", "WITHDRAWN", "DOWNGRADED"}
-CAUSE_CLASSES = {"violated_invariant", "missing_abstraction", "wrong_domain_model", "broken_contract", "absent_constraint"}
+CAUSE_CLASSES = {"violated_invariant", "missing_abstraction", "wrong_domain_model", "broken_contract", "absent_constraint",
+                 "incorrect_authoritative_content"}
 PR_VERDICTS = {"ONE_PR", "SPLIT", "INSUFFICIENT_EVIDENCE"}
 
 

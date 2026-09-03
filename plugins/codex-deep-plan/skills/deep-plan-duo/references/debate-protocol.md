@@ -63,7 +63,8 @@ printed by `debate-status.py`. Codex's raw reply is never pasted here; it lives 
 
 | | Condition | Result |
 |---|---|---|
-| T1 | Codex verdict APPROVE or APPROVE_WITH_CONDITIONS, zero open BLOCKER/MAJOR, zero OPEN ledger rows | `PLAN.md` |
+| T0 | light or question mode: round 0 ruled on directly, no escalation trigger fired (`phases.md` §5) | `PLAN.md` + `PLAN-EVIDENCE.md` / `ANSWER.md` |
+| T1 | Codex verdict APPROVE or APPROVE_WITH_CONDITIONS, zero open BLOCKER/MAJOR, zero OPEN ledger rows | `PLAN.md` + `PLAN-EVIDENCE.md` |
 | T4 | An open BLOCKER whose falsifier is "a human must choose X over Y" | `DECISION-REQUIRED.md` |
 | T2 | Round cap reached (default 2, hard cap 3, never extended) | `DECISION-REQUIRED.md` if any BLOCKER/MAJOR is open, else `PLAN.md` + §Residual disagreements |
 | T3 | Two consecutive rounds with no new objection, class, citation or changed position | `PLAN.md` + §Residual disagreements |

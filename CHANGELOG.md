@@ -2,7 +2,16 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
-## [1.1.0] - 2026-09-02
+## [1.2.0] - 2026-09-03
+
+### Changed
+- **codex-deep-plan 1.1.0 — proportionate depth.** The first real use, on the four-word question "is read me updated", produced a 111-line plan proposing a checker script, a validator section and six fixtures for three wrong README lines. A codex-debate run (ruling REFINED, convergence after one round) traced this to rules, not misapplication: the skill had no notion of intent or size, none of its five cause classes fit "the content is wrong", so README drift became `absent_constraint` and the rubric rejected the direct edit as a workaround exactly as written; Codex retracted its own "faulty application" claim after tracing the chain. Changes, as amended in the debate:
+  - Phase 0 classifies **intent** (a question ends in `ANSWER.md`, never a plan) and **scale** (`light` for corrections to authoritative content, `standard` otherwise, `deep` with `--deep` or several issues). Light runs evidence, a short root cause, one blind Codex round and a short plan; it skips the candidate matrix and the debate rounds. Light is provisional and escalates after Phase 1 or after round 0 when the content is generated, duplicated or overridden, more than one defect appears, a blocking unknown remains, or an accepted objection goes beyond the edit.
+  - New cause class `incorrect_authoritative_content`, accepted by the verdict validator and named in the blind brief. The rubric's new Proportionality section makes the direct correction the real fix for such content and demotes enforcement machinery to an optional follow-up unless drift has recurred or the user asked; content that fails the authority test continues the causal chain to its generator or source.
+  - `PLAN.md` is summary-first and short by construction: summary, root cause → change → test → closure, file-by-file, tests, order and rollback. Scoring, risks, unknowns, debate closure, concessions and optional follow-ups move to `PLAN-EVIDENCE.md`; both are linted and citation-checked, and only `PLAN.md` is copied into plan mode. Codex's conditions — keep the mapping table, keep the ordering constraint, check both files — are met.
+  - `--deep` flag; `init-plan.sh` records `mode_requested`. Tests cover the flag, the cause class and the filled templates.
+
+
 
 ### Added
 - **codex-deep-plan** plugin (skill `deep-plan-duo`, command `/codex-deep-plan:plan`): evidence-only planning for GitHub issues, pull-request review comments, a single comment, or a plain request, ending in one reviewed PR plan. Nine phases on disk: scope → evidence → root cause → designs → draft → blind Codex round → divergence → bounded debate → `PLAN.md` or `DECISION-REQUIRED.md`.

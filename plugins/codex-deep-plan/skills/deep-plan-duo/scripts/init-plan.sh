@@ -1,23 +1,23 @@
 #!/bin/bash
 # init-plan.sh — create the artifact directory for one deep-plan run and pin its inputs verbatim.
 #
-#   init-plan.sh --repo <path> --out <dir> [--slug <name>] [--rounds N] [--solo] \
+#   init-plan.sh --repo <path> --out <dir> [--slug <name>] [--rounds N] [--solo] [--deep] \
 #                (--issue <N|URL> | --pr <N|URL> | --comment <URL> | --request "<text>" | --request-file <file>)...
 #   init-plan.sh --parse-only (--issue|--pr|--comment) <value>      # print the parsed reference; no network
 #
-# Writes: <out>/meta.json (slug, repo, base_sha, branch, dirty_tree, rounds, solo, inputs[])
+# Writes: <out>/meta.json (slug, repo, base_sha, branch, dirty_tree, rounds, solo, mode_requested, inputs[])
 #         <out>/00-scope.md.baseline (NUL-separated `git status`, the read-only audit baseline)
 #         <out>/inputs/<kind>-<id>.md one per input, body text untouched
 #         <out>/debate/ (empty)
 # Exit 0 ok · 2 usage error · 3 `gh` unavailable or a GitHub fetch failed (everything else is still
 # written; the message names the input so the caller can paste it with --request-file instead).
 set -uo pipefail
-USAGE='usage: init-plan.sh --repo <path> --out <dir> [--slug <name>] [--rounds N] [--solo] (--issue <N|URL> | --pr <N|URL> | --comment <URL> | --request "<text>" | --request-file <file>)...
+USAGE='usage: init-plan.sh --repo <path> --out <dir> [--slug <name>] [--rounds N] [--solo] [--deep] (--issue <N|URL> | --pr <N|URL> | --comment <URL> | --request "<text>" | --request-file <file>)...
        init-plan.sh --parse-only (--issue|--pr|--comment) <value>'
 die2() { echo "init-plan.sh: $1" >&2; echo "$USAGE" >&2; exit 2; }
 need() { [ $# -ge 2 ] || die2 "$1 requires a value"; case "$2" in -*) die2 "$1 requires a value (got option $2)";; esac; }
 SK="$(cd "$(dirname "$0")/.." && pwd)"
-REPO=""; OUT=""; SLUG=""; ROUNDS=2; SOLO=false; PARSE_ONLY=false
+REPO=""; OUT=""; SLUG=""; ROUNDS=2; SOLO=false; DEEP=false; PARSE_ONLY=false
 PAIRS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -26,6 +26,7 @@ while [ $# -gt 0 ]; do
     --slug) need "$@"; SLUG="$2"; shift;;
     --rounds) need "$@"; ROUNDS="$2"; shift;;
     --solo) SOLO=true;;
+    --deep) DEEP=true;;
     --parse-only) PARSE_ONLY=true;;
     --request) [ $# -ge 2 ] || die2 "--request requires a value"; PAIRS+=("request" "$2"); shift;;   # free text may begin with "-"
     --issue|--pr|--comment|--request-file) need "$@"; PAIRS+=("${1#--}" "$2"); shift;;
@@ -55,11 +56,12 @@ else
   done
 fi
 
-python3 - "$PARSE_ONLY" "$REPO" "${OUT:-}" "$SLUG" "$ROUNDS" "$SOLO" "${PAIRS[@]}" <<'PY'
+python3 - "$PARSE_ONLY" "$REPO" "${OUT:-}" "$SLUG" "$ROUNDS" "$SOLO" "$DEEP" "${PAIRS[@]}" <<'PY'
 import datetime, json, os, re, subprocess, sys
 
 parse_only, repo, out, slug, rounds, solo = sys.argv[1] == "true", sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6] == "true"
-pairs = sys.argv[7:]
+deep = sys.argv[7] == "true"
+pairs = sys.argv[8:]
 inputs = [(pairs[i], pairs[i + 1]) for i in range(0, len(pairs), 2)]
 GH_URL = re.compile(r"^(?:https?://)?github\.com/(?P<owner>[\w.-]+)/(?P<repo>[\w.-]+)/(?P<kind>issues|pull)/(?P<number>\d+)(?:/[\w/-]*)?(?:#(?P<frag>[\w-]+))?/?$")
 
@@ -289,8 +291,11 @@ if not slug:
         if os.path.isfile(text):
             text = os.path.splitext(os.path.basename(text))[0]
         slug = re.sub(r"[^a-z0-9]+", "-", " ".join(text.split()[:5]).lower()).strip("-") or "plan"
+# mode_requested is the user's flag; the skill writes the resolved "mode" (question|light|standard|deep)
+# after classifying intent and scale (references/phases.md §0).
 meta = {"slug": slug, "repo": repo, "base_sha": sha, "branch": branch, "dirty_tree": dirty, "rounds": rounds,
-        "solo": solo, "created": NOW, "inputs": records, "failed_inputs": failures}
+        "solo": solo, "mode_requested": "deep" if deep else None, "mode": None, "created": NOW,
+        "inputs": records, "failed_inputs": failures}
 json.dump(meta, open(os.path.join(out, "meta.json"), "w", encoding="utf-8"), indent=2)
 open(os.path.join(out, "meta.json"), "a").write("\n")
 print(f"BASE_SHA={sha}")

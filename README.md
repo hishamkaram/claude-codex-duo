@@ -52,7 +52,7 @@ These plugins make the second model useful by forcing structure around it:
 |---|---|---|
 | **codex-pr-review** | Two-model code review of a PR, branch, commit range, or uncommitted local changes. Ends in exactly one merge decision. | `/codex-pr-review:review-pr <target> <base> "<intent>"` |
 | **codex-debate** | Adversarial debate on any falsifiable motion or choice between named options: architecture decisions, migration plans, root-cause hypotheses, disputed review findings. | `/codex-debate:debate "<motion>" <mode> <rounds> [--seed <file>]` |
-| **codex-deep-plan** | Evidence-only planning for GitHub issues, PR review comments, a single comment, or a plain request: cited facts, root causes, real fixes scored against workarounds, a blind Codex diagnosis and a bounded debate. Ends in one PR plan handed to Claude Code plan mode. | `/codex-deep-plan:plan <issues \| pr N \| comment-url \| "request">... [--rounds N] [--solo]` |
+| **codex-deep-plan** | Evidence-only planning for GitHub issues, PR review comments, a single comment, or a plain request: cited facts, root causes, real fixes scored against workarounds, a blind Codex diagnosis and a bounded debate, at a depth that follows the request (a question gets an answer, a doc fix gets a short plan). Ends in one PR plan handed to Claude Code plan mode. | `/codex-deep-plan:plan <issues \| pr N \| comment-url \| "request">... [--slug <name>] [--rounds 1-3] [--deep] [--solo] [--no-plan-mode]` |
 
 All plugins also trigger from plain language ("review PR 123 with Codex", "debate with Codex whether ...", "plan a real fix for issues 12 and 13, no assumptions, and get Codex's take").
 
@@ -182,7 +182,8 @@ flowchart LR
 - **Root causes, real fixes.** Each chain must end in a violated invariant, missing abstraction, wrong domain model, broken contract or absent constraint. Designs are scored on five gates (mechanism, universality, structural invariant, deletion, regression proof) with blast radius, reversibility, verifiability and cost-of-being-wrong as counterweights; do-nothing, the largest correct change and the tempting workaround are always scored and the chosen design must beat each in writing. "One PR" is a hypothesis: a split is recommended when the inputs do not share a mechanism.
 - **Blind second model.** Round 0 gives Codex only the inputs, the base SHA and the in-scope paths; the brief is generated before any evidence exists and the builder refuses wording that reveals another analysis. Codex returns its own root causes, designs and single-PR verdict as JSON. `validate-verdict.py` enforces the objection contract (evidence, falsifier, proposed change), rejects praise and evidence-free concessions, makes a bare APPROVE require an adversarial attempt, and checks Codex's sha-pinned citations against the code.
 - **Bounded debate.** Default 2 rounds, hard cap 3. `debate-status.py` stops at the first termination condition: T1 converged, T2 cap, T3 no new information for two rounds, T4 a blocker that needs a human choice, T5 Codex unavailable (plan stamped `SOLO`, never simulated).
-- **Handoff.** `PLAN.md` (or `DECISION-REQUIRED.md`) is copied verbatim into a Claude Code plan-mode plan for approval, with the artifact directory as the source of record. `--no-plan-mode` prints it instead. The plan-mode tools are built in but not a documented skill contract; if no plan file path is offered the skill prints the plan.
+- **Proportionate depth.** Phase 0 classifies the request. A *question* ("is the README current?") gets `ANSWER.md`: evidence, one blind Codex look, a verdict, and any defects found, with no plan. A *content correction* (documentation, wording, config values that are the source of truth) runs *light*: evidence for the edited lines, the direct correction as the fix (cause class `incorrect_authoritative_content`; a checker is at most an optional follow-up), one blind Codex round, a short plan. Anything with reported behaviour runs *standard*; `--deep` or several issues run everything. Light is provisional: it escalates after the evidence phase or after Codex's round if the content is generated or duplicated, more than one defect appears, or an accepted objection goes beyond the edit.
+- **Handoff.** `PLAN.md` carries only what an approver acts on — summary, root cause → change → test → closure, file-by-file plan, tests, order and rollback — and is copied verbatim into a Claude Code plan-mode plan for approval. Candidate scoring, risks, unknowns and the debate closure live in `PLAN-EVIDENCE.md` beside it, with the artifact directory as the source of record. `--no-plan-mode` prints it instead. The plan-mode tools are built in but not a documented skill contract; if no plan file path is offered the skill prints the plan.
 
 ### Reviewing uncommitted changes
 
@@ -223,7 +224,7 @@ Everything is written outside the repository:
 /tmp/deep-plan-duo/<repo>/<slug>-<timestamp>/
   meta.json  inputs/<kind>-<id>.md  00-scope.md  01-evidence.md  02-root-cause.md  03-designs.md
   04-plan-draft.md  05-disagreements.md  debate/r<n>-prompt.md  debate/r<n>-codex.{json,stdout,meta,...}
-  debate/divergence.md  PLAN.md | DECISION-REQUIRED.md
+  debate/divergence.md  PLAN.md + PLAN-EVIDENCE.md | DECISION-REQUIRED.md | ANSWER.md
 ```
 
 Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at the first missing artifact.

@@ -1,5 +1,26 @@
 # Real solution vs. workaround (Phase 3)
 
+## Proportionality — read first
+
+The gates below are written for mechanisms in code. They do not apply to a correction of
+**authoritative content**: documentation, wording, a config value, a comment — any text or value
+that is itself the source of truth and that nothing regenerates. For such a correction:
+
+- the direct edit is the real fix by definition (cause class `incorrect_authoritative_content`);
+  it passes G1 and G2, and G3–G5 do not apply. It may not be labelled a workaround;
+- enforcement machinery (a checker, a fixture, a validator step) is an **optional follow-up**,
+  listed under "Optional follow-ups" in `PLAN-EVIDENCE.md`. It joins the PR only when the drift
+  has recurred (cite `git log` showing an earlier correction of the same claim) or the user asked
+  for enforcement;
+- authority must be shown, not assumed: Phase 1 records the searches for generators, duplicates
+  and overrides. Content that fails the authority test is not exempt — the causal chain continues
+  to the generator, the duplicated source, or the precedence rule, and that mechanism's cause
+  class applies with the full rubric.
+
+Depth is not quality. A plan that adds a subsystem to guarantee three lines of prose has confused
+"real" with "large" (SKILL.md constraint 7). The mandatory candidates and the auto-classify list
+below apply to standard and deep runs; light runs record the direct correction and stop.
+
 ## The operational test
 
 A change is a **workaround** if it makes the symptom unobservable while leaving the mechanism that
@@ -19,7 +40,7 @@ If you cannot, it is a patch.
 | G4 Deletion | Does it remove or unify code? Count net new branches, flags and special cases. Real fixes usually subtract. | complexity accretion |
 | G5 Regression proof | Is there a test that fails at the base SHA and exercises the mechanism, not just the reported input? | unproven |
 
-## Auto-classify as workaround
+## Auto-classify as workaround (standard and deep; never a content correction)
 
 - try/catch or null-guard at the crash site with no change to what produced the bad value
 - retry, sleep or timeout bump for a race whose ordering is not fixed
@@ -42,7 +63,7 @@ The gates reward structure and therefore bias toward rewrites. Score every candi
 A design passing all gates with irreversible migrations and a 40-file blast radius loses to one
 passing all gates in 4 files. "Real" means addresses the cause, not large.
 
-## Mandatory candidates in `03-designs.md`
+## Mandatory candidates in `03-designs.md` (standard and deep)
 
 Always score: **do-nothing** (state the cost of the status quo), **the largest correct change**
 (unlimited review budget), and **the tempting workaround** (labelled, rejected, so the rejection is

@@ -35,6 +35,13 @@ string-matches the quote against the cited range. Both must exit 0 before Phase 
 9. No design decision may rest on an `[INFERENCE]` or `[UNKNOWN]`. Promote it, or move it to the
    risk register with a detection signal and a rollback trigger.
 
+## Authority of edited content (light and question modes)
+
+Before a content correction can be the fix, `01-evidence.md` carries `[VERIFIED]` rows for the
+bounded searches that show the file is the source of truth: no generator writes it, no duplicate
+carries the same claim, no override replaces the value, and who consumes it. A hit on any of
+them escalates the run (`phases.md` §1).
+
 ## Collection order
 
 entry points → call path (read bodies, not names) → state, schema, invariants → reproduce the

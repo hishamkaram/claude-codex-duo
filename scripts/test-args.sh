@@ -147,6 +147,12 @@ chk "init: non-numeric comment fragment" 2 "must be #issuecomment"  bash "$I" --
 # F-16: free text may begin with a dash
 bash "$I" --repo "$G2" --out "$TMP/art16" --request "-v is ignored" >/dev/null 2>&1 && grep -q '^-v is ignored$' "$TMP/art16/inputs/request-1.md" \
   && printf '  ok    %-42s\n' "request text may start with a dash" || { printf '  FAIL  dash-leading request rejected\n'; FAIL=1; }
+# proportionality (debate 2026-09-03): --deep is recorded; the resolved mode is left to the skill
+bash "$I" --repo "$G2" --out "$TMP/artdeep" --deep --request x >/dev/null 2>&1
+python3 -c "import json; m=json.load(open('$TMP/artdeep/meta.json')); assert m['mode_requested']=='deep' and m['mode'] is None, m" \
+  && printf '  ok    %-42s\n' "--deep recorded as mode_requested" || { printf '  FAIL  --deep not recorded\n'; FAIL=1; }
+python3 -c "import json; m=json.load(open('$TMP/art16/meta.json')); assert m['mode_requested'] is None, m" \
+  && printf '  ok    %-42s\n' "mode_requested null without --deep" || { printf '  FAIL  mode_requested default\n'; FAIL=1; }
 # F-08: gh output of one JSON array per page (older gh) is merged
 FAKE2="$TMP/fakegh2"; mkdir -p "$FAKE2"; cat > "$FAKE2/gh" <<'GH'
 #!/bin/sh
@@ -239,6 +245,27 @@ chk "lint: fenced code skipped"        0 "OK"                   python3 "$L" "$T
 mkdir -p "$A/inputs2"; cp "$TMP/l-hedge.md" "$A/inputs/issue-1.md"
 chk "lint: inputs/ dir skipped"        0 "OK"                   python3 "$L" "$A"
 
+echo "deep-plan: the summary-first plan templates lint clean once filled"
+PT=plugins/codex-deep-plan/skills/deep-plan-duo/templates
+mkdir -p "$TMP/plan"; cp "$A/meta.json" "$TMP/plan/"
+python3 - "$PT" "$TMP/plan" "$SHA2" <<'PY2'
+import re,sys,os
+pt,out,sha=sys.argv[1:]
+fill={"PLAN.md":{"{{slug}}":"s","{{REVIEWED by Codex, N rounds, termination Tn | SOLO — unreviewed by second model: <reason>}}":"REVIEWED by Codex, 1 round, termination T0 (light)",
+  "{{light | standard | deep}}":"light","{{, escalated from light at Phase n: <trigger>}}":"","{{7-char sha}}":sha[:7],"{{branch}}":"main","{{date}}":"2026-09-03","{{date + 14 days}}":"2026-09-17","{{artifact dir}}":out},
+ "PLAN-EVIDENCE.md":{"{{slug}}":"s","{{7-char sha}}":sha[:7],"{{light | standard | deep}}":"light","{{DS-n}}":"DS-1","{{F-/V- ids}}":"F-1"},
+ "ANSWER.md":{"{{slug}}":"s","{{the input, quoted}}":"q","{{7-char sha}}":sha[:7],"{{branch}}":"main","{{date}}":"2026-09-03","{{CHECKED by Codex, blind round 0 | SOLO: <reason>}}":"SOLO: test","{{artifact dir}}":out}}
+for f,rep in fill.items():
+    t=open(os.path.join(pt,f)).read()
+    for k,v in rep.items(): t=t.replace(k,v)
+    t=re.sub(r"\{\{[^}]*\}\}","x",t)
+    t=t.replace("| F-1 | [FACT] | x | `x` \"x\" |", "| F-1 | [FACT] | x | `f.txt:1-1@%s` \"line one\" |" % sha)
+    t=t.replace("{{RC-1: one sentence (violated_invariant)}}","x")
+    open(os.path.join(out,f),"w").write(t)
+PY2
+chk "templates: filled PLAN/EVIDENCE/ANSWER lint" 0 "OK"        python3 "$L" "$TMP/plan"
+[ "$(wc -l < "$PT/PLAN.md")" -lt 45 ] && printf '  ok    %-42s\n' "PLAN.md template stays short" || { printf '  FAIL  PLAN.md template too long\n'; FAIL=1; }
+
 echo "deep-plan: validate-verdict.py enforces the objection contract"
 V="$DS/validate-verdict.py"
 chk "verdict: missing args"            2 "usage"                python3 "$V" --extract "$TMP/absent"
@@ -293,6 +320,15 @@ chk "verdict: unknown root cause ref"  1 "unknown root cause"   python3 "$V" --e
 # F-06: round 1 must resolve round-0 objections
 mkobj "$TMP/v-r1-none.json" 1 APPROVE '[]' "x"
 chk "verdict: round 1 must resolve r0" 1 "must resolve every prior" python3 "$V" --extract "$TMP/v-r1-none.json" --round 1 --prior "$TMP/v-hyp.json"
+# proportionality: the content cause class is accepted, an unknown class still rejected
+python3 - "$TMP/v-ok.json" "$TMP/v-content.json" "$TMP/v-badclass.json" <<'PY2'
+import json,sys
+v=json.load(open(sys.argv[1])); v["objections"]=[]; v["verdict"]="REJECT"
+c=json.loads(json.dumps(v)); c["root_causes"][0]["cause_class"]="incorrect_authoritative_content"; json.dump(c,open(sys.argv[2],"w"))
+b=json.loads(json.dumps(v)); b["root_causes"][0]["cause_class"]="docs_drift"; json.dump(b,open(sys.argv[3],"w"))
+PY2
+chk "verdict: content cause class accepted" 0 "OK"              python3 "$V" --extract "$TMP/v-content.json" --round 0
+chk "verdict: unknown cause class rejected" 1 "cause_class"     python3 "$V" --extract "$TMP/v-badclass.json" --round 0
 printf 'no json here\n' > "$TMP/v-none.txt"
 chk "verdict: no JSON block"           1 "no parseable JSON"    python3 "$V" --extract "$TMP/v-none.txt" --round 0
 mkobj "$TMP/v-r1.json" 1 REJECT '[{"id":"X-1","class":"SCOPE","severity":"MINOR","claim":"c","evidence":["cmd: git grep x -> 0 hits"],"proposed_change":"p","falsifier":"f"}]' "x"

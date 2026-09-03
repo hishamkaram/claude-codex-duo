@@ -7,7 +7,7 @@ Return exactly one fenced ```json block with this shape. Every string field is p
   "summary": "one paragraph, evidence not adjectives",
   "root_causes": [                         // round 0: required. later rounds: only if changed
     {"id": "RC-1", "explains": ["issue-123"],
-     "cause_class": "violated_invariant | missing_abstraction | wrong_domain_model | broken_contract | absent_constraint",
+     "cause_class": "violated_invariant | missing_abstraction | wrong_domain_model | broken_contract | absent_constraint | incorrect_authoritative_content",
      "statement": "one falsifiable sentence naming the mechanism, not the symptom",
      "evidence": ["src/x.ts:40-44@<sha> \"quote\"", "cmd: <command> -> <excerpt>"]}
   ],
