@@ -28,7 +28,8 @@ description. Then: whether that matches the stated intent.}}
 ## 6. DISAGREEMENT LOG
 BOTH: {{n}} | CLAUDE-ONLY: {{n}} | CODEX-ONLY: {{n}} | CONFLICT: {{n}}
 Codex status: {{SUCCEEDED | UNAVAILABLE | FAILED | DECLINED — reason}} · job ids: {{from 02-codex.meta / 05-exchange-*.meta}}
-Blindness: procedural (unmotivated brief + ordering + mode-000 defense-in-depth); not structurally guaranteed.
+Lead: {{`codex-pr-review:lead-reviewer` task <id> | general-purpose fallback (reason) | in-context fallback (reason)}} · join: {{JOIN-OK line from 03-matrix.md}}
+Blindness: procedural (neutral packets hashed before any finding + lead sealed before any Codex output was read + lead in its own context + mode-000 defense-in-depth); not structurally guaranteed. {{Concurrency: the two reviews overlapped from <lead start> to <first end> (00-run.md) | single-model run: no cross-review, nothing ran concurrently}}
 {{every UNRESOLVED item with both positions and strongest evidence for each}}
 
 **Escalate one at a time (optional):** for each UNRESOLVED item, a ready-to-paste line:

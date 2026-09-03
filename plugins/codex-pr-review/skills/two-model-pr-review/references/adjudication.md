@@ -46,7 +46,16 @@ A test that FAILS at head for the predicted reason is the E0 proof; keep its log
 as `04-<id>-repro.log`.
 
 Codex cannot execute tests or builds in its sandbox, so every rung-(a) and
-rung-(c) proof is the lead's to run. Budget Phase 4 accordingly.
+rung-(c) proof is the orchestrator's to run. Budget Phase 4 accordingly.
+
+With `--workflow` (`references/workflow-mode.md`): rungs (a), (b) and (d) run
+per finding, concurrently, in `finding-verifier` agents through the shipped
+workflow script; each returns CONFIRMED / REFUTED / UNVERIFIABLE with its
+method and quoted evidence, which you copy into `04-verification.md` under the
+finding. Rung (c) — the project's suite, linter, typechecker — is never run by
+those agents (concurrent suites in one checkout collide on build output); run
+it once yourself, sequentially, for the findings that still need it. A verifier
+that returns nothing (null) leaves its finding to you, in-context.
 
 Mark each CONFIRMED / REFUTED / UNVERIFIABLE with the method used. Delete
 REFUTED from the main report; list them in the false-positive appendix with the

@@ -71,6 +71,15 @@ for r in plugins/*/scripts/codex-run.sh; do
   cmp -s "$REF" "$r" && note ok "$r identical to $REF" || note FAIL "$r differs from $REF (the runner is shared by copy; keep the copies byte-identical)"
 done
 
+echo "4c. Workflow scripts compile as the Workflow tool evaluates them (scripts/js-check.sh)"
+if command -v node >/dev/null 2>&1; then
+  while IFS= read -r s; do
+    bash scripts/js-check.sh "$s" 2>/dev/null && note ok "$s" || note FAIL "$s has a JavaScript syntax error (js-check.sh)"
+  done < <(find plugins -name '*.js' | sort)
+else
+  note FAIL "node is not installed; workflow scripts cannot be checked"
+fi
+
 echo "5. No absolute or home-relative paths leak into shipped files"
 if grep -rn '~/\.claude/skills/\|~/\.claude/scripts/\|/Users/' plugins >/dev/null 2>&1; then
   grep -rn '~/\.claude/skills/\|~/\.claude/scripts/\|/Users/' plugins | sed 's/^/  FAIL    /'; FAIL=1
