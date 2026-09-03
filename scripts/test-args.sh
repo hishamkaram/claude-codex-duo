@@ -22,7 +22,8 @@ chk() {
     printf '  FAIL  %-42s exit=%s (want %s) out=%s\n' "$n" "$code" "$e" "$(printf '%s' "$out" | head -1)"; FAIL=1
   fi
 }
-TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+TMP="$(mktemp -d)" && [ -n "$TMP" ] && [ -d "$TMP" ] || { echo "test-args.sh: mktemp -d failed; refusing to run with an empty TMP" >&2; exit 1; }
+trap 'rm -rf "$TMP"' EXIT
 PROMPT="$TMP/p.md"; echo hi > "$PROMPT"; PFX="$TMP/x"
 
 echo "runner: every invocation error exits 4 (never 1)"
@@ -153,6 +154,11 @@ python3 -c "import json; m=json.load(open('$TMP/artdeep/meta.json')); assert m['
   && printf '  ok    %-42s\n' "--deep recorded as mode_requested" || { printf '  FAIL  --deep not recorded\n'; FAIL=1; }
 python3 -c "import json; m=json.load(open('$TMP/art16/meta.json')); assert m['mode_requested'] is None, m" \
   && printf '  ok    %-42s\n' "mode_requested null without --deep" || { printf '  FAIL  mode_requested default\n'; FAIL=1; }
+# review F-05: --deep defaults to three rounds; an explicit --rounds wins; the default stays 2
+python3 -c "import json; assert json.load(open('$TMP/artdeep/meta.json'))['rounds']==3" && printf '  ok    %-42s\n' "--deep defaults rounds to 3" || { printf '  FAIL  --deep rounds default\n'; FAIL=1; }
+bash "$I" --repo "$G2" --out "$TMP/artdeep1" --deep --rounds 1 --request x >/dev/null 2>&1
+python3 -c "import json; assert json.load(open('$TMP/artdeep1/meta.json'))['rounds']==1" && printf '  ok    %-42s\n' "--deep keeps explicit --rounds" || { printf '  FAIL  --deep overrides --rounds\n'; FAIL=1; }
+python3 -c "import json; assert json.load(open('$TMP/art16/meta.json'))['rounds']==2" && printf '  ok    %-42s\n' "rounds default 2 without --deep" || { printf '  FAIL  rounds default\n'; FAIL=1; }
 # F-08: gh output of one JSON array per page (older gh) is merged
 FAKE2="$TMP/fakegh2"; mkdir -p "$FAKE2"; cat > "$FAKE2/gh" <<'GH'
 #!/bin/sh
@@ -179,6 +185,11 @@ printf '| F-1 | [FACT] | both | `f.txt:1-1@%s` "line one" ; `f.txt:2-2@%s` "line
 chk "citations: two citations per cell pass" 0 "checked 2 citation" python3 "$C" --repo "$G2" "$TMP/ev-two.md"
 printf '| F-1 | [FACT] | both | `f.txt:1-1@%s` "line one" ; `f.txt:2-2@%s` "line nine" |\n' "$SHA2" "$SHA2" > "$TMP/ev-two-bad.md"
 chk "citations: second of two citations fails" 1 "quote not found" python3 "$C" --repo "$G2" "$TMP/ev-two-bad.md"
+# review F-02: a citation never borrows a neighbour's quote
+printf '| F-1 | [FACT] | x | `f.txt:1-1@%s` ; `f.txt:2-2@%s` "line two" |\n' "$SHA2" "$SHA2" > "$TMP/ev-noq1.md"
+chk "citations: first citation without quote fails" 1 "no verbatim" python3 "$C" --repo "$G2" "$TMP/ev-noq1.md"
+printf '| F-1 | [FACT] | x | `f.txt:1-1@%s` "line one" ; `f.txt:1-1@%s` |\n' "$SHA2" "$SHA2" > "$TMP/ev-noq2.md"
+chk "citations: second citation without quote fails" 1 "no verbatim" python3 "$C" --repo "$G2" "$TMP/ev-noq2.md"
 printf '| F-1 | [FACT] | wrong | `f.txt:2-2@%s` "line nine" |\n' "$SHA2" > "$TMP/ev-bad.md"
 chk "citations: wrong quote fails"     1 "quote not found"      python3 "$C" --repo "$G2" "$TMP/ev-bad.md"
 printf '| F-1 | [FACT] | oob | `f.txt:9-12@%s` "line two" |\n' "$SHA2" > "$TMP/ev-oob.md"
@@ -334,6 +345,17 @@ b=json.loads(json.dumps(v)); b["root_causes"][0]["cause_class"]="docs_drift"; js
 PY2
 chk "verdict: content cause class accepted" 0 "OK"              python3 "$V" --extract "$TMP/v-content.json" --round 0
 chk "verdict: unknown cause class rejected" 1 "cause_class"     python3 "$V" --extract "$TMP/v-badclass.json" --round 0
+# review F-03: a question with no defect is a valid round 0 only in question mode, and only with a cited answer
+python3 - "$TMP/v-ok.json" "$TMP/v-q.json" "$TMP/v-q-nocite.json" "$SHA2" <<'PY2'
+import json,sys
+v=json.load(open(sys.argv[1])); v["objections"]=[]; v["verdict"]="APPROVE"; v["root_causes"]=[]; v["designs"]=[]
+v["single_pr_recommendation"]={"verdict":"INSUFFICIENT_EVIDENCE","because":"no defect found"}
+q=json.loads(json.dumps(v)); q["summary"]='Yes: f.txt:2-2@%s "line two" shows it.' % sys.argv[4]; json.dump(q,open(sys.argv[2],"w"))
+n=json.loads(json.dumps(v)); n["summary"]="Yes, it is fine."; json.dump(n,open(sys.argv[3],"w"))
+PY2
+chk "verdict: question mode accepts no-defect answer" 0 "OK"   python3 "$V" --extract "$TMP/v-q.json" --round 0 --mode question --repo "$G2" --base-sha "$SHA2"
+chk "verdict: question answer needs a citation" 1 "citation"    python3 "$V" --extract "$TMP/v-q-nocite.json" --round 0 --mode question --repo "$G2" --base-sha "$SHA2"
+chk "verdict: no-defect shape rejected outside question mode" 1 "root_causes" python3 "$V" --extract "$TMP/v-q.json" --round 0 --repo "$G2" --base-sha "$SHA2"
 printf 'no json here\n' > "$TMP/v-none.txt"
 chk "verdict: no JSON block"           1 "no parseable JSON"    python3 "$V" --extract "$TMP/v-none.txt" --round 0
 mkobj "$TMP/v-r1.json" 1 REJECT '[{"id":"X-1","class":"SCOPE","severity":"MINOR","claim":"c","evidence":["cmd: git grep x -> 0 hits"],"proposed_change":"p","falsifier":"f"}]' "x"
@@ -370,6 +392,17 @@ chk "prompt: leak in scope paths exits 3" 3 "LEAK"              bash "$BP" --art
 printf '# Scope\n\n## In-scope paths\n- debate/notes.md\n- .claude-plugin/plugin.json (manifest)\n- f.txt\n' > "$A/00-scope.md"
 chk "prompt: repository paths with leak words pass" 0 "prompt written" bash "$BP" --art "$A" --round 0
 grep -q '^- debate/notes.md$' "$A/debate/r0-prompt.md" && grep -q '^- .claude-plugin/plugin.json (manifest)$' "$A/debate/r0-prompt.md" && printf '  ok    %-42s\n' "exempt paths restored in the brief" || { printf '  FAIL  exempt paths not restored\n'; FAIL=1; }
+# review F-01: only normalized relative repository paths are exempt — never absolute or `..` paths, whatever exists there
+LEAKDIR="$TMP/debate-artifacts"; mkdir -p "$LEAKDIR"
+printf '# Scope\n\n## In-scope paths\n- %s\n- f.txt\n' "$LEAKDIR" > "$A/00-scope.md"
+chk "prompt: absolute existing path is not exempt" 3 "LEAK"    bash "$BP" --art "$A" --round 0
+printf '# Scope\n\n## In-scope paths\n- ../%s/debate/notes.md\n' "$(basename "$G2")" > "$A/00-scope.md"
+chk "prompt: parent-relative path is not exempt" 3 "LEAK"      bash "$BP" --art "$A" --round 0
+# a path present at the pinned base SHA but deleted from the worktree is still exempt (git branch)
+A5="$TMP/art5"; bash "$I" --repo "$G2" --out "$A5" --request x >/dev/null 2>&1; rm -f "$G2/debate/notes.md"
+printf '# Scope\n\n## In-scope paths\n- debate/notes.md\n' > "$A5/00-scope.md"
+chk "prompt: path at base SHA only is exempt" 0 "prompt written" bash "$BP" --art "$A5" --round 0
+( cd "$G2" && git checkout -q -- debate/notes.md )
 printf '# Scope\n\n## In-scope paths\n- f.txt\n' > "$A/00-scope.md"
 printf 'Please compare this with Claude'"'"'s debate.\n' > "$TMP/req-claude.txt"
 A3="$TMP/art3"; bash "$I" --repo "$G2" --out "$A3" --request-file "$TMP/req-claude.txt" >/dev/null 2>&1

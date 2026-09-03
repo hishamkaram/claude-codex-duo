@@ -18,7 +18,7 @@ import argparse, json, os, re, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True   # never write __pycache__ into the plugin (validator check 5, review F-14)
 sys.path.insert(0, HERE)
-from duo_common import CITE_RE, has_citation, has_evidence_ref, load_rounds, fold, outstanding  # noqa: E402
+from duo_common import CITE_RE, CMD_RE, has_citation, has_evidence_ref, load_rounds, fold, outstanding  # noqa: E402
 
 PRAISE = re.compile(r"\b(great|excellent|as you (correctly|rightly)|well done|i (fully )?agree|"
                     r"good (catch|point|plan|idea)|solid plan|nice work|impressive)\b", re.I)
@@ -97,11 +97,18 @@ def check_objection(o, e):
         e.append(f"{oid}: hypothesis-only objection cannot be BLOCKER/MAJOR")
 
 
-def check_round0(v, e):
-    """Round 0 must be a complete independent analysis (review finding F-05)."""
+def check_round0(v, e, mode=None):
+    """Round 0 must be a complete independent analysis (review finding F-05). In question mode
+    (meta.json "mode": "question") no defect may exist: root_causes and designs may be empty, and
+    the answer must then be in summary with at least one citation (review F-03)."""
     rcs = v.get("root_causes")
-    if not isinstance(rcs, list) or not rcs:
+    question = mode == "question"
+    if not isinstance(rcs, list) or (not rcs and not question):
         e.append("round 0 requires independent root_causes[]"); rcs = []
+    if question and not rcs:
+        summ = str(v.get("summary") or "")
+        if not (CITE_RE.search(summ) or CMD_RE.search(summ)):
+            e.append("question mode with no root cause: summary must carry the answer with a citation")
     rc_ids = set()
     for i, rc in enumerate(rcs):
         rid = rc.get("id") if isinstance(rc, dict) else None
@@ -119,7 +126,9 @@ def check_round0(v, e):
             e.append(f"{tag}: no sha-pinned path:line or cmd: evidence")
     ds = v.get("designs")
     if not isinstance(ds, list) or len(ds) < 2:
-        e.append("round 0 requires at least 2 designs"); ds = ds if isinstance(ds, list) else []
+        if not (question and isinstance(ds, list) and not ds and not rcs):
+            e.append("round 0 requires at least 2 designs")
+        ds = ds if isinstance(ds, list) else []
     preferred = 0
     for i, d in enumerate(ds):
         did = d.get("id") if isinstance(d, dict) else None
@@ -148,11 +157,12 @@ def check_round0(v, e):
     else:
         if spr.get("verdict") not in PR_VERDICTS:
             e.append(f"single_pr_recommendation.verdict not in {sorted(PR_VERDICTS)}")
-        if not nonempty_str(spr.get("because")) or not (has_evidence_ref(spr["because"]) or any(r in spr["because"] for r in rc_ids)):
+        no_defect = question and not rcs and spr.get("verdict") == "INSUFFICIENT_EVIDENCE"
+        if not no_defect and (not nonempty_str(spr.get("because")) or not (has_evidence_ref(spr["because"]) or any(r in spr["because"] for r in rc_ids))):
             e.append("single_pr_recommendation.because must cite evidence or a root cause id")
 
 
-def validate(v, round_, role, prior_rounds):
+def validate(v, round_, role, prior_rounds, mode=None):
     e, warn = [], []
     if not isinstance(v, dict):
         return ["top level is not a JSON object"], warn
@@ -201,7 +211,7 @@ def validate(v, round_, role, prior_rounds):
             e.append(f"objection_resolutions[{rid}]: DOWNGRADED needs a new severity")
 
     if round_ == 0 and role == "codex":
-        check_round0(v, e)
+        check_round0(v, e, mode)
     elif round_ and round_ >= 1:
         # Every objection still outstanding from earlier rounds must be resolved in EVERY later
         # round, round 1 included (review finding F-06), against cumulative state (F-07).
@@ -251,7 +261,7 @@ def main():
     p = argparse.ArgumentParser(add_help=False)
     p.add_argument("--extract"); p.add_argument("--out"); p.add_argument("--round", type=int)
     p.add_argument("--role", default="codex"); p.add_argument("--repo"); p.add_argument("--base-sha")
-    p.add_argument("--art"); p.add_argument("--prior")
+    p.add_argument("--art"); p.add_argument("--prior"); p.add_argument("--mode")
     try:
         a = p.parse_args()
     except SystemExit:
@@ -279,7 +289,8 @@ def main():
     v = extract(open(a.extract, encoding="utf-8", errors="replace").read())
     if v is None:
         print("FAIL: no parseable JSON object in the reply", file=sys.stderr); return 1
-    errs, warns = validate(v, a.round, a.role, prior_rounds)
+    mode = a.mode or meta.get("mode")
+    errs, warns = validate(v, a.round, a.role, prior_rounds, mode)
     cited = 0
     if repo and not errs:
         cite_fails, cited = check_citations(v, repo, base)

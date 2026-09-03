@@ -85,9 +85,15 @@ if rnd == 0:
     # paths contain "debate" and ".claude" (live-run friction 2026-09-03). Anything else on the
     # bullet (a comment after the path) is checked.
     def is_repo_path(p):
+        # Only a normalized relative path inside the repository qualifies (review F-01): an absolute
+        # path or a `..` segment is never exempt, whatever exists there.
+        if os.path.isabs(p) or ".." in p.split("/") or p.startswith("~"):
+            return False
         if subprocess.run(["git", "-C", meta["repo"], "cat-file", "-e", f"{sha}:{p}"], capture_output=True).returncode == 0:
             return True
-        return os.path.exists(os.path.join(meta["repo"], p))
+        root = os.path.realpath(meta["repo"])
+        full = os.path.realpath(os.path.join(root, p))
+        return full.startswith(root + os.sep) and os.path.exists(full)
     marks = {}
     bullets = []
     for i, p in enumerate(paths):
@@ -101,9 +107,13 @@ if rnd == 0:
     t = open(os.path.join(sk, "templates", "codex-r0.md"), encoding="utf-8").read()
     # The inputs and the repository path are the user's own text: substituted after the leak check.
     INPUT_MARK, REPO_MARK = "@@INPUTS@@", "@@REPO@@"
+    question_note = ("The inputs ask a question rather than report a problem. Answer it in `summary` with "
+                     "citations. If you find no defect, return `root_causes: []`, `designs: []` and "
+                     "`single_pr_recommendation.verdict: \"INSUFFICIENT_EVIDENCE\"` with `because: \"no defect found\"`; "
+                     "if you do find one, fill them as for any other input.") if meta.get("mode") == "question" else ""
     t = fill(t, {"{{repo path}}": REPO_MARK, "{{base SHA}}": sha, "{{base SHA short}}": sha[:7],
                  "{{in-scope paths}}": paths_txt, "{{tool budget}}": budget or "12",
-                 "{{inputs}}": INPUT_MARK, "{{verdict schema}}": schema})
+                 "{{inputs}}": INPUT_MARK, "{{verdict schema}}": schema, "{{mode note}}": question_note})
     hits = sorted({m.group(0).lower() for m in LEAK.finditer(t)})
     if hits:
         print("build-prompt.sh: LEAK in the blind brief (wording that reveals another analysis exists): " + ", ".join(hits), file=sys.stderr)

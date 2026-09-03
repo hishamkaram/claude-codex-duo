@@ -33,7 +33,7 @@
       "name": "codex-deep-plan",
       "description": "Evidence-only deep planning for issues, PR comments, or a request, with a blind Codex second opinion and a bounded debate, ending in one reviewed PR plan, or an evidence-backed answer for a question.",
       "source": "./plugins/codex-deep-plan",
-      "version": "1.1.0",
+      "version": "2.0.0",
       "category": "planning",
       "tags": [
         "planning",

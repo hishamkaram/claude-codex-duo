@@ -48,7 +48,7 @@ planning, not implementing.
 | Slug | `--slug`, else derived by `init-plan.sh` from the first input |
 | Rounds | `--rounds`, else 2. Hard cap 3, never extended |
 | Intent | *question* when the inputs ask whether something is true or how something behaves ("is the README current?", "why does X fail?"); *change request* when they ask for something to be different. A question ends in `ANSWER.md`, not a plan, unless the answer reveals a defect and the user then asks for a plan |
-| Scale (change requests) | `light` when every input is a correction to authoritative content — documentation, wording, config values — with no reported behaviour; `standard` otherwise; `deep` when `--deep` is passed or the inputs are several issues. Provisional: re-evaluated after Phase 1 and after Codex round 0 (`references/phases.md`) |
+| Scale (change requests) | `light` when every input is a correction to authoritative content — documentation, wording, config values — with no reported behaviour; `standard` otherwise; `deep` when `--deep` is passed or the inputs are several issues. Provisional: re-evaluated after Phase 1 and after Codex round 0 (`references/phases.md`); escalation is by mechanism, never by counting defects in one authoritative file |
 | `--deep` | force full depth regardless of the inputs |
 | `--solo` | skip Codex entirely; plan is stamped SOLO |
 | `--no-plan-mode` | print `PLAN.md` at the end instead of entering plan mode |
@@ -69,7 +69,7 @@ Fresh directory OUTSIDE the repository, never overwritten:
 `/tmp/deep-plan-duo/<repo>/<slug>-<timestamp>/` — created by
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/skills/deep-plan-duo/scripts/init-plan.sh --repo <repo> --out "$ART" [--slug s] [--rounds n] [--solo] <inputs...>
+${CLAUDE_PLUGIN_ROOT}/skills/deep-plan-duo/scripts/init-plan.sh --repo <repo> --out "$ART" [--slug s] [--rounds n] [--solo] [--deep] <inputs...>
 ```
 
 Blindness is procedural, not structural: Codex's sandbox reads `/tmp` and Claude Code session
@@ -95,7 +95,8 @@ Before each phase, list the artifact directory and resume at the first missing a
 every artifact with `STATUS: PHASE <n> COMPLETE` (or `... COMPLETE (SKIPPED — <reason>)`). Never
 start a phase before the previous artifact carries that line. Specifically: no evidence before
 `debate/r0-prompt.md` exists; no contact with Codex before `04-plan-draft.md` exists and `01`–`04`
-are mode 000; no `PLAN.md` before a termination condition is recorded in `05-disagreements.md`
+are mode 000 (question mode: before `01-evidence.md` exists and is mode 000, since a question
+writes no plan draft); no `PLAN.md` before a termination condition is recorded in `05-disagreements.md`
 (or Phase 5 is SKIPPED).
 
 ## Phases
@@ -134,9 +135,10 @@ Otherwise run to Phase 8 without check-ins.
 
 ## Completion gate
 
-Before finishing confirm: both linters exit 0 on the artifact dir, `PLAN.md` and
-`PLAN-EVIDENCE.md` (or `ANSWER.md`); the resolved mode and every escalation are recorded in
-`00-scope.md`; every input maps to root cause → change → test → closure criterion; every test in the matrix states why it
+Before finishing confirm: `check-citations.py` exits 0 on `01-evidence.md` and, with
+`--allow-empty` (final files cite by id), on `PLAN.md` and `PLAN-EVIDENCE.md` (or `ANSWER.md`);
+`lint-claims.py` exits 0 on the artifact dir; the resolved mode and every escalation are recorded in
+`00-scope.md`; for a change request every input maps to root cause → change → test → closure criterion; every test in the matrix states why it
 fails at the base SHA; every objection in the ledger has a final status with evidence; the review
 status on line 1 is truthful, with round count and termination condition; your own concessions
 are listed with round numbers; `01`–`04` are back to mode 600; no Codex call used `--write`;

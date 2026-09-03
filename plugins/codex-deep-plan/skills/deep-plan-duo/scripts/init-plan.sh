@@ -17,7 +17,7 @@ USAGE='usage: init-plan.sh --repo <path> --out <dir> [--slug <name>] [--rounds N
 die2() { echo "init-plan.sh: $1" >&2; echo "$USAGE" >&2; exit 2; }
 need() { [ $# -ge 2 ] || die2 "$1 requires a value"; case "$2" in -*) die2 "$1 requires a value (got option $2)";; esac; }
 SK="$(cd "$(dirname "$0")/.." && pwd)"
-REPO=""; OUT=""; SLUG=""; ROUNDS=2; SOLO=false; DEEP=false; PARSE_ONLY=false
+REPO=""; OUT=""; SLUG=""; ROUNDS=""; SOLO=false; DEEP=false; PARSE_ONLY=false
 PAIRS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -33,6 +33,8 @@ while [ $# -gt 0 ]; do
     *) die2 "unknown arg $1";;
   esac; shift
 done
+# deep defaults to three rounds (phases.md §0); an explicit --rounds always wins (review F-05)
+if [ -z "$ROUNDS" ]; then if $DEEP; then ROUNDS=3; else ROUNDS=2; fi; fi
 case "$ROUNDS" in ''|*[!0-9]*) die2 "--rounds requires a whole number (got '$ROUNDS')";; esac
 ROUNDS=$(printf '%s' "$ROUNDS" | sed 's/^0*//'); [ -n "$ROUNDS" ] && [ "$ROUNDS" -ge 1 ] && [ "$ROUNDS" -le 3 ] || die2 "--rounds must be between 1 and 3"
 [ ${#PAIRS[@]} -gt 0 ] || die2 "at least one input is required (--issue, --pr, --comment, --request or --request-file)"

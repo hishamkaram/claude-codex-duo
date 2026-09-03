@@ -70,18 +70,22 @@ def base_for(path, explicit, repo_explicit):
     return meta_for(path).get("base_sha")
 
 
-def candidates(line, start, end=None):
-    """Quote candidates after a citation, up to the next citation on the line (`end`). A quoted
-    line of code may itself contain double quotes (`note ok "no machine-specific paths"`), so
-    when more than one pair follows the citation the intended quote is the whole span; the
-    shortest pair would match trivially."""
+def candidates(line, start, end=None, prev_end=0):
+    """Quote candidates for one citation: the text after it up to the next citation on the line
+    (`end`). The quote-before-citation form is accepted only when the citation is alone on its
+    line, so a quote never crosses a citation boundary (review F-02). A quoted line of code may
+    itself contain double quotes (`note ok "no machine-specific paths"`), so when more than one
+    pair follows the citation the intended quote is the whole span; the shortest pair would match
+    trivially."""
     out = []
     tail = line[start:end]
     nq = tail.count('"')
     if nq > 2:
         out.append(tail[tail.find('"') + 1:tail.rfind('"')])
     else:
-        q = QUOTE.search(tail) or QUOTE.search(line)
+        q = QUOTE.search(tail)
+        if q is None and end is None and prev_end == 0:
+            q = QUOTE.search(line[:start])
         if q:
             out.append(q.group(1))
     seen, uniq = set(), []
@@ -99,6 +103,7 @@ def check_line(repo, base, where, line):
     for i, m in enumerate(matches):
         n += 1
         nxt = matches[i + 1].start() if i + 1 < len(matches) else None
+        prev_end = matches[i - 1].end() if i > 0 else 0
         a, b = int(m["a"]), int(m["b"] or m["a"])
         full = resolve(repo, m["sha"])
         if full is None:
@@ -112,7 +117,7 @@ def check_line(repo, base, where, line):
             fails.append(f"{where}: {m['path']} not found at {m['sha']} (git show failed)"); continue
         if a < 1 or b > len(lines) or a > b:
             fails.append(f"{where}: {m['path']}:{a}-{b} out of range (file has {len(lines)} lines)"); continue
-        cands = candidates(line, m.end(), nxt)
+        cands = candidates(line, m.end(), nxt, prev_end)
         if not cands:
             fails.append(f"{where}: {m['path']}:{a}-{b}@{m['sha'][:7]} has no verbatim \"quote\""); continue
         short = [q for q in cands if len(q.split()) <= MAX_WORDS]

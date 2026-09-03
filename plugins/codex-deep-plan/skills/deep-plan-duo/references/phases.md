@@ -9,8 +9,9 @@
    `## Mode`, each with the sentence of the input that decided it, and into `meta.json` as
    `"mode": "question" | "light" | "standard" | "deep"` (write it with a one-line python edit; the
    script only records `mode_requested` from `--deep`). Quote the deciding words: "is the README
-   current" is a question; "fix the README row for X" is a light change request; "issues 12 and
-   13 crash on empty input" is standard. When in doubt choose the deeper mode; the cost of a wrong
+   current" is a question; "fix the README row for X" is a light change request; "issue 12 crashes
+   on empty input" is standard; "issues 12 and 13 crash on empty input" is deep (several issues,
+   SKILL.md Step 0). When in doubt choose the deeper mode; the cost of a wrong
    `light` is a missed mechanism, the cost of a wrong `standard` is reading time.
    Modes and the phases they run:
 
@@ -52,8 +53,9 @@ searches that show the file you would edit is the source of truth: no generator 
 (`git grep -F '<distinctive phrase>'`), no override or precedence rule replaces the value at
 runtime, and who consumes it. **Re-evaluate scale now**: escalate `light` → `standard` (write the
 trigger under `## Mode` in `00-scope.md`) when any holds: a blocking unknown; the content is
-generated, duplicated or overridden; the evidence shows more than one defect; the evidence points
-at behaviour rather than content. `STATUS: PHASE 1 COMPLETE`.
+generated, duplicated or overridden; the evidence points at behaviour rather than content.
+Several wrong sentences in one authoritative file are several plan rows, not a trigger (review
+F-06, settled with Codex). `STATUS: PHASE 1 COMPLETE`.
 
 ## Phase 2 — Root cause → `02-root-cause.md`
 
@@ -98,10 +100,11 @@ PHASE 5 COMPLETE`. `--solo`: write the SKIPPED artifact without running anything
 
 **Light and question modes — re-evaluate scale after round 0.** Rule on every Codex objection
 directly in `05-disagreements.md` (ACCEPT / REJECT / DEFER / CRUX with evidence; no rounds follow).
-Escalate to `standard` (trigger recorded in `00-scope.md`, then continue at Phase 3) when: a
-BLOCKER or MAJOR objection is accepted and its change goes beyond editing the authoritative
-content; Codex's root cause is a different mechanism with a citation you cannot refute; or a
-blocking unknown appears. Otherwise proceed to Phase 8 with termination `T0 (light)`.
+Escalate to `standard` (trigger recorded in `00-scope.md`, then continue at Phase 3) when: an
+accepted objection of any severity, or new evidence, requires a change that is not an edit of the
+authoritative content; the content fails the authority test; Codex cites a different mechanism
+and the citation survives verification; or a blocking unknown appears. Otherwise proceed to
+Phase 8 with termination `T0 (light)`.
 
 ## Phase 6 — Divergence → `debate/divergence.md`
 
@@ -126,8 +129,9 @@ review status stamp. `PLAN.md` holds only what an approver acts on: summary, roo
 test → closure table, file-by-file plan, test matrix, order and rollback. `PLAN-EVIDENCE.md`
 holds the scope contract, candidate scoring (or "not scored: light mode"), risk register,
 unknowns, debate closure, concessions and optional follow-ups. Prose uses 7-character SHAs; ids
-appear in table cells, not in sentences. Run `check-citations.py` on both files and
-`lint-claims.py "$ART"`; all OK. Then the completion gate in SKILL.md, then the plan-mode handoff.
+appear in table cells, not in sentences. Run `check-citations.py --allow-empty` on both files (they
+cite by id; `01-evidence.md` is re-checked without the flag) and `lint-claims.py "$ART"`; all OK.
+Then the completion gate in SKILL.md, then the plan-mode handoff.
 
 Question mode: fill `templates/ANSWER.md` instead — the answer in one paragraph, the evidence
 rows it rests on, what Codex's blind round added or disputed, and the defects found (if any) with
