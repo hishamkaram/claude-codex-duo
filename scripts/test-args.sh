@@ -260,6 +260,10 @@ printf '```\nthis should be ignored inside a fence\n```\n' > "$TMP/l-fence.md"
 chk "lint: fenced code skipped"        0 "OK"                   python3 "$L" "$TMP/l-fence.md"
 mkdir -p "$A/inputs2"; cp "$TMP/l-hedge.md" "$A/inputs/issue-1.md"
 chk "lint: inputs/ dir skipped"        0 "OK"                   python3 "$L" "$A"
+# live-run friction 2026-09-03: a sealed (mode 000) file is reported, not a traceback
+printf '| F-1 | [FACT] | sealed | `f.txt:1-1@%s` "line one" |\n' "$SHA2" > "$A/sealed.md"; chmod 000 "$A/sealed.md"
+chk "lint: sealed file named, no traceback" 1 "unreadable"       python3 "$L" "$A"
+chmod 600 "$A/sealed.md"; rm -f "$A/sealed.md"
 
 echo "deep-plan: the summary-first plan templates lint clean once filled"
 PT=plugins/codex-deep-plan/skills/deep-plan-duo/templates

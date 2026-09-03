@@ -1,6 +1,6 @@
 {
   "name": "codex-deep-plan",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Deep, evidence-only planning for GitHub issues, PR review comments, or a feature request: every claim cited and machine-checked, root causes not symptoms, real fixes scored against workarounds, then a blind Codex second opinion and a bounded debate, ending in one reviewed PR plan handed to Claude Code plan mode, or an evidence-backed answer for a question.",
   "author": { "name": "Hesham Karm" },
   "keywords": ["planning", "codex", "root-cause", "issues", "second-opinion"]

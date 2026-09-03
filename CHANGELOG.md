@@ -2,6 +2,12 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-09-03
+
+### Fixed
+- **codex-deep-plan 2.0.1.** Two live runs of the released skill against this repository, both with Codex: a question ("does every runner refuse `--write`?") took the new answer-only round-0 path (`root_causes: []`, accepted by the validator in question mode) and ended in `ANSWER.md` with no defect; a light change request ("fix the README's Bounded-debate bullet") ran one blind round, then entered Claude Code plan mode with `PLAN.md` verbatim and came back approved — the first observed plan-mode handoff. Applied from that plan (Codex added the last four): README's bullet now says 2 rounds, 3 with `--deep`, lists T0 and orders the conditions by precedence with their owners; SKILL.md's Rounds row and debate-protocol.md's T2 row carry the same default.
+- `lint-claims.py` names a sealed (mode 000) file instead of raising a traceback.
+
 ## [1.2.0] - 2026-09-03
 
 ### Changed

@@ -47,7 +47,10 @@ def lint(files):
         base = os.path.basename(f)
         if os.path.basename(os.path.dirname(f)) in SKIP_DIRS:
             continue
-        lines = open(f, encoding="utf-8", errors="replace").read().splitlines()
+        try:
+            lines = open(f, encoding="utf-8", errors="replace").read().splitlines()
+        except PermissionError:
+            fails.append(f"{f}: unreadable (sealed with chmod 000? unseal it, or lint before sealing)"); continue
         in_fence = False
         for idx, line in enumerate(lines):
             i = idx + 1

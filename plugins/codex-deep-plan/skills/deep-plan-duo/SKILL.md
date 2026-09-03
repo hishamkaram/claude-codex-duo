@@ -46,7 +46,7 @@ planning, not implementing.
 |---|---|
 | Inputs (any mix) | issue numbers/`#N`/URLs → `--issue`; `pr N` or PR URLs → `--pr` (plans the changes its review comments ask for; never reviews the PR); comment URLs with `#issuecomment-`, `#discussion_r` or `#pullrequestreview-` → `--comment`; quoted text or the user's own prose → `--request`; a file path or pasted text → `--request-file` |
 | Slug | `--slug`, else derived by `init-plan.sh` from the first input |
-| Rounds | `--rounds`, else 2. Hard cap 3, never extended |
+| Rounds | `--rounds`, else 2 (3 with `--deep`). Hard cap 3, never extended |
 | Intent | *question* when the inputs ask whether something is true or how something behaves ("is the README current?", "why does X fail?"); *change request* when they ask for something to be different. A question ends in `ANSWER.md`, not a plan, unless the answer reveals a defect and the user then asks for a plan |
 | Scale (change requests) | `light` when every input is a correction to authoritative content — documentation, wording, config values — with no reported behaviour; `standard` otherwise; `deep` when `--deep` is passed or the inputs are several issues. Provisional: re-evaluated after Phase 1 and after Codex round 0 (`references/phases.md`); escalation is by mechanism, never by counting defects in one authoritative file |
 | `--deep` | force full depth regardless of the inputs |
