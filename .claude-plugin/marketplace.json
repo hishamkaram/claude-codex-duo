@@ -7,9 +7,9 @@
   "plugins": [
     {
       "name": "codex-pr-review",
-      "description": "Two-model PR review with a blind Codex second reviewer, verification, and one merge decision.",
+      "description": "Two-model PR review: lead-reviewer agent and blind Codex review run concurrently, verification, one merge decision; optional Workflow fan-out.",
       "source": "./plugins/codex-pr-review",
-      "version": "1.0.5",
+      "version": "2.0.0",
       "category": "code-review",
       "tags": [
         "code-review",

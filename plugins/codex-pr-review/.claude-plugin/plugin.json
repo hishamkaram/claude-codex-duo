@@ -1,7 +1,7 @@
 {
   "name": "codex-pr-review",
-  "version": "1.0.5",
-  "description": "Two-model PR review: Claude reviews, Codex reviews blind, findings are reconciled and verified against the code, one merge decision with an audit trail. Works on PRs, branches, commits and uncommitted local changes.",
+  "version": "2.0.0",
+  "description": "Two-model PR review: a lead-reviewer agent and Codex review the same brief concurrently, each in its own context; findings are reconciled and verified against the code, one merge decision with an audit trail. Optional Workflow-tool fan-out. Works on PRs, branches, commits and uncommitted local changes.",
   "author": { "name": "Hesham Karm" },
   "keywords": ["code-review", "codex", "pr-review", "second-opinion"]
 }

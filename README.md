@@ -50,7 +50,7 @@ These plugins make the second model useful by forcing structure around it:
 
 | Plugin | Purpose | Entry point |
 |---|---|---|
-| **codex-pr-review** | Two-model code review of a PR, branch, commit range, or uncommitted local changes. Ends in exactly one merge decision. | `/codex-pr-review:review-pr <target> <base> "<intent>"` |
+| **codex-pr-review** | Two-model code review of a PR, branch, commit range, or uncommitted local changes: a lead-reviewer agent and Codex review the same brief concurrently, each in its own context. Ends in exactly one merge decision. | `/codex-pr-review:review-pr <target> <base> "<intent>" [--workflow]` |
 | **codex-debate** | Adversarial debate on any falsifiable motion or choice between named options: architecture decisions, migration plans, root-cause hypotheses, disputed review findings. | `/codex-debate:debate "<motion>" <mode> <rounds> [--seed <file>]` |
 | **codex-deep-plan** | Evidence-only planning for GitHub issues, PR review comments, a single comment, or a plain request: cited facts, root causes, real fixes scored against workarounds, a blind Codex diagnosis and a bounded debate, at a depth that follows the request. A change request ends in one PR plan handed to Claude Code plan mode; a question ends in an evidence-backed answer. | `/codex-deep-plan:plan <issues \| pr N \| comment-url \| "request text" \| --request-file f>... [--slug <name>] [--rounds <1-3>] [--deep] [--solo] [--no-plan-mode]` |
 
@@ -129,20 +129,24 @@ claude plugin update codex-deep-plan@claude-codex-duo
 
 ```mermaid
 flowchart LR
-    A[Phase 0<br/>Scope + neutral brief] --> B[Phase 1<br/>Lead review<br/>chmod 000]
-    B --> C[Phase 2<br/>Codex blind review]
-    C --> D[Phase 3<br/>Reconciliation matrix]
+    A[Phase 0<br/>Scope + neutral brief<br/>hashed] --> B[Phase 1<br/>Lead-reviewer agent<br/>own context, seals 01-lead.md]
+    A --> C[Phase 2<br/>Codex blind review<br/>background runner]
+    B --> J{Join gate<br/>lead sealed +<br/>Codex artifact}
+    C --> J
+    J --> D[Phase 3<br/>Reconciliation matrix]
     D --> E[Phase 4<br/>Verify every P0–P3]
     E --> F[Phase 5<br/>Bounded debate<br/>max 2 exchanges]
     F --> G[Phase 6<br/>REVIEW.md<br/>one verdict]
 ```
 
-1. **Scope and brief.** Base and head are pinned to immutable SHAs. A neutral brief for Codex is generated deterministically by `build-brief.sh` before any finding exists; it contains the diff command, the alphabetical file list, the stated intent, the conventions, and the review rubric. It never mentions a second reviewer.
-2. **Lead review.** Claude reviews in two passes (design, then implementation) against the rubric, writes its findings, and immediately sets the file to mode 000.
-3. **Codex blind review.** A pre-flight asserts the lead file is unreadable, then the monitored runner launches Codex in a fresh thread, read-only, from the brief. Raw output and job metadata are kept verbatim.
+1. **Scope and brief.** Base and head are pinned to immutable SHAs. A neutral brief is generated deterministically by `build-brief.sh` before any finding exists; it contains the diff command, the alphabetical file list, the stated intent, the conventions, and the review rubric. It never mentions a second reviewer. `phase-gate.sh pre-codex` records the sha256 of the brief and the scope once; later gates compare and never rewrite.
+2. **Two reviews at once.** In one turn the monitored runner launches Codex in a fresh thread, read-only, from the brief, and the `lead-reviewer` agent starts in its own context from the same brief. The lead reviews in two passes (design, then implementation), writes its findings and immediately sets the file to mode 000. Neither context receives the other's output; the runner's completion line carries no Codex text.
+3. **Join.** `phase-gate.sh pre-phase3` must pass — lead file sealed, Codex artifact written with its status line, hashes unchanged — before the orchestrator opens Codex's output. If the lead agent failed, the orchestrator reviews in-context first, without touching Codex's output.
 4. **Reconciliation.** Every distinct finding from both sides is tabled as BOTH, CLAUDE-ONLY, CODEX-ONLY, or CONFLICT and given one canonical severity.
 5. **Verification.** Each P0 to P3 finding and each CONFLICT is checked up an evidence ladder: quoted code, traced call path, executed test or repro. CODEX-ONLY findings get the same rigor as Claude's own.
 6. **Bounded debate.** Only still-unverifiable or conflicting items go back to Codex, at most twice. Positions move only for new code-level evidence.
+
+With `--workflow`, verification fans out one `finding-verifier` agent per finding through the Workflow tool (the project's own test suite still runs once, sequentially), and a diff over ~2000 LOC runs one lead-reviewer per subsystem from an exclusive file-ownership manifest that the script checks before spawning anything. If the tool is not available the review says so and falls back to plain agents; it never switches silently.
 7. **Report.** `REVIEW.md` carries the verdict under an ordered, exclusive policy (BLOCK, REQUEST CHANGES, NEEDS CLARIFICATION, APPROVE WITH COMMENTS, APPROVE), merge conditions by finding ID, a disagreement log with job IDs, a false-positive appendix, and a coverage statement. Anything left unresolved is printed as a ready-to-run `/debate` line.
 
 If Codex is unavailable the review continues as a single-model review, says so on line one, and never raises confidence to compensate.
@@ -215,7 +219,7 @@ Everything is written outside the repository:
 
 ```text
 /tmp/two-model-pr-review/<repo>/<target>-<timestamp>/
-  00-scope.md  00-brief.md  01-lead.md  02-codex.md (+ .stdout .stderr .joblog .meta)
+  00-scope.md (+ .sha256)  00-brief.md (+ .sha256 .tree .baseline)  00-run.md  01-lead.md  02-codex.md (+ .stdout .stderr .joblog .meta .progress .exit)
   03-matrix.md  04-verification.md  05-debate.md  REVIEW.md
 
 /tmp/codex-debate/<repo>/<motion-slug>-<timestamp>/
@@ -234,7 +238,7 @@ Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at th
 - **Read-only.** No plugin modifies, formats, stages, stashes, commits or restores tracked files, and Codex is never invoked with `--write`. `git status` must match the starting baseline at the end of every run.
 - **Untrusted input.** Repository content, PR text and Codex output are treated as data, never as instructions.
 - **No fabricated evidence.** A command that did not run is never reported as run; failures are reported verbatim.
-- **Blindness is procedural, not structural.** Codex's sandbox can read `/tmp` and Claude Code session transcripts. What keeps the second review blind is that Codex is never told a first review exists, that Claude's findings are written before any Codex contact, and that they sit at mode 000 while Codex runs. Reports say exactly this and never claim more.
+- **Blindness is procedural, not structural.** Codex's sandbox can read `/tmp` and Claude Code session transcripts, including subagent transcripts. What keeps the two reviews blind to each other is that Codex is never told another review exists, that both packets are frozen and hashed before any finding exists, that the lead runs in its own context and seals its findings (mode 000) before any context reads Codex's output, and that the orchestrator opens that output only after the join gate passes. Reports say exactly this and never claim more.
 
 ## Troubleshooting
 
@@ -244,6 +248,9 @@ Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at th
 | Runner exit `5` | The job stalled or timed out and the cancel could not be confirmed. Do not retry; check the job with the companion's `status` command, because a worker may still be running. |
 | Runner exit `2` (STALLED) | No job-log activity for `--stall-min` minutes. Check the `.joblog` sidecar; upstream capacity errors are recorded in `.meta` as `last_error`. Rerun; attempts rotate. |
 | Runner exit `3` (TIMEOUT) | Review exceeded `--max-min`. Large diffs should be split by subsystem in Phase 0. |
+| `phase-gate.sh pre-phase3` fails with `01-lead.md missing` | The lead-reviewer agent returned nothing or never wrote its file. The orchestrator must run the lead review in-context BEFORE opening any `02-codex.*` file, then seal it and rerun the gate. |
+| `phase-gate.sh` reports a packet `changed since its hash was recorded` | `00-brief.md` or `00-scope.md` was edited after Codex was launched. Packets are frozen; run records belong in `00-run.md`. If only log lines were appended, move them there and restore the packet; otherwise start a fresh run directory. |
+| `--workflow` passed but the Workflow tool is not listed | The review announces it, uses plain Agent-tool fan-out, and records `Workflow: unavailable — Agent-tool fallback` in `00-run.md` and REVIEW.md §8. |
 | "nothing to review" in local mode | The working tree equals the base tree. Make a change or pick a different base. |
 | Builder refuses `--out` | The artifact directory must be outside the repository so the scratch index cannot leak into the snapshot. |
 | Tests fail inside a monorepo repro | Build workspace dependencies first; stale `dist` output is the usual cause. |
@@ -257,6 +264,8 @@ Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at th
 **Does the debate plugin need the review plugin?** No. It debates any motion. `--seed` is an optional way to import a review's verification record.
 
 **Can I use a Claude subagent instead of Codex?** No. All plugins refuse to simulate the second model; a same-model second opinion is exactly the failure mode they exist to avoid.
+
+**Is the lead review a subagent now?** Yes. Since codex-pr-review 2.0.0 the lead review runs in the plugin's `lead-reviewer` agent, in its own context, at the same time as Codex's blind review. That is what lets the two run concurrently without either seeing the other's output; the orchestrator adjudicates after a join gate. Codex is still never simulated.
 
 **Why does the deep plan run outside plan mode and only enter it at the end?** Plan mode blocks every write except the plan file, and the skill has to write artifacts, run linters and launch 10–30 minute Codex jobs. It finishes the work, then enters plan mode with `PLAN.md` verbatim so you approve the same document that carries the evidence.
 

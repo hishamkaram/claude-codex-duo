@@ -73,26 +73,42 @@ Builder exit codes: 0 brief written (`00-brief.md.tree` holds the SHA,
 `00-brief.md.baseline` the NUL-separated status); 3 nothing to review (tree
 equals base tree); 2 usage error (including `--out` inside the repository).
 
-## Phase 2 — blind review
+## Join turn — Phase 2 (blind review) launched beside Phase 1
 
-Pre-flight, all must hold or stop:
+Pre-flight, must print `PREFLIGHT-OK` or stop (it also records the packet hashes once):
 
 ```bash
-test -s "$ART/00-brief.md" && test -s "$ART/01-lead.md" && [ "$(stat -f '%Lp' "$ART/01-lead.md" 2>/dev/null || stat -c '%a' "$ART/01-lead.md")" = "0" ] && ! grep -q "$ART" "$ART/00-brief.md" \
-  && { [ ! -s "$ART/00-brief.md.tree" ] || git -C "$REPO" cat-file -e "$(cat "$ART/00-brief.md.tree")^{tree}"; } && echo PREFLIGHT-OK
+${CLAUDE_PLUGIN_ROOT}/skills/two-model-pr-review/scripts/phase-gate.sh pre-codex "$ART" "$REPO"
 ```
 
-Launch, using the caller's background execution (Claude Code: `run_in_background: true`)
-so the turn is not blocked and the worker is not tied to a foreground timeout:
+The gate passes with `01-lead.md` absent (the normal case: the lead has not
+started) or sealed at mode 000 (a resumed run); it fails on a readable lead
+file, a missing or run-directory-naming brief, a vanished snapshot tree, or a
+packet whose hash changed since it was recorded. Paste its output into
+`00-run.md`, never into `00-scope.md` (that would change the hash).
+
+Launch FIRST in the turn, using the caller's background execution (Claude Code:
+`run_in_background: true`) so the turn is not blocked and the worker is not tied
+to a foreground timeout; then, in the same turn, launch the `lead-reviewer` agent:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/02-codex" --fresh --prompt-file "$ART/00-brief.md" --stall-min 8 --max-min 40
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/02-codex" --fresh --prompt-file "$ART/00-brief.md" --stall-min 12 --max-min 40
 ```
 
 Expect 15–40 minutes for a few-hundred-line diff (26 min observed for 437
-lines). While it runs, do NOT start Phase 3 (it needs `01-lead.md` readable, and that
-must stay mode 000 until Codex has finished). You may check progress at any
-time with `tail -n 5 "$ART/02-codex.progress"`. The runner exits with:
+lines); the stall window is 12 minutes because the job log is silent while
+Codex composes a long final answer (an 8-minute window cancelled one such run).
+While it runs, do NOT open `02-codex.stdout`, `.stderr` or `.joblog` and do NOT
+start Phase 3: the join gate (`phase-gate.sh pre-phase3 "$ART"`) must print
+`JOIN-OK` first, which needs `01-lead.md` sealed and `02-codex.md` written with
+its STATUS line. The runner's completion line carries only outcome, job id,
+elapsed time and byte count — never Codex's text — so a completion notification
+is safe to receive while the lead is still running. `02-codex.exit` and `.meta`
+are control files (no review text) and may be read on completion. Each
+`.progress` line ends with the last job-log line, which can carry Codex text:
+before `JOIN-OK` check liveness only with
+`tail -n 1 "$ART/02-codex.progress" | cut -d'|' -f1`; the full tail is for after
+the join. The runner exits with:
 
 | exit | outcome | what to do |
 |---|---|---|
@@ -110,9 +126,14 @@ the helper appends two trailer lines "Codex session ID …" / "Resume in Codex �
 `last_error=` — the last `Codex error:` line from the job log, e.g. an upstream
 "model is at capacity", which is a transient and the normal reason for the one
 retry),
-`02-codex.exit`. Never edit them. Then write `02-codex.md`: outcome line, the
-exact command, the `.meta` contents, the `.stdout` inside a four-backtick fence
-verbatim, and the STATUS line.
+`02-codex.exit`. Never edit them. Then write `02-codex.md` from `.exit` and
+`.meta` only: outcome line, the exact command, the `.meta` contents, and the
+STATUS line — and, only after `phase-gate.sh pre-phase3` has printed `JOIN-OK`,
+the `.stdout` inside a four-backtick fence verbatim (insert it above the STATUS
+line, which stays last). When Codex was unavailable, declined or the probe
+failed, no runner call was made and no sidecar exists: `02-codex.md` holds the
+verbatim probe line or failure and `STATUS: PHASE 2 COMPLETE (SKIPPED — <reason>)`,
+which the join gate accepts without an `.exit` file.
 
 ## Phase 5 — debate exchanges
 
@@ -143,7 +164,11 @@ The brief MUST NOT contain, summarize, hint at, or allude to:
 - anything that narrows Codex's attention, including "pay particular attention
   to…" or reordering files by your suspicion. Files are listed alphabetically.
 
-Build the brief in Phase 0, before your findings exist. Invoke with `--fresh`.
+Build the brief in Phase 0, before any finding exists, and hash it with
+`phase-gate.sh pre-codex`. Invoke with `--fresh`. The same brief is the lead
+agent's packet, so both reviewers read byte-identical inputs; the agent's own
+contract overrides the two sentences that describe Codex's environment (`CX-`
+ids, whole-filesystem read-only).
 
 ## Output handling
 

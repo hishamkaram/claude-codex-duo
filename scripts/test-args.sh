@@ -458,5 +458,116 @@ printf '%s' "$out" | grep -q 'OPEN_MAJORS: none' && printf '%s' "$out" | grep -q
 # F-Q1: build-prompt refuses a round beyond the run's cap
 chk "prompt: round beyond cap refused" 2 "exceeds the run"      bash "$BP" --art "$A" --round 3
 
+echo "review: phase-gate.sh join gates (pre-codex / pre-phase3 / post-join)"
+PG=plugins/codex-pr-review/skills/two-model-pr-review/scripts/phase-gate.sh
+GA="$TMP/gate"; mkdir -p "$GA"
+chk "gate: no arguments"               2 "usage"                bash "$PG"
+chk "gate: unknown subcommand"         2 "usage"                bash "$PG" bogus "$GA"
+chk "gate: pre-codex without repo"     2 "usage"                bash "$PG" pre-codex "$GA"
+chk "gate: pre-codex, no brief"        1 "00-brief.md"          bash "$PG" pre-codex "$GA" .
+printf 'scope\n' > "$GA/00-scope.md"; printf 'brief\n' > "$GA/00-brief.md"
+chk "gate: pre-codex, lead absent"     0 "PREFLIGHT-OK"         bash "$PG" pre-codex "$GA" .
+[ -s "$GA/00-brief.md.sha256" ] && [ -s "$GA/00-scope.md.sha256" ] && [ "$(wc -c < "$GA/00-brief.md.sha256" | tr -d ' ')" = "65" ] && printf '  ok    %-42s\n' "gate: 64-hex hashes recorded on first call" || { printf '  FAIL  gate: hashes not recorded\n'; FAIL=1; }
+H1=$(cat "$GA/00-brief.md.sha256")
+chk "gate: pre-codex repeat, unchanged" 0 "PREFLIGHT-OK"        bash "$PG" pre-codex "$GA" .
+# compare-never-rewrite: a tampered record must make the gate fail, not be replaced by a fresh hash
+printf '%s\n' "0000000000000000000000000000000000000000000000000000000000000000" > "$GA/00-brief.md.sha256"
+chk "gate: pre-codex vs tampered record" 1 "changed since"        bash "$PG" pre-codex "$GA" .
+[ "$(cat "$GA/00-brief.md.sha256")" = "0000000000000000000000000000000000000000000000000000000000000000" ] && printf '  ok    %-42s\n' "gate: record never rewritten" || { printf '  FAIL  gate: record rewritten\n'; FAIL=1; }
+printf '%s\n' "$H1" > "$GA/00-brief.md.sha256"
+rm -f "$GA/00-scope.md"
+chk "gate: pre-codex, no scope"        1 "00-scope.md"          bash "$PG" pre-codex "$GA" .
+printf 'scope\n' > "$GA/00-scope.md"
+printf '%s\n' "0123456789abcdef0123456789abcdef01234567" > "$GA/00-brief.md.tree"
+chk "gate: pre-codex, snapshot tree gone" 1 "no longer resolves" bash "$PG" pre-codex "$GA" .
+rm -f "$GA/00-brief.md.tree"
+( cd "$GA" && chk "gate: pre-codex with a relative ART" 0 "PREFLIGHT-OK" bash "$OLDPWD/$PG" pre-codex . "$OLDPWD" )
+GN="$TMP/gate-nopre"; mkdir -p "$GN"; printf 'scope\n' > "$GN/00-scope.md"; printf 'brief\n' > "$GN/00-brief.md"; printf 'lead\n' > "$GN/01-lead.md"; chmod 000 "$GN/01-lead.md"; printf 'x\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$GN/02-codex.md"
+chk "gate: pre-phase3 without pre-codex" 1 "pre-codex never ran" bash "$PG" pre-phase3 "$GN"
+printf 'lead\n' > "$GA/01-lead.md"; chmod 600 "$GA/01-lead.md"
+chk "gate: pre-codex, lead readable"   1 "not sealed"           bash "$PG" pre-codex "$GA" .
+chmod 000 "$GA/01-lead.md"
+chk "gate: pre-codex, lead sealed"     0 "PREFLIGHT-OK"         bash "$PG" pre-codex "$GA" .
+printf 'shard\n' > "$GA/01-lead.api.md"; chmod 600 "$GA/01-lead.api.md"
+chk "gate: pre-codex, shard file readable" 1 "01-lead.api.md"   bash "$PG" pre-codex "$GA" .
+chmod 000 "$GA/01-lead.api.md"
+chk "gate: pre-codex, shard file sealed" 0 "PREFLIGHT-OK"       bash "$PG" pre-codex "$GA" .
+rm -f "$GA/01-lead.api.md"
+printf 'brief changed\n' > "$GA/00-brief.md"
+chk "gate: pre-codex after brief mutated" 1 "changed since"    bash "$PG" pre-codex "$GA" .
+printf 'brief mentions %s\n' "$GA" > "$GA/00-brief.md"
+chk "gate: pre-codex, brief names run dir" 1 "run directory"   bash "$PG" pre-codex "$GA" .
+printf 'brief\n' > "$GA/00-brief.md"
+# F-08 (2.0.0 review): a failed hasher must fail the gate, never record an empty hash
+GB="$TMP/gate-nohash"; mkdir -p "$GB/bin"; printf '#!/bin/sh\nexit 127\n' > "$GB/bin/python3"; printf '#!/bin/sh\nexit 127\n' > "$GB/bin/shasum"; printf '#!/bin/sh\nexit 127\n' > "$GB/bin/sha256sum"; chmod +x "$GB/bin/"*
+printf 'scope\n' > "$GB/00-scope.md"; printf 'brief\n' > "$GB/00-brief.md"
+out=$(PATH="$GB/bin:$PATH" bash "$PG" pre-codex "$GB" . 2>&1); code=$?
+[ "$code" = 1 ] && printf '%s' "$out" | grep -q "cannot hash" && [ ! -e "$GB/00-brief.md.sha256" ] && printf '  ok    %-42s exit=1\n' "gate: no hasher → fail, nothing recorded" || { printf '  FAIL  gate: no hasher: exit=%s out=%s\n' "$code" "$out"; FAIL=1; }
+# pre-phase3 — SKIPPED form needs no runner sidecar (F-02); COMPLETE form does
+chk "gate: pre-phase3, no 02-codex.md"  1 "02-codex.md"         bash "$PG" pre-phase3 "$GA"
+printf 'outcome\n' > "$GA/02-codex.md"
+chk "gate: pre-phase3, no STATUS line" 1 "STATUS"               bash "$PG" pre-phase3 "$GA"
+printf 'PROBE FAILED\nSTATUS: PHASE 2 COMPLETE (SKIPPED — probe failed)\n' > "$GA/02-codex.md"
+chk "gate: pre-phase3, SKIPPED, no .exit" 0 "codex=SKIPPED"     bash "$PG" pre-phase3 "$GA"
+printf 'outcome\nSTATUS: PHASE 2 COMPLETE\n' > "$GA/02-codex.md"
+chk "gate: pre-phase3, COMPLETE, no .exit" 1 "02-codex.exit"    bash "$PG" pre-phase3 "$GA"
+echo 0 > "$GA/02-codex.exit"
+chk "gate: pre-phase3, COMPLETE status" 0 "JOIN-OK"             bash "$PG" pre-phase3 "$GA"
+printf 'outcome\nSTATUS: PHASE 2 COMPLETE\n\n' > "$GA/02-codex.md"
+chk "gate: pre-phase3, trailing blank line" 0 "JOIN-OK"         bash "$PG" pre-phase3 "$GA"
+chmod 600 "$GA/01-lead.md"
+chk "gate: pre-phase3, lead readable"  1 "not sealed"           bash "$PG" pre-phase3 "$GA"
+: > "$GA/01-lead.md"; chmod 000 "$GA/01-lead.md"
+chk "gate: pre-phase3, lead empty"     1 "empty"                bash "$PG" pre-phase3 "$GA"
+rm -f "$GA/01-lead.md"
+chk "gate: pre-phase3, lead absent"    1 "01-lead.md missing"   bash "$PG" pre-phase3 "$GA"
+printf 'lead\n' > "$GA/01-lead.md"; chmod 000 "$GA/01-lead.md"; printf 'scope changed\n' > "$GA/00-scope.md"
+chk "gate: pre-phase3, hash mismatch"  1 "changed since"        bash "$PG" pre-phase3 "$GA"
+printf 'scope\n' > "$GA/00-scope.md"
+# post-join (completion gate): lead unsealed by Phase 3, must end with its STATUS line (F-04)
+chk "gate: post-join, lead still sealed" 1 "still sealed"       bash "$PG" post-join "$GA"
+chmod 600 "$GA/01-lead.md"
+chk "gate: post-join, lead lacks STATUS" 1 "PHASE 1 COMPLETE"   bash "$PG" post-join "$GA"
+printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$GA/01-lead.md"
+chk "gate: post-join, consistent run"  0 "POST-JOIN-OK"         bash "$PG" post-join "$GA"
+printf 'brief changed\n' > "$GA/00-brief.md"
+chk "gate: post-join, hash mismatch"   1 "changed since"        bash "$PG" post-join "$GA"
+
+echo "review: workflow script compiles the way the Workflow tool evaluates it (scripts/js-check.sh)"
+JS=scripts/js-check.sh; WF=plugins/codex-pr-review/skills/two-model-pr-review/templates/review-workflow.js
+chk "js-check: no arguments"           2 "usage"                bash "$JS"
+printf 'export const x = 1\nconst = ;\n' > "$TMP/broken.js"
+chk "js-check: broken module rejected" 1 "SyntaxError"          bash "$JS" "$TMP/broken.js"
+node --check "$TMP/broken.js" >/dev/null 2>&1 && printf '  ok    %-42s\n' "js-check: (node --check accepts it — the reason js-check exists)" || printf '  ok    %-42s\n' "js-check: node --check also rejects it on this node"
+printf 'export const meta = { name: "m" }\nconst r = await agent("x")\nreturn { r }\n' > "$TMP/good.js"
+bash "$JS" "$TMP/good.js" >/dev/null 2>&1 && printf '  ok    %-42s exit=0\n' "js-check: top-level await/return ok" || { printf '  FAIL  js-check rejected good.js\n'; FAIL=1; }
+bash "$JS" "$WF" >/dev/null 2>&1 && printf '  ok    %-42s exit=0\n' "js-check: shipped review-workflow.js" || { printf '  FAIL  js-check rejected the shipped script\n'; FAIL=1; }
+# executed smoke test of both stages with stubbed Workflow globals (F-12/F-13 of the 2.0.0 review)
+out=$(node - "$WF" <<'JSEOF' 2>&1
+const fs = require("fs"); const src = fs.readFileSync(process.argv[2], "utf8").replace(/^export /mg, "");
+const AF = Object.getPrototypeOf(async function () {}).constructor;
+const calls = []; const log = m => calls.push("log:" + m); const phase = p => calls.push("phase:" + p);
+const parallel = async thunks => Promise.all(thunks.map(t => t()));
+const pipeline = async (items, ...stages) => Promise.all(items.map(async (it, i) => { let r = it; for (const s of stages) r = await s(r, it, i); return r; }));
+async function run(args, agent) { const f = new AF("args","phase","log","agent","parallel","pipeline","workflow","budget", src); return f(args, phase, log, agent, parallel, pipeline, null, {total:null}); }
+(async () => {
+  // verify: two findings, second agent returns null
+  let n = 0; const agentV = async (prompt, opts) => { n++; if (!prompt.includes('"id":"F-0')) throw new Error("prompt lacks the JSON-encoded finding"); if (opts.agentType !== "codex-pr-review:finding-verifier") throw new Error("wrong agentType"); return n === 1 ? { verdict: "CONFIRMED", method: "(b) trace", evidence: ["x"], trigger: "t", severity_note: "unchanged", refutation_searched: "r", finding: "F-01" } : null; };
+  const v = await run({ stage: "verify", art: "/a", repo: "/r", findings: [{ id: "F-01" }, { id: "F-02" }] }, agentV);
+  if (v.verdicts.length !== 2 || v.verdicts[0].verdict !== "CONFIRMED" || v.verdicts[1].verdict !== "UNVERIFIABLE" || v.nulls.join() !== "F-02") throw new Error("verify stage wrong: " + JSON.stringify(v));
+  // lead: bad manifest must throw before any agent call
+  let leadCalls = 0; const agentL = async (prompt, opts) => { leadCalls++; if (prompt.includes('shard "web"') && !prompt.includes('"dir/first\\nsecond.md"')) throw new Error("newline path not JSON-encoded: " + prompt); if (opts.agentType !== "codex-pr-review:lead-reviewer") throw new Error("wrong agentType"); return { status: "LEAD SEALED", file: "/a/01-lead.api.md", findings: 1, questions: 0, mode: "0" }; };
+  let threw = false; try { await run({ stage: "lead", art: "/a", repo: "/r", files: ["a", "b"], shards: { api: ["a"] } }, agentL); } catch (e) { threw = /unowned/.test(e.message); }
+  if (!threw || leadCalls !== 0) throw new Error("bad manifest not rejected before spawning");
+  threw = false; try { await run({ stage: "lead", art: "/a", repo: "/r", files: ["a"], shards: { "bad name": ["a"] } }, agentL); } catch (e) { threw = /shard name/.test(e.message); }
+  if (!threw) throw new Error("bad shard name accepted");
+  const l = await run({ stage: "lead", art: "/a", repo: "/r", files: ["a", "dir/first\nsecond.md"], shards: { api: ["a"], web: ["dir/first\nsecond.md"] } }, agentL);
+  if (leadCalls !== 2 || l.shards.length !== 2 || l.failed.length !== 0) throw new Error("lead stage wrong: " + JSON.stringify(l));
+  console.log("SMOKE-OK");
+})().catch(e => { console.log("SMOKE-FAIL " + e.message); process.exit(1); });
+JSEOF
+); code=$?
+[ "$code" = 0 ] && printf '%s' "$out" | grep -q SMOKE-OK && printf '  ok    %-42s\n' "workflow: both stages run under stubbed globals" || { printf '  FAIL  workflow smoke: %s\n' "$out"; FAIL=1; }
+
 echo
 [ $FAIL -eq 0 ] && { echo "ALL ARGUMENT AND BUILDER TESTS PASSED"; exit 0; } || { echo "TESTS FAILED"; exit 1; }
