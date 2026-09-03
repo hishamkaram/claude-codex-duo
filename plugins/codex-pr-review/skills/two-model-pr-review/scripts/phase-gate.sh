@@ -27,7 +27,9 @@ esac
 [ -d "$ART" ] || die2 "run directory not found: $ART"
 ART="$(cd "$ART" && pwd -P)"   # absolute: the brief is grepped for this path, and "." would match everything
 fail() { echo "GATE FAILED ($CMD): $1"; exit 1; }
-mode() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1" 2>/dev/null; }
+# GNU stat first: on Linux `stat -f` means file-system status and exits 0 with the wrong output.
+if stat --version >/dev/null 2>&1; then mode() { stat -c '%a' "$1" 2>/dev/null; }
+else mode() { stat -f '%Lp' "$1" 2>/dev/null; }; fi
 lastline() { awk 'NF{l=$0} END{print l}' "$1"; }   # last non-blank line
 sha() {
   local h=""
