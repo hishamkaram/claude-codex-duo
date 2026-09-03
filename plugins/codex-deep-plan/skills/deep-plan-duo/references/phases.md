@@ -88,7 +88,7 @@ context; you cannot re-read them until round 0 returns. `STATUS: PHASE 4 COMPLET
 
 ## Phase 5 — Codex round 0 (blind) → `debate/r0-codex.json` + sidecars
 
-Pre-flight: the four files above are mode 000; `debate/r0-prompt.md` predates `01-evidence.md`
+Pre-flight: the four files above (those that exist in this mode; a question has only `01-evidence.md`) are mode 000; `debate/r0-prompt.md` predates `01-evidence.md`
 (`ls -l --time-style=full-iso` or `stat`). Run the round per `codex-invocation.md` with `--fresh`.
 The validator reads repo and base SHA from `meta.json` and checks Codex's citations against the code at the base commit. On T5 write
 `debate/r0-codex.md` with the verbatim failure and `STATUS: PHASE 5 COMPLETE (SKIPPED — <reason>)`,

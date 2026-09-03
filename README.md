@@ -44,7 +44,7 @@ These plugins make the second model useful by forcing structure around it:
 - **Blind first pass.** Codex forms its view from the code alone; it is never told another reviewer exists.
 - **Every claim is checked.** Agreement between the two models is not evidence. Every finding of severity P0 to P3 is verified against the code, whoever raised it.
 - **Written trail.** Every phase writes an artifact. The verdict follows from the ledger and a fixed policy, not from whoever spoke last.
-- **Nothing is touched.** All plugins are strictly read-only, including when reviewing uncommitted work.
+- **The repository is never modified.** All plugins are read-only towards the checkout, including when reviewing uncommitted work: artifacts go outside it, local review leaves only unreachable git objects, and deep-plan writes one plan-mode plan file for Claude Code.
 
 ## What is in the box
 
@@ -52,7 +52,7 @@ These plugins make the second model useful by forcing structure around it:
 |---|---|---|
 | **codex-pr-review** | Two-model code review of a PR, branch, commit range, or uncommitted local changes. Ends in exactly one merge decision. | `/codex-pr-review:review-pr <target> <base> "<intent>"` |
 | **codex-debate** | Adversarial debate on any falsifiable motion or choice between named options: architecture decisions, migration plans, root-cause hypotheses, disputed review findings. | `/codex-debate:debate "<motion>" <mode> <rounds> [--seed <file>]` |
-| **codex-deep-plan** | Evidence-only planning for GitHub issues, PR review comments, a single comment, or a plain request: cited facts, root causes, real fixes scored against workarounds, a blind Codex diagnosis and a bounded debate, at a depth that follows the request (a question gets an answer, a doc fix gets a short plan). Ends in one PR plan handed to Claude Code plan mode. | `/codex-deep-plan:plan <issues \| pr N \| comment-url \| "request">... [--slug <name>] [--rounds 1-3] [--deep] [--solo] [--no-plan-mode]` |
+| **codex-deep-plan** | Evidence-only planning for GitHub issues, PR review comments, a single comment, or a plain request: cited facts, root causes, real fixes scored against workarounds, a blind Codex diagnosis and a bounded debate, at a depth that follows the request. A change request ends in one PR plan handed to Claude Code plan mode; a question ends in an evidence-backed answer. | `/codex-deep-plan:plan <issues \| pr N \| comment-url \| "request text" \| --request-file f>... [--slug <name>] [--rounds <1-3>] [--deep] [--solo] [--no-plan-mode]` |
 
 All plugins also trigger from plain language ("review PR 123 with Codex", "debate with Codex whether ...", "plan a real fix for issues 12 and 13, no assumptions, and get Codex's take").
 
@@ -63,7 +63,7 @@ All plugins also trigger from plain language ("review PR 123 with Codex", "debat
 | Claude Code | With plugins enabled |
 | OpenAI Codex plugin | `claude plugin install codex@openai-codex`, then `/codex:setup` and log in. All plugins drive Codex through that plugin's companion script in its read-only sandbox. |
 | `git`, `python3`, `node` | Standard tooling; macOS and Linux |
-| `gh` (deep-plan only) | Fetches issues, PRs and comments verbatim. Without it, paste the text with `--request-file`. |
+| `gh` | deep-plan fetches issues, PRs and comments with it; codex-pr-review resolves a PR number with it. Without it, paste the text with `--request-file` or review a branch, commit or local changes. |
 
 Sending repository content to Codex means sending it to OpenAI. All plugins ask for confirmation that this is permitted for the repository before the first Codex call.
 
@@ -174,12 +174,12 @@ flowchart LR
     E --> F[Phase 5<br/>Codex blind round 0]
     F --> G[Phase 6<br/>Divergence]
     G --> H[Phase 7<br/>Rounds 1..N]
-    H --> I[Phase 8<br/>PLAN.md → plan mode]
+    H --> I[Phase 8<br/>PLAN.md → plan mode<br/>question: ANSWER.md printed]
 ```
 
 - **Inputs.** Any mix of GitHub issues, pull requests (their review comments become the work items), single issue or PR comments, quoted request text, or a file. `init-plan.sh` pins the base SHA and stores every input verbatim; input text is a claim, never a fact.
 - **Facts only, mechanically.** Every claim carries `[FACT]`, `[VERIFIED]`, `[INFERENCE]` or `[UNKNOWN]`. `check-citations.py` resolves each `path:lines@sha` with `git show` and string-matches the quote; `lint-claims.py` rejects hedge words outside inferences, facts without citations and decisions without an evidence id. No design decision may rest on an inference; an isolated `fact-checker` agent promotes inferences without seeing the reasoning behind them.
-- **Root causes, real fixes.** Each chain must end in a violated invariant, missing abstraction, wrong domain model, broken contract or absent constraint. Designs are scored on five gates (mechanism, universality, structural invariant, deletion, regression proof) with blast radius, reversibility, verifiability and cost-of-being-wrong as counterweights; do-nothing, the largest correct change and the tempting workaround are always scored and the chosen design must beat each in writing. "One PR" is a hypothesis: a split is recommended when the inputs do not share a mechanism.
+- **Root causes, real fixes.** Each chain must end in a violated invariant, missing abstraction, wrong domain model, broken contract, absent constraint or incorrect authoritative content (the source-of-truth text is wrong, so the edit is the fix). In standard and deep runs designs are scored on five gates (mechanism, universality, structural invariant, deletion, regression proof) with blast radius, reversibility, verifiability and cost-of-being-wrong as counterweights; do-nothing, the largest correct change and the tempting workaround are always scored and the chosen design must beat each in writing; light runs skip scoring. "One PR" is a hypothesis: a split is recommended when the inputs do not share a mechanism.
 - **Blind second model.** Round 0 gives Codex only the inputs, the base SHA and the in-scope paths; the brief is generated before any evidence exists and the builder refuses wording that reveals another analysis. Codex returns its own root causes, designs and single-PR verdict as JSON. `validate-verdict.py` enforces the objection contract (evidence, falsifier, proposed change), rejects praise and evidence-free concessions, makes a bare APPROVE require an adversarial attempt, and checks Codex's sha-pinned citations against the code.
 - **Bounded debate.** Default 2 rounds, hard cap 3. `debate-status.py` stops at the first termination condition: T1 converged, T2 cap, T3 no new information for two rounds, T4 a blocker that needs a human choice, T5 Codex unavailable (plan stamped `SOLO`, never simulated).
 - **Proportionate depth.** Phase 0 classifies the request. A *question* ("is the README current?") gets `ANSWER.md`: evidence, one blind Codex look, a verdict, and any defects found, with no plan. A *content correction* (documentation, wording, config values that are the source of truth) runs *light*: evidence for the edited lines, the direct correction as the fix (cause class `incorrect_authoritative_content`; a checker is at most an optional follow-up), one blind Codex round, a short plan. Anything with reported behaviour runs *standard*; `--deep` or several issues run everything. Light is provisional: it escalates after the evidence phase or after Codex's round if the content is generated or duplicated, more than one defect appears, or an accepted objection goes beyond the edit.

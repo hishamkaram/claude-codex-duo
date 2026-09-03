@@ -26,6 +26,12 @@ All notable changes to this repository are documented here. Versions follow [Sem
 - First live run of the skill on this repository (request: the validator's machine-specific-path check) produced a plan in which Codex's blind round found a real fail-open bug: `grep` exit 2 reached the success branch. Friction found and fixed: dot-paths and quoted lines containing quotes were rejected by the citation checker; a reused objection id confused the status report.
 - Validator: Python scripts are checked for executability and syntax without writing bytecode; all `codex-run.sh` copies must be byte-identical; the deep-plan skill's exit-code table is checked like the others. Regression tests cover every new script's usage errors, the citation checker against a fixture repository, the linter rules, the verdict validator's contract, the leak check and the termination logic.
 
+### Fixed, from the live replays of the README request (question mode, then light mode)
+- `build-prompt.sh` rejected the blind brief when an in-scope path merely contained a leak word (`plugins/codex-debate/…`, `.claude-plugin/…`). A bullet that resolves to a repository path at the base SHA is now exempt; text after the path is still checked.
+- `check-citations.py` could not check two `path:line@sha "quote"` citations in one table cell: the inner-quote rule swallowed everything after the first citation. Candidates are now bounded by the next citation on the line.
+- Phase 5 pre-flight wording: a question run has only `01-evidence.md` to seal.
+- The replays' own findings, applied: the `gh` prerequisite row scoped `gh` to deep-plan although codex-pr-review resolves a PR number with it; the "Nothing is touched" headline claimed more than the plugins guarantee (artifacts outside the repo, unreachable git objects from local review, one plan-mode file); the deep-plan entry-point cell drifted from the command's argument hint; the plugin-table row, the workflow diagram, the rubric bullet and four discovery descriptions still described every run as ending in a plan-mode plan with five cause classes and unconditional scoring. Codex's blind round found the last four and one contract gap: the skill's "write only to the artifact directory" rule now states the plan-mode file as its single exception.
+
 ## [1.0.5] - 2026-09-02
 
 Round 2 of the same Codex debate. Two of the 1.0.4 fixes had moved a defect rather than closed it; both are now closed properly.

@@ -70,12 +70,13 @@ def base_for(path, explicit, repo_explicit):
     return meta_for(path).get("base_sha")
 
 
-def candidates(line, start):
-    """Quote candidates after a citation. A quoted line of code may itself contain double
-    quotes (`note ok "no machine-specific paths"`), so when more than one pair follows the
-    citation the intended quote is the whole span; the shortest pair would match trivially."""
+def candidates(line, start, end=None):
+    """Quote candidates after a citation, up to the next citation on the line (`end`). A quoted
+    line of code may itself contain double quotes (`note ok "no machine-specific paths"`), so
+    when more than one pair follows the citation the intended quote is the whole span; the
+    shortest pair would match trivially."""
     out = []
-    tail = line[start:]
+    tail = line[start:end]
     nq = tail.count('"')
     if nq > 2:
         out.append(tail[tail.find('"') + 1:tail.rfind('"')])
@@ -94,8 +95,10 @@ def candidates(line, start):
 def check_line(repo, base, where, line):
     """Return (checked, failures) for one text line."""
     fails, n = [], 0
-    for m in CITE_RE.finditer(line):
+    matches = list(CITE_RE.finditer(line))
+    for i, m in enumerate(matches):
         n += 1
+        nxt = matches[i + 1].start() if i + 1 < len(matches) else None
         a, b = int(m["a"]), int(m["b"] or m["a"])
         full = resolve(repo, m["sha"])
         if full is None:
@@ -109,7 +112,7 @@ def check_line(repo, base, where, line):
             fails.append(f"{where}: {m['path']} not found at {m['sha']} (git show failed)"); continue
         if a < 1 or b > len(lines) or a > b:
             fails.append(f"{where}: {m['path']}:{a}-{b} out of range (file has {len(lines)} lines)"); continue
-        cands = candidates(line, m.end())
+        cands = candidates(line, m.end(), nxt)
         if not cands:
             fails.append(f"{where}: {m['path']}:{a}-{b}@{m['sha'][:7]} has no verbatim \"quote\""); continue
         short = [q for q in cands if len(q.split()) <= MAX_WORDS]

@@ -174,6 +174,11 @@ chk "citations: no file"               2 "usage"                python3 "$C"
 chk "citations: --repo with no value"  2 "requires a value"     python3 "$C" --repo
 printf '| F-1 | [FACT] | second line exists | `f.txt:2-2@%s` "line two" |\n' "$SHA2" > "$TMP/ev-ok.md"
 chk "citations: correct quote passes"  0 "OK"                   python3 "$C" --repo "$G2" "$TMP/ev-ok.md"
+# two citations in one cell: each quote is checked against its own citation (live-run friction 2026-09-03)
+printf '| F-1 | [FACT] | both | `f.txt:1-1@%s` "line one" ; `f.txt:2-2@%s` "line two" |\n' "$SHA2" "$SHA2" > "$TMP/ev-two.md"
+chk "citations: two citations per cell pass" 0 "checked 2 citation" python3 "$C" --repo "$G2" "$TMP/ev-two.md"
+printf '| F-1 | [FACT] | both | `f.txt:1-1@%s` "line one" ; `f.txt:2-2@%s` "line nine" |\n' "$SHA2" "$SHA2" > "$TMP/ev-two-bad.md"
+chk "citations: second of two citations fails" 1 "quote not found" python3 "$C" --repo "$G2" "$TMP/ev-two-bad.md"
 printf '| F-1 | [FACT] | wrong | `f.txt:2-2@%s` "line nine" |\n' "$SHA2" > "$TMP/ev-bad.md"
 chk "citations: wrong quote fails"     1 "quote not found"      python3 "$C" --repo "$G2" "$TMP/ev-bad.md"
 printf '| F-1 | [FACT] | oob | `f.txt:9-12@%s` "line two" |\n' "$SHA2" > "$TMP/ev-oob.md"
@@ -360,6 +365,11 @@ grep -q 'make it fast' "$A/debate/r0-prompt.md" && grep -q "$SHA2" "$A/debate/r0
   && printf '  ok    %-42s\n' "brief carries inputs, sha, paths, no {{}}" || { printf '  FAIL  brief content\n'; FAIL=1; }
 printf '# Scope\n\n## In-scope paths\n- f.txt (compare with the second analysis in the debate dir)\n' > "$A/00-scope.md"
 chk "prompt: leak in scope paths exits 3" 3 "LEAK"              bash "$BP" --art "$A" --round 0
+# a real repository path may contain a leak word (this repo has plugins/codex-debate and .claude-plugin)
+( cd "$G2" && mkdir -p debate && echo n > debate/notes.md && mkdir -p .claude-plugin && echo '{}' > .claude-plugin/plugin.json && git add -A && git commit -qm leakpaths )
+printf '# Scope\n\n## In-scope paths\n- debate/notes.md\n- .claude-plugin/plugin.json (manifest)\n- f.txt\n' > "$A/00-scope.md"
+chk "prompt: repository paths with leak words pass" 0 "prompt written" bash "$BP" --art "$A" --round 0
+grep -q '^- debate/notes.md$' "$A/debate/r0-prompt.md" && grep -q '^- .claude-plugin/plugin.json (manifest)$' "$A/debate/r0-prompt.md" && printf '  ok    %-42s\n' "exempt paths restored in the brief" || { printf '  FAIL  exempt paths not restored\n'; FAIL=1; }
 printf '# Scope\n\n## In-scope paths\n- f.txt\n' > "$A/00-scope.md"
 printf 'Please compare this with Claude'"'"'s debate.\n' > "$TMP/req-claude.txt"
 A3="$TMP/art3"; bash "$I" --repo "$G2" --out "$A3" --request-file "$TMP/req-claude.txt" >/dev/null 2>&1

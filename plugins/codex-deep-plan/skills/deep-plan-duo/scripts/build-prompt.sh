@@ -37,7 +37,7 @@ CAP=$(python3 -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("r
 [ -n "$OUT" ] || OUT="$ART/debate/r$ROUND-prompt.md"
 mkdir -p "$(dirname "$OUT")"
 python3 - "$SK" "$ART" "$ROUND" "${BUDGET:-}" "$OUT" <<'PY'
-import json, os, re, sys
+import json, os, re, subprocess, sys
 sk, art, rnd, budget, out = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5]
 meta = json.load(open(os.path.join(art, "meta.json"), encoding="utf-8"))
 sha = meta["base_sha"]
@@ -81,7 +81,23 @@ if rnd == 0:
             take = line.lower().startswith("## in-scope paths")
         elif take and line.strip().startswith("- "):
             paths.append(line.strip()[2:].strip())
-    paths_txt = "\n".join(f"- {p}" for p in paths) if paths else "no restriction given; start from the inputs and the repository layout"
+    # A bullet that is a real repository path is exempt from the leak check: this repo's own
+    # paths contain "debate" and ".claude" (live-run friction 2026-09-03). Anything else on the
+    # bullet (a comment after the path) is checked.
+    def is_repo_path(p):
+        if subprocess.run(["git", "-C", meta["repo"], "cat-file", "-e", f"{sha}:{p}"], capture_output=True).returncode == 0:
+            return True
+        return os.path.exists(os.path.join(meta["repo"], p))
+    marks = {}
+    bullets = []
+    for i, p in enumerate(paths):
+        tok = p.split()[0].rstrip("/") if p.split() else p
+        if tok and is_repo_path(tok):
+            marks[f"@@PATH{i}@@"] = tok
+            bullets.append(f"- @@PATH{i}@@" + p[len(tok):] if p.startswith(tok) else f"- {p}")
+        else:
+            bullets.append(f"- {p}")
+    paths_txt = "\n".join(bullets) if paths else "no restriction given; start from the inputs and the repository layout"
     t = open(os.path.join(sk, "templates", "codex-r0.md"), encoding="utf-8").read()
     # The inputs and the repository path are the user's own text: substituted after the leak check.
     INPUT_MARK, REPO_MARK = "@@INPUTS@@", "@@REPO@@"
@@ -91,9 +107,11 @@ if rnd == 0:
     hits = sorted({m.group(0).lower() for m in LEAK.finditer(t)})
     if hits:
         print("build-prompt.sh: LEAK in the blind brief (wording that reveals another analysis exists): " + ", ".join(hits), file=sys.stderr)
-        print("  fix 00-scope.md's in-scope paths section or the template; inputs are not checked", file=sys.stderr)
+        print("  fix 00-scope.md's in-scope paths section or the template; inputs and existing repository paths are not checked", file=sys.stderr)
         sys.exit(3)
     t = t.replace(INPUT_MARK, inputs_block()).replace(REPO_MARK, meta["repo"])
+    for k, v in marks.items():
+        t = t.replace(k, v)
 else:
     cap = int(meta.get("rounds") or 2)
     prev = read(f"debate/r{rnd-1}-codex.stdout")
