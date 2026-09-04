@@ -118,5 +118,15 @@ for f in \
   else note FAIL "$f does not carry the path-form clause: $CLAUSE"; fi
 done
 
+echo "9. No shipped instruction publishes a directory change in a command"
+# The rule in check 8 is worthless if a reference file demonstrates the shape it forbids
+# (review objection X-1). The constraint text itself writes `cd` in backticks, never `cd <operand>`,
+# so it does not match. Scripts are exempt: the harness parses only top-level tool commands.
+HITS=$(grep -rnE '(^|[ (;&`])cd[[:space:]]+[^[:space:]]' plugins --include='*.md' 2>/dev/null)
+if [ -n "$HITS" ]; then
+  printf '%s\n' "$HITS" | while IFS= read -r h; do note FAIL "publishes a directory change: $h"; done
+  FAIL=1
+else note ok "no shipped instruction publishes a directory change"; fi
+
 echo
 [ $FAIL -eq 0 ] && { echo "ALL CHECKS PASSED"; exit 0; } || { echo "VALIDATION FAILED"; exit 1; }

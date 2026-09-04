@@ -34,8 +34,10 @@ if [ "$HSHA" = "WORKTREE" ]; then
   # Baseline (audit): NUL-safe, no index refresh, individual untracked files, submodules visible.
   git -C "$REPO" --no-optional-locks status --porcelain=v1 -z --untracked-files=all --ignore-submodules=none > "$OUT.baseline"
   SCRATCH="$OUTDIR/tmp-index.$$"; rm -f "$SCRATCH"
-  # GIT_INDEX_FILE must cover BOTH commands (exported inside one subshell).
-  TREE=$( cd "$REPO" && export GIT_INDEX_FILE="$SCRATCH" && git add -A . >/dev/null && git write-tree )
+  # GIT_INDEX_FILE must cover BOTH commands; `git -C` keeps the shell where it is, so the
+  # documented form never teaches a `cd` plus a relative operand (review X-1).
+  GIT_INDEX_FILE="$SCRATCH" git -C "$REPO" add -A "$REPO" >/dev/null || { echo "refusing: could not stage the working tree" >&2; exit 2; }
+  TREE=$(GIT_INDEX_FILE="$SCRATCH" git -C "$REPO" write-tree)
   rm -f "$SCRATCH" "$SCRATCH.lock"
   printf '%s\n' "$TREE" > "$OUT.tree"
   BASETREE=$(git -C "$REPO" rev-parse "$BSHA^{tree}")
