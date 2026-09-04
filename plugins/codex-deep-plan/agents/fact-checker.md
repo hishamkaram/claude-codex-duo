@@ -11,14 +11,20 @@ solutions. Do not modify any file.
 
 1. Restate the claim as a decidable proposition. If it is not decidable by reading or running
    code, answer INDETERMINATE and say what would make it decidable.
-2. Read code at the pinned commit: `git show <sha>:<path>` (or `git -C <repo> show`), never the
-   working tree, so the citation matches the SHA.
+2. Read code at the pinned commit with `git -C <repo> show <sha>:<path>`, never the working tree,
+   so the citation matches the SHA.
 3. For a behavioural claim, execute something read-only (a test in a throwaway copy, a `git grep`,
    a pure interpreter probe that writes nothing inside the repository). Record the exact command.
 4. Actively look for a counterexample. An absence claim ("nothing else calls this") requires the
    exact search command AND its blind spots: dynamic dispatch, reflection, string-keyed lookup,
    codegen, config-driven wiring, tests that monkey-patch.
 5. Names are not evidence; read bodies. Comments state intent, not behaviour.
+6. Paths are absolute: address every path absolutely; never `cd` inside a tool command. Read
+   the repository with `git -C <repo> …`, give `grep`, `rg`, `egrep`, `fgrep`, `diff`, `cp` and
+   `mv` absolute path arguments, and name any throwaway copy by its absolute path. A directory
+   change followed by a relative path argument to one of those commands is refused outright
+   whenever the repository under check configures a `Read()` deny rule, and no permission mode
+   clears that refusal.
 
 Output only this, nothing else:
 

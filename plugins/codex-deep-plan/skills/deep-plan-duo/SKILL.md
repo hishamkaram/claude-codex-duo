@@ -39,6 +39,13 @@ planning, not implementing.
    `validate-verdict.py` run on a `codex-run.sh` `.stdout` produces one. If Codex is unavailable
    the plan is stamped SOLO and says so on line 1.
 10. Never edit, paraphrase, or trim Codex's raw replies; they stay verbatim in the sidecars.
+11. PATHS ARE ABSOLUTE. Every command runs from wherever the session already is:
+    address every path absolutely; never `cd` inside a tool command. Read the repository with
+    `git -C <repo> …`, give `grep`, `rg`, `egrep`, `fgrep`, `diff`, `cp` and `mv` absolute path
+    arguments, and name artifact-directory files by their absolute path. A directory change
+    followed by a relative path argument to one of those commands is refused outright whenever
+    the repository being planned against configures a `Read()` deny rule, and no permission mode
+    clears that refusal.
 
 ## Step 0 — Resolve inputs, then stop if unresolved
 

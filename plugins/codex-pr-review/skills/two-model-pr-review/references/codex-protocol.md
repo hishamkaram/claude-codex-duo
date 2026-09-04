@@ -46,10 +46,14 @@ the result except to remove something that would leak.
 The builder captures the aggregate working tree as one TREE object:
 
 ```bash
-( cd "$REPO" && export GIT_INDEX_FILE="$ART/tmp-index" && git add -A . >/dev/null && git write-tree )
+GIT_INDEX_FILE="$ART/tmp-index" git -C "$REPO" add -A "$REPO" >/dev/null
+GIT_INDEX_FILE="$ART/tmp-index" git -C "$REPO" write-tree
 ```
 
-`GIT_INDEX_FILE` is exported inside one subshell so it covers BOTH commands; the
+`GIT_INDEX_FILE` is set on BOTH commands, and `git -C` reaches the repository
+without moving the shell: a `cd` followed by a relative operand is what hard
+constraint 11 forbids, and a reference must not publish the shape the skill
+bans. The
 scratch index lives in the artifact directory (inside the repo it would leak its
 own lock file into the snapshot) and is deleted afterwards. The repo's real
 index, refs, stash, reflog and files are untouched; only unreachable objects are

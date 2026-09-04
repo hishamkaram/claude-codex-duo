@@ -32,6 +32,14 @@ movement. Follow it exactly.
    is no debate; report the failure and stop.
 7. Never edit, paraphrase, or trim Codex's raw responses in the artifacts.
 8. No production credentials, no destructive operations, no network writes.
+9. PATHS ARE ABSOLUTE. Every command runs from wherever the session already
+   is: address every path absolutely; never `cd` inside a tool command. Read
+   the repository with `git -C <repo> …`, give `grep`, `rg`, `egrep`, `fgrep`,
+   `diff`, `cp` and `mv` absolute path arguments, and name artifact-directory
+   files by their absolute path. A directory change followed by a relative path
+   argument to one of those commands is refused outright whenever the repository
+   under debate configures a `Read()` deny rule, and no permission mode clears
+   that refusal.
 
 ## Step 0 — Resolve the motion, then stop if unresolved
 
