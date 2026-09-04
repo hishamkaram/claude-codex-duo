@@ -135,7 +135,8 @@ sealed, `02-codex.md` written with its STATUS line — the SKIPPED form needs no
 runner sidecar — hashes unchanged); no `REVIEW.md` before `04-verification.md`
 exists; and `phase-gate.sh post-join` must print `POST-JOIN-OK` at the
 completion gate. If the lead agent returns `LEAD FAILED`, null, or no
-`01-lead.md` exists when Codex finishes, run Phase 1 yourself in-context BEFORE
+`01-lead.md` exists when Codex finishes — or the deadline watcher fired and the
+`TaskStop` was acknowledged — run Phase 1 yourself in-context BEFORE
 opening any Codex output file (you may have read `.exit`/`.meta` and the
 cut-down progress line: no review text), then seal the file and run the join
 gate.
@@ -158,7 +159,18 @@ finding exists. Also run the package build for the touched workspace packages
 now (`pnpm --filter <pkg> build`; gitignored output only) so Phase 4 tests run
 against fresh declarations. Finish Phase 0 with
 `${CLAUDE_PLUGIN_ROOT}/skills/two-model-pr-review/scripts/phase-gate.sh pre-codex "$ART" "$REPO"`
-and paste its `PREFLIGHT-OK` line into `00-run.md`. `00-run.md` is the orchestrator's
+and paste its `PREFLIGHT-OK` line into `00-run.md`.
+
+Then run the **consent probe**, once, in the foreground: issue the command families a reviewer may
+still need Bash for — `mkdir -p "$ART/lead-scratch"`, a `cp -R` of one file inside `ART`, `git -C
+<repo> worktree list`, and the project's own test command in its `--version` or `--help` form — as
+SEPARATE top-level Bash calls, and record each outcome in `00-run.md` as
+`PERM-PROBE <family> ok|prompted|denied`. It cannot be one script: the harness matches the
+top-level command string of a tool call and never the interior of a script, so approving a wrapper
+approves nothing it runs. The probe is **best-effort prompt surfacing only** — it puts any approval
+in front of the user while they are still at the keyboard. It is not asserted to authorise any
+later call, least of all one issued inside a subagent, and nothing in the run depends on it: what
+bounds an unanswered prompt is the supervision in the join turn. `00-run.md` is the orchestrator's
 log for everything that happens after the packets are frozen (gate lines, launch
 times, task and job ids, Workflow status); it is never hashed and no reviewer
 reads it. `00-scope.md` and `00-brief.md` must not change after the gate — the
@@ -170,11 +182,46 @@ monitored runner in the background from `00-brief.md` (`references/codex-protoco
 `codex-pr-review:lead-reviewer`; if that type is not registered, a fresh
 general-purpose agent given `agents/lead-reviewer.md` verbatim as its
 instructions — record which in `00-run.md`) with the run directory, the
-repository path and the plugin root. Then wait for both. While either runs, do
-not open `02-codex.stdout`, `.stderr` or `.joblog`, do not read `01-lead.md`,
-and check liveness only with `tail -n 1 "$ART/02-codex.progress" | cut -d'|' -f1`.
-Record the lead agent's task id, the Codex job id, and both launch times in
+repository path, the plugin root and the `TREE-IS-HEAD` line below; (3) launch
+TWO `agent-watch.sh` jobs in the background over the lead's output file, an
+advisory one and a deadline one. Then wait for all of them. While either
+reviewer runs, do not open `02-codex.stdout`, `.stderr` or `.joblog`, do not
+read `01-lead.md`, and check Codex's liveness only with
+`tail -n 1 "$ART/02-codex.progress" | cut -d'|' -f1`. Record the lead agent's
+task id, the Codex job id, both watcher job ids, and every launch time in
 `00-run.md`.
+
+```bash
+W=${CLAUDE_PLUGIN_ROOT}/skills/two-model-pr-review/scripts/agent-watch.sh
+"$W" "$ART/01-lead.advisory" --expect "$ART/01-lead.md" --after 20 --label lead-advisory   # background
+"$W" "$ART/01-lead.deadline" --expect "$ART/01-lead.md" --after 45 --label lead-deadline   # background
+```
+
+A background job notifies once, when it exits, so one watcher cannot raise an
+advisory and then survive to raise a deadline — that is why there are two. Set
+the advisory window above the band a real review occupies (observed lead reviews
+run 4–26 minutes) so it means "something is wrong", not "this is taking a while".
+
+- **Advisory watcher exits 3** — say in ONE line that the lead agent has not
+  produced its file yet and a tool-approval prompt may be waiting for the user,
+  then keep waiting. The deadline watcher is still alive. Do nothing destructive.
+- **Deadline watcher exits 3** — call `TaskStop` on the lead agent and read its
+  result. Only once the stop is acknowledged may you run Phase 1 in-context and
+  write `01-lead.md`. If the stop is NOT acknowledged, do not start the
+  in-context review: a stopped-but-running agent and a fallback would both write
+  the same file. Report it and stop, exactly as the runner's exit 5 forbids a
+  second worker after an unconfirmed cancel.
+- **Either watcher exits 0** — the lead file arrived; supervision for that unit
+  is over. The other watcher exits 0 by itself at its next poll.
+
+**`TREE-IS-HEAD`.** The reviewers search the working tree, while the brief pins
+SHAs, so tell them in their task prompt which one the tree is. Range mode: `yes`
+when `git -C <repo> rev-parse HEAD` equals the head SHA AND
+`git --no-optional-locks status --porcelain=v1 --untracked-files=all` is empty —
+untracked files count, because a tree search can hit a file that is not in the
+pinned tree. Local mode: `yes` when the recorded snapshot tree still recaptures
+identically. Otherwise `no`, and the agent restricts tree results to discovery
+and makes every exhaustive or absence claim with one `git grep` at the pinned SHA.
 
 **Phase 1 — Lead review (in the agent)** → `01-lead.md`
 The agent reads only `00-scope.md` and `00-brief.md`, follows

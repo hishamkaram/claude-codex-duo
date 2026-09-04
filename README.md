@@ -248,6 +248,8 @@ Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at th
 | Runner exit `5` | The job stalled or timed out and the cancel could not be confirmed. Do not retry; check the job with the companion's `status` command, because a worker may still be running. |
 | Runner exit `2` (STALLED) | No job-log activity for `--stall-min` minutes. Check the `.joblog` sidecar; upstream capacity errors are recorded in `.meta` as `last_error`. Rerun; attempts rotate. |
 | Runner exit `3` (TIMEOUT) | Review exceeded `--max-min`. Large diffs should be split by subsystem in Phase 0. |
+| A reviewer agent never returns (`WATCH-OVERDUE` from the advisory watcher) | It is almost certainly blocked on a tool-approval prompt, not computing: a Bash call it issued is waiting for an answer. Approve or reject the pending prompt. Read-only tool calls never wait, which is why reviewers are told to search with the Grep and Glob tools. |
+| `WATCH-OVERDUE` from the deadline watcher | The review stops the agent with `TaskStop` and, once the stop is acknowledged, runs Phase 1 in-context. If the stop is not acknowledged it refuses to continue rather than let a stopped-but-running agent and the fallback both write `01-lead.md`. |
 | `phase-gate.sh pre-phase3` fails with `01-lead.md missing` | The lead-reviewer agent returned nothing or never wrote its file. The orchestrator must run the lead review in-context BEFORE opening any `02-codex.*` file, then seal it and rerun the gate. |
 | `phase-gate.sh` reports a packet `changed since its hash was recorded` | `00-brief.md` or `00-scope.md` was edited after Codex was launched. Packets are frozen; run records belong in `00-run.md`. If only log lines were appended, move them there and restore the packet; otherwise start a fresh run directory. |
 | `--workflow` passed but the Workflow tool is not listed | The review announces it, uses plain Agent-tool fan-out, and records `Workflow: unavailable — Agent-tool fallback` in `00-run.md` and REVIEW.md §8. |
@@ -266,6 +268,8 @@ Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at th
 **Can I use a Claude subagent instead of Codex?** No. All plugins refuse to simulate the second model; a same-model second opinion is exactly the failure mode they exist to avoid.
 
 **Is the lead review a subagent now?** Yes. Since codex-pr-review 2.0.0 the lead review runs in the plugin's `lead-reviewer` agent, in its own context, at the same time as Codex's blind review. That is what lets the two run concurrently without either seeing the other's output; the orchestrator adjudicates after a join gate. Codex is still never simulated.
+
+**Why do the reviewer agents search with the Grep and Glob tools instead of `grep` or `git grep`?** Because a Bash call can wait for an approval and a read-only tool call does not. A reviewer runs in the background, so a prompt it raises is not in front of you; four runs on one machine blocked between 35 minutes and 2h16m on exactly that, the worst of them on a single `git grep`. Bash is still used for `git show`/`diff`/`log` at a pinned SHA and for running a repro, and those calls are bounded by the join turn's watchers rather than avoided.
 
 **Why does the deep plan run outside plan mode and only enter it at the end?** Plan mode blocks every write except the plan file, and the skill has to write artifacts, run linters and launch 10–30 minute Codex jobs. It finishes the work, then enters plan mode with `PLAN.md` verbatim so you approve the same document that carries the evidence.
 

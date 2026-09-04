@@ -128,5 +128,26 @@ if [ -n "$HITS" ]; then
   FAIL=1
 else note ok "no shipped instruction publishes a directory change"; fi
 
+echo "10. Every file that gives an agent a search instruction names the Grep/Glob tools"
+# Non-load-bearing regression coverage: the wording edits are what remove the cause (the agent
+# contracts are authoritative text, not generated). This check asserts the instrument rule is
+# PRESENT — it must not forbid the word `grep`, because `git grep` at a pinned SHA is the
+# sanctioned fallback for when the checkout is not the review head, and check 8's path-form
+# clause legitimately names the shell search commands it constrains.
+for f in \
+  plugins/codex-pr-review/agents/lead-reviewer.md \
+  plugins/codex-pr-review/agents/finding-verifier.md \
+  plugins/codex-deep-plan/agents/fact-checker.md \
+  plugins/codex-pr-review/skills/two-model-pr-review/references/review-rubric.md; do
+  if [ ! -f "$f" ]; then note FAIL "$f missing (it delivers a search instruction to an agent)"; continue; fi
+  flat=$(tr '\n' ' ' < "$f" | tr -s ' \t' ' ')
+  miss=""
+  printf '%s' "$flat" | grep -Fq "Grep tool" || miss="$miss no-Grep-tool"
+  printf '%s' "$flat" | grep -Fq "Glob tool" || miss="$miss no-Glob-tool"
+  # the rule has to say WHY, so it survives a reader who disagrees with it
+  printf '%s' "$flat" | grep -Eq "never (wait|block)|cannot (wait|block)|without waiting" || miss="$miss no-rationale"
+  [ -z "$miss" ] && note ok "$f" || note FAIL "$f lacks the instrument rule:$miss"
+done
+
 echo
 [ $FAIL -eq 0 ] && { echo "ALL CHECKS PASSED"; exit 0; } || { echo "VALIDATION FAILED"; exit 1; }

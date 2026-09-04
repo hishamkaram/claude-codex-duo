@@ -38,6 +38,23 @@ message run concurrently; use the same agent types, prompts and per-item contrac
 silently switch. If the tool is present but a run is cancelled or returns nothing, finish the
 stage in-context and record `Workflow: partial — <reason>` the same way.
 
+## Supervision of fan-out units
+
+Every unit launched in the background gets the same pair of `agent-watch.sh` jobs the join turn
+gives the lead (SKILL.md §Join turn): one advisory, one deadline. A background job notifies once,
+at exit, so two single-purpose watchers are what produce an advisory and, later, a deadline.
+
+- **Lead shards.** One pair per shard, `--expect "$ART/01-lead.<shard>.md"`.
+- **Phase 4.** A verifier returns a structured object and writes no file, so there is nothing to
+  watch per finding. Watch the STAGE instead: write `$ART/.stage-verify.done` the moment the
+  Workflow call returns, and point one pair of watchers at that sentinel. Teardown is then
+  automatic — a successful fan-out ends both watchers at exit 0, and neither can outlive the work
+  it watched and report a stale verdict.
+
+A verifier's repro commands are chosen after Phase 3, from findings that do not exist at Phase 0,
+so the Phase-0 consent probe cannot enumerate them. Supervision, not the probe, is what bounds
+them.
+
 ## Stage `verify` (Phase 4, always under `--workflow`)
 
 ```json

@@ -569,5 +569,61 @@ JSEOF
 ); code=$?
 [ "$code" = 0 ] && printf '%s' "$out" | grep -q SMOKE-OK && printf '  ok    %-42s\n' "workflow: both stages run under stubbed globals" || { printf '  FAIL  workflow smoke: %s\n' "$out"; FAIL=1; }
 
+echo "review: agent-watch.sh (supervision of an asynchronous review unit)"
+AW=plugins/codex-pr-review/skills/two-model-pr-review/scripts/agent-watch.sh
+WD="$TMP/watch"; mkdir -p "$WD"
+chk "watch: no arguments"              2 "out-prefix"           bash "$AW"
+chk "watch: option as first argument"  2 "out-prefix"           bash "$AW" --expect x
+chk "watch: --expect with no value"    2 "requires a value"     bash "$AW" "$WD/a" --expect
+chk "watch: --after with no value"     2 "requires a value"     bash "$AW" "$WD/a" --expect x --after
+chk "watch: --after followed by option" 2 "requires a value"    bash "$AW" "$WD/a" --expect x --after --label l
+chk "watch: non-numeric --after"       2 "whole number"         bash "$AW" "$WD/a" --expect x --after abc
+chk "watch: --expect is required"      2 "--expect is required" bash "$AW" "$WD/a" --after 1
+chk "watch: a deadline is required"    2 "--after"              bash "$AW" "$WD/a" --expect x
+chk "watch: unknown arg"               2 "unknown arg"          bash "$AW" "$WD/a" --bogus
+# T-5 / T-7: the expected artifact is already there — exit 0 without waiting out the deadline
+printf 'lead\n' > "$WD/present.md"
+S=$(date +%s); chk "watch: artifact present → 0" 0 "WATCH-OK" bash "$AW" "$WD/p" --expect "$WD/present.md" --after-sec 30 --poll-sec 1
+[ $(( $(date +%s) - S )) -lt 10 ] && printf '  ok    %-42s\n' "watch: returned at once, did not wait" || { printf '  FAIL  watch: waited out the deadline\n'; FAIL=1; }
+[ "$(cat "$WD/p.exit" 2>/dev/null)" = "0" ] && printf '  ok    %-42s\n' "watch: .exit sidecar records 0" || { printf '  FAIL  watch: .exit sidecar\n'; FAIL=1; }
+# The lead SEALS its file (chmod 000) the moment it writes it, so the sealed file is the normal
+# success case: -s stats, it does not open, and the watcher must still see it.
+printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$WD/sealed.md"; chmod 000 "$WD/sealed.md"
+chk "watch: sealed (mode 000) artifact → 0"  0 "WATCH-OK"      bash "$AW" "$WD/sl" --expect "$WD/sealed.md" --after-sec 20 --poll-sec 1
+chmod 600 "$WD/sealed.md"
+# and the watcher's own sidecars must not collide with the glob pre-codex uses to refuse a
+# resumed run while any lead file is readable
+bash "$AW" "$WD/01-lead.advisory" --expect "$WD/present.md" --after-sec 5 --poll-sec 1 >/dev/null 2>&1
+set -- "$WD"/01-lead*.md
+[ ! -e "$1" ] && printf '  ok    %-42s\n' "watch: sidecars miss the 01-lead*.md glob" || { printf '  FAIL  watch: sidecar matches the gate glob: %s\n' "$1"; FAIL=1; }
+# an empty artifact is not an artifact
+: > "$WD/empty.md"
+chk "watch: artifact empty → deadline"  3 "WATCH-OVERDUE"       bash "$AW" "$WD/e" --expect "$WD/empty.md" --after-sec 2 --poll-sec 1
+# T-3 / T-4: absent artifact, deadline passes
+chk "watch: artifact absent → 3"        3 "WATCH-OVERDUE"       bash "$AW" "$WD/d" --expect "$WD/never.md" --after-sec 2 --poll-sec 1
+grep -q "expect=" "$WD/d.progress" 2>/dev/null && printf '  ok    %-42s\n' "watch: .progress sidecar written" || { printf '  FAIL  watch: no .progress sidecar\n'; FAIL=1; }
+# T-10: the paired-watcher lifecycle — one process, one verdict, so two processes are used.
+# The advisory must fire while the deadline watcher is STILL ALIVE; that is the sequence a
+# single three-exit watcher provably cannot produce (round-2 blocker X-10).
+rm -f "$WD/paired.md"
+bash "$AW" "$WD/adv" --expect "$WD/paired.md" --after-sec 2  --poll-sec 1 >/dev/null 2>&1 & ADV=$!
+bash "$AW" "$WD/dln" --expect "$WD/paired.md" --after-sec 12 --poll-sec 1 >/dev/null 2>&1 & DLN=$!
+wait "$ADV"; ADVRC=$?
+if kill -0 "$DLN" 2>/dev/null; then ALIVE=yes; else ALIVE=no; fi
+[ "$ADVRC" = 3 ] && [ "$ALIVE" = yes ] && printf '  ok    %-42s\n' "watch: advisory fired, deadline still alive" || { printf '  FAIL  watch: paired lifecycle advisory=%s deadline_alive=%s\n' "$ADVRC" "$ALIVE"; FAIL=1; }
+# the artifact appears between the two thresholds → the deadline watcher exits 0, never 3
+printf 'lead\n' > "$WD/paired.md"
+wait "$DLN"; DLNRC=$?
+[ "$DLNRC" = 0 ] && printf '  ok    %-42s\n' "watch: artifact between thresholds → 0" || { printf '  FAIL  watch: deadline watcher exit=%s (want 0)\n' "$DLNRC"; FAIL=1; }
+# T-11: the stage sentinel — a stage with no watchable file still has a success condition, so a
+# watcher can never outlive the work it watches (round-3 X-11)
+rm -f "$WD/.stage-verify.done"
+bash "$AW" "$WD/s1" --expect "$WD/.stage-verify.done" --after-sec 12 --poll-sec 1 >/dev/null 2>&1 & S1=$!
+bash "$AW" "$WD/s2" --expect "$WD/.stage-verify.done" --after-sec 12 --poll-sec 1 >/dev/null 2>&1 & S2=$!
+printf 'done\n' > "$WD/.stage-verify.done"
+wait "$S1"; R1=$?; wait "$S2"; R2=$?
+[ "$R1" = 0 ] && [ "$R2" = 0 ] && printf '  ok    %-42s\n' "watch: stage sentinel ends both watchers" || { printf '  FAIL  watch: sentinel exits %s/%s (want 0/0)\n' "$R1" "$R2"; FAIL=1; }
+
+
 echo
 [ $FAIL -eq 0 ] && { echo "ALL ARGUMENT AND BUILDER TESTS PASSED"; exit 0; } || { echo "TESTS FAILED"; exit 1; }
