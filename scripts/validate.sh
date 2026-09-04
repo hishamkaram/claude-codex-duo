@@ -104,5 +104,19 @@ else
 fi
 rm -f /tmp/ccd-test-args.$$
 
+echo "8. Every context that composes commands carries the path-form rule"
+CLAUSE='address every path absolutely; never `cd` inside a tool command'
+for f in \
+  plugins/codex-pr-review/skills/two-model-pr-review/SKILL.md \
+  plugins/codex-deep-plan/skills/deep-plan-duo/SKILL.md \
+  plugins/codex-debate/skills/codex-debate/SKILL.md \
+  plugins/codex-pr-review/agents/lead-reviewer.md \
+  plugins/codex-pr-review/agents/finding-verifier.md \
+  plugins/codex-deep-plan/agents/fact-checker.md; do
+  if [ ! -f "$f" ]; then note FAIL "$f missing (the rule must live in every command-composing context)"
+  elif tr '\n' ' ' < "$f" | tr -s ' \t' ' ' | grep -Fq "$CLAUSE"; then note ok "$f"
+  else note FAIL "$f does not carry the path-form clause: $CLAUSE"; fi
+done
+
 echo
 [ $FAIL -eq 0 ] && { echo "ALL CHECKS PASSED"; exit 0; } || { echo "VALIDATION FAILED"; exit 1; }

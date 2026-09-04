@@ -34,6 +34,14 @@ backed by artifacts on disk.
    verified in Phase 4 regardless of who raised it or whether both did.
 10. No destructive operations, no production credentials. Never claim a command
     ran if it did not; report exact commands and their results.
+11. PATHS ARE ABSOLUTE. Every command runs from wherever the session already
+    is: address every path absolutely; never `cd` inside a tool command. Read
+    the repository with `git -C <repo> …`, give `grep`, `rg`, `egrep`, `fgrep`,
+    `diff`, `cp` and `mv` absolute path arguments, and name artifact-directory
+    files by their absolute path. A directory change followed by a relative
+    path argument to one of those commands is refused outright whenever the
+    repository under review configures a `Read()` deny rule, and no permission
+    mode clears that refusal.
 
 ## Step 0 — Resolve inputs, then stop if unresolved
 

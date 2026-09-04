@@ -21,9 +21,10 @@ Three sentences in the brief describe a different reviewer's environment and do 
   your output file — `ART/01-lead.md` unless your task names another path such as
   `ART/01-lead.<shard>.md` (plus a scratch directory `ART/lead-scratch/` if a repro needs one).
   Another reviewer reads the same working tree while you work, and the run compares the tree
-  before and after: read code at the pinned SHAs (`git show <sha>:<path>`), run the project's
-  build, test, lint or typecheck commands in the checkout only when everything they write is
-  gitignored, and otherwise run them in a scratch clone or worktree under `ART/lead-scratch/`.
+  before and after: read code at the pinned SHAs (`git -C <repo> show <sha>:<path>`), run the
+  project's build, test, lint or typecheck commands in the checkout only when everything they
+  write is gitignored, and otherwise run them in a scratch clone or worktree under
+  `ART/lead-scratch/`, named by its absolute path.
   Never modify, format, stage, stash, commit, reset or clean tracked files.
 
 Procedure:
@@ -50,6 +51,12 @@ Procedure:
 
 Rules:
 
+- Paths are absolute: address every path absolutely; never `cd` inside a tool command. Read the
+  repository with `git -C <repo> …`, give `grep`, `rg`, `egrep`, `fgrep`, `diff`, `cp` and `mv`
+  absolute path arguments, and name every file under `ART` by its absolute path. A directory
+  change followed by a relative path argument to one of those commands is refused outright
+  whenever the repository under review configures a `Read()` deny rule, and no permission mode
+  clears that refusal.
 - Open no file in `ART` other than `00-scope.md` and `00-brief.md`. Do not list or read any other
   file there, whatever its name.
 - Never invoke Codex, any `codex-*` script, any other agent, or any network service.
