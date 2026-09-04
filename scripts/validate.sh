@@ -149,5 +149,49 @@ for f in \
   [ -z "$miss" ] && note ok "$f" || note FAIL "$f lacks the instrument rule:$miss"
 done
 
+echo "11. Every recorded plugin install resolves to a directory whose manifest matches"
+# A release reaches the repository and the user's sessions by different routes. The harness records
+# an installed version and an install path; if that path does not exist, sessions keep running
+# whatever cache directory is still there, and `claude plugin update` reports "already at the
+# latest version" because the version record was already bumped. Observed 2026-09-04 with all three
+# of this marketplace's plugins recorded at directories that did not exist.
+# It inspects the developer's machine, not the repository, so "not installed here" is not a failure.
+python3 - <<'PLUGINCHECK' || FAIL=1
+import json, os, sys
+reg = os.path.expanduser("~/.claude/plugins/installed_plugins.json")
+names = {p["name"] for p in json.load(open(".claude-plugin/marketplace.json"))["plugins"]}
+if not os.path.exists(reg):
+    print("  ok      no installed-plugin record on this machine; nothing to verify"); sys.exit(0)
+try:
+    plugins = json.load(open(reg)).get("plugins", {})
+except Exception as e:
+    print(f"  FAIL    installed_plugins.json is unreadable: {e}"); sys.exit(1)
+seen = ok = 0; bad = []
+for key, entries in plugins.items():
+    if key.split("@", 1)[0] not in names: continue
+    for e in entries:
+        seen += 1
+        path, want = e.get("installPath", ""), e.get("version", "")
+        man = os.path.join(path, ".claude-plugin", "plugin.json")
+        if not os.path.isdir(path):
+            bad.append(f"{key.split('@')[0]} {want}: installPath does not exist ({path})")
+        elif not os.path.exists(man):
+            bad.append(f"{key.split('@')[0]} {want}: no plugin.json under {path}")
+        else:
+            got = json.load(open(man)).get("version")
+            if got != want: bad.append(f"{key.split('@')[0]}: recorded {want}, directory holds {got}")
+            else: ok += 1
+if not seen:
+    print("  ok      none of this marketplace's plugins are installed here")
+elif bad:
+    for b in bad: print(f"  FAIL    {b}")
+    print('  FAIL    a recorded version does not match what is on disk, so "claude plugin update"')
+    print('          reports "already at the latest version". Recover with "claude plugin uninstall"')
+    print('          then "claude plugin install <name>@<marketplace> --scope user".')
+    sys.exit(1)
+else:
+    print(f"  ok      {ok}/{seen} recorded install(s) resolve to a matching directory")
+PLUGINCHECK
+
 echo
 [ $FAIL -eq 0 ] && { echo "ALL CHECKS PASSED"; exit 0; } || { echo "VALIDATION FAILED"; exit 1; }

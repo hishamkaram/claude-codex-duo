@@ -2,6 +2,12 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] - 2026-09-04
+
+### Added
+- **A check that the version recorded as installed is the version on disk** (`scripts/validate.sh` check 11). Found while diagnosing the reviewer stalls: `installed_plugins.json` recorded `codex-pr-review 2.1.0`, `codex-deep-plan 2.1.0` and `codex-debate 1.1.0` at cache directories that did not exist, while the newest directories present were `2.0.0`, `2.0.1` and `1.0.5`. A release can therefore reach the repository and never reach a session, and `claude plugin update` answers "already at the latest version" because the version record was bumped regardless. The check reports each mismatch and names the reinstall that recovers it; on a machine with no record, or with none of this marketplace's plugins installed, it passes quietly, so CI is unaffected.
+- Separate from the 1.5.0 fix by design: different mechanism, different change surface, and — established during the debate — **not** the cause of the observed stalls. The registry was last written at `04:07:10.197Z`, after the affected agents started at `03:44:30Z` and `03:46:59Z`, so which contract those runs loaded is not established either way.
+
 ## [1.5.0] - 2026-09-04
 
 ### Fixed
