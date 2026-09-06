@@ -40,6 +40,8 @@ fixture_revs() {  # what build-brief.sh (.base/.head) and pre-codex (00-repo.txt
 mkbrief() {  # a brief whose Target section restates fixture_revs: the gate pins 00-repo.txt to it (round-38 CX-02)
   printf -- '- Repository: %s\n- Head: `HEAD` (%s)\n- Base: `HEAD` (%s)\nbrief\n' "$(cd "$G2" && pwd -P)" "$SHA2" "$SHA2" > "$1/00-brief.md"
 }
+# File mode, portable: GNU stat (-c) on Linux, BSD stat (-f) on macOS — the same detection phase-gate.sh uses.
+if stat --version >/dev/null 2>&1; then fmode() { stat -c %a "$1" 2>/dev/null; }; else fmode() { stat -f %Lp "$1" 2>/dev/null; }; fi
 pgw() { [ -d "${2:-}" ] && { top_up_claims "$2"; fixture_revs "$2"; }; bash "$PG" "$@"; }
 pgwg() { local g="$1"; shift; [ -d "${2:-}" ] && { top_up_claims "$2"; fixture_revs "$2"; }; PHASE_GATE_CLAIM_GRACE_SEC="$g" bash "$PG" "$@"; }
 chk() {
@@ -695,7 +697,7 @@ printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$GA/01-lead.md"
 # the lead was rewritten above, so re-join (fresh seal) before the consistency checks
 chmod 000 "$GA/01-lead.md"; chmod u+w "$GA/02-review-seal.sha256" 2>/dev/null; rm -f "$GA/02-review-seal.sha256" "$GA/00-accepted.sha256"
 pgw pre-phase3 "$GA" >/dev/null || { printf '  FAIL  gate: re-join for post-join fixture\n'; FAIL=1; }
-grep -q ' 02-review-seal.sha256  pre-phase3  final$' "$GA/00-accepted.sha256" && [ "$(stat -f %Lp "$GA/00-accepted.sha256" 2>/dev/null || stat -c %a "$GA/00-accepted.sha256")" = 400 ] && printf '  ok    %-42s\n' "ledger: join accepts the review seal (mode 400)" || { printf '  FAIL  ledger: seal row missing or ledger writable\n'; FAIL=1; }
+grep -q ' 02-review-seal.sha256  pre-phase3  final$' "$GA/00-accepted.sha256" && [ "$(fmode "$GA/00-accepted.sha256")" = 400 ] && printf '  ok    %-42s\n' "ledger: join accepts the review seal (mode 400)" || { printf '  FAIL  ledger: seal row missing or ledger writable\n'; FAIL=1; }
 chmod 600 "$GA/01-lead.md"
 chk "gate: post-join, consistent run"  0 "POST-JOIN-OK"         pgw post-join "$GA"
 printf '%s\n' "0123456789abcdef0123456789abcdef01234567" > "$GA/00-brief.md.tree"
@@ -923,7 +925,7 @@ cp "$CS/04-consultation.md" "$TMP/cs-04md.bak"; printf 'consultation\nSTATUS: PH
 chk "L-01r28: SKIPPED after an accepted consultation refused" 1 "an accepted consultation cannot be skipped" pgw pre-verification "$CS"
 cp "$TMP/cs-04md.bak" "$CS/04-consultation.md"
 grep -q ' 04-consultation.stdout  pre-verification  final$' "$CS/00-accepted.sha256" && grep -q ' 04-consultation.json  pre-verification  final$' "$CS/00-accepted.sha256" && grep -q ' 04-consultation.thread  pre-verification  final$' "$CS/00-accepted.sha256" && grep -q ' 05-verifier-packets.ndjson  pre-verification  draft$' "$CS/00-accepted.sha256" && printf '  ok    %-42s\n' "ledger: consultation response, thread and packets accepted" || { printf '  FAIL  ledger: consultation rows missing\n'; FAIL=1; }
-[ "$(stat -f %Lp "$CS/00-accepted.sha256" 2>/dev/null || stat -c %a "$CS/00-accepted.sha256")" = 400 ] && printf '  ok    %-42s\n' "CX-02r23: accept ledger is read-only (mode 400)" || { printf '  FAIL  CX-02r23: ledger missing or writable\n'; FAIL=1; }
+[ "$(fmode "$CS/00-accepted.sha256")" = 400 ] && printf '  ok    %-42s\n' "CX-02r23: accept ledger is read-only (mode 400)" || { printf '  FAIL  CX-02r23: ledger missing or writable\n'; FAIL=1; }
 # CX-02r23: rewriting a still-valid consultation response after pre-verification is caught later.
 cp "$CS/04-consultation.stdout" "$TMP/cs-stdout.bak"
 python3 - "$CS/04-consultation.stdout" <<'PY2'

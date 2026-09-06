@@ -54,6 +54,9 @@ shift
 # With --claim nothing may be written before the claim is owned, so an argument
 # error leaves no .exit (the gate's claim stays in flight until the operator
 # relaunches or releases it); the flag is detected before parsing for that reason.
+# stat, portable: GNU (-c) on Linux, BSD (-f) on macOS; a wrong-flavour call must never "succeed" with garbage.
+if stat --version >/dev/null 2>&1; then fmtime() { stat -c %Y "$1" 2>/dev/null; }; fsig() { stat -c '%s:%Y' "$1" 2>/dev/null; }
+else fmtime() { stat -f %m "$1" 2>/dev/null; }; fsig() { stat -f '%z:%m' "$1" 2>/dev/null; }; fi
 CLAIM_MODE=0; CLAIM_TOKEN=""; for _a in "$@"; do [ "$_a" = "--claim" ] && CLAIM_MODE=1; done  # exact argument, never a substring of a value (round-33 CX-03)
 # An argument error writes <prefix>.exit only for the claim-less sibling plugins: with --claim, or when a launch claim exists for the prefix (a gate-issued prefix), nothing is written (round-42 CL-04).
 die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
@@ -118,7 +121,7 @@ stamp_claim() {
   # minute belongs to a dead process.
   local lock="$PREFIX.claim.lock" i=0 now m
   while ! mkdir "$lock" 2>/dev/null; do
-    now=$(date +%s); m=$(stat -c %Y "$lock" 2>/dev/null || stat -f %m "$lock" 2>/dev/null || echo "$now")
+    now=$(date +%s); m=$(fmtime "$lock" || echo "$now"); m=${m:-$now}
     if [ $(( now - m )) -ge 60 ] && rmdir "$lock" 2>/dev/null; then continue; fi  # stale and reclaimed; an unremovable one is retried like a held one (bounded)
     i=$((i+1)); [ "$i" -lt 50 ] || { echo "codex-run.sh: $lock is held by a launch gate or another runner (a claim is being taken or rotated right now), or is stale and cannot be removed; retry in a moment (no sidecar was written)" >&2; exit 4; }
     sleep 0.1
@@ -176,7 +179,7 @@ while :; do
   LASTLINE=""; SIG=""
   if [ -n "$LOGFILE" ] && [ -r "$LOGFILE" ]; then
     LASTLINE=$(tail -n 1 "$LOGFILE" 2>/dev/null | cut -c1-140)
-    SIG=$(stat -f '%z:%m' "$LOGFILE" 2>/dev/null || stat -c '%s:%Y' "$LOGFILE" 2>/dev/null)
+    SIG=$(fsig "$LOGFILE")
   fi
   if [ "$SIG" != "$PREV_SIG" ]; then LAST_ACTIVITY=$(now); PREV_SIG="$SIG"; fi
   IDLE=$(( $(now) - LAST_ACTIVITY ))
