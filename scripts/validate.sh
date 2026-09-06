@@ -71,6 +71,9 @@ for r in plugins/*/scripts/codex-run.sh; do
   cmp -s "$REF" "$r" && note ok "$r identical to $REF" || note FAIL "$r differs from $REF (the runner is shared by copy; keep the copies byte-identical)"
 done
 
+echo "4b2. review-workflow.js constants are generated from review_common.py (gen-workflow-constants.py --check)"
+python3 plugins/codex-pr-review/skills/two-model-pr-review/scripts/gen-workflow-constants.py --check >/dev/null 2>&1 && note ok "workflow constants match review_common.py" || note FAIL "review-workflow.js constants differ from review_common.py: run scripts/gen-workflow-constants.py --write"
+
 echo "4c. Workflow scripts compile as the Workflow tool evaluates them (scripts/js-check.sh)"
 if command -v node >/dev/null 2>&1; then
   while IFS= read -r s; do
@@ -81,8 +84,8 @@ else
 fi
 
 echo "5. No absolute or home-relative paths leak into shipped files"
-if grep -rn '~/\.claude/skills/\|~/\.claude/scripts/\|/Users/' plugins >/dev/null 2>&1; then
-  grep -rn '~/\.claude/skills/\|~/\.claude/scripts/\|/Users/' plugins | sed 's/^/  FAIL    /'; FAIL=1
+if grep -rn --exclude-dir=__pycache__ --exclude='*.pyc' '~/\.claude/skills/\|~/\.claude/scripts/\|/Users/' plugins >/dev/null 2>&1; then
+  grep -rn --exclude-dir=__pycache__ --exclude='*.pyc' '~/\.claude/skills/\|~/\.claude/scripts/\|/Users/' plugins | sed 's/^/  FAIL    /'; FAIL=1
 else note ok "no machine-specific paths"; fi
 
 echo "6. Every runner exit code is documented in every skill and the README"
@@ -108,10 +111,10 @@ echo "8. Every context that composes commands carries the path-form rule"
 CLAUSE='address every path absolutely; never `cd` inside a tool command'
 for f in \
   plugins/codex-pr-review/skills/two-model-pr-review/SKILL.md \
+  plugins/codex-pr-review/agents/finding-verifier.md \
   plugins/codex-deep-plan/skills/deep-plan-duo/SKILL.md \
   plugins/codex-debate/skills/codex-debate/SKILL.md \
   plugins/codex-pr-review/agents/lead-reviewer.md \
-  plugins/codex-pr-review/agents/finding-verifier.md \
   plugins/codex-deep-plan/agents/fact-checker.md; do
   if [ ! -f "$f" ]; then note FAIL "$f missing (the rule must live in every command-composing context)"
   elif tr '\n' ' ' < "$f" | tr -s ' \t' ' ' | grep -Fq "$CLAUSE"; then note ok "$f"

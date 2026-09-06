@@ -5,7 +5,7 @@ All three plugins are Markdown skills plus small shell and Python scripts. There
 ## Ground rules
 
 - **Read-only stays read-only.** No change may make any plugin modify, stage, stash or commit tracked files, or pass `--write` to Codex.
-- **Blindness is procedural.** Nothing sent to Codex may mention a second reviewer, a debate, findings, or artifact paths. Templates carry no such wording; do not add any.
+- **Blindness is procedural.** The initial blind brief and all pre-`JOIN-OK` communication sent to Codex may not mention a second reviewer, a debate, findings, or artifact paths. Post-join exchanges may contain canonical findings and fair normalized positions, but never artifact paths or raw review sidecars.
 - **Evidence over agreement.** Findings need `path:line` and quoted code; verdicts follow the ledger and the verdict policy, never who spoke last.
 - **Keep it agent-agnostic.** Skills describe procedure; enforcement lives in the scripts and the completion gates.
 

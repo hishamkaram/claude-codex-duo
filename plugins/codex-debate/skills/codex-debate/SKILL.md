@@ -51,7 +51,7 @@ movement. Follow it exactly.
 | Rounds | user's number, else 3. Hard cap 5 |
 | Blind first round | on by default; off only if the user says "just attack my plan" or equivalent |
 | Stakes | what happens if the wrong side wins: reversible? data loss? security? cost? |
-| Seed evidence | optional `--seed <file>`: a prior verification record (e.g. a review's `04-verification.md`). Its entries become pre-graded ledger rows with owner `seed`, one row per method (split a seed entry that mixes an executed check with a trace; grade each by its own method); Codex still gets a blind round and the seed is withheld from it until round 1 |
+| Seed evidence | optional `--seed <file>`: a prior verification record (e.g. a review's `05-verification.md`). Its entries become pre-graded ledger rows with owner `seed`, one row per method (split a seed entry that mixes an executed check with a trace; grade each by its own method); Codex still gets a blind round and the seed is withheld from it until round 1 |
 
 If the motion is not a falsifiable statement or a choice between named options,
 rewrite it into one and confirm with the user before anything else. "Is our

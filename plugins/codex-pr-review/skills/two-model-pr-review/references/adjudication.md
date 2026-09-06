@@ -15,10 +15,95 @@ severity in a way that crosses a verdict boundary (P0↔P1, P1↔P2) or spans 2+
 levels. A P1-vs-P2 disagreement is therefore a CONFLICT.
 
 Every merged finding gets ONE canonical severity in the matrix. Provisionally
-record the higher of the two; Phase 4 evidence sets the final severity. Never
+record the higher of the two; Phase 5 evidence sets the final severity. Never
 average severities and never let the last speaker decide.
 
-## Phase 4 — Verification
+Then write a machine-readable `03-matrix.tsv` with one tab-separated row per
+canonical finding and no header:
+
+```
+F-01	BOTH	P2
+F-02	CLAUDE-ONLY	P1
+F-03	CODEX-ONLY	P2
+```
+
+Then write `03-debate-selection.tsv`, one tab-separated row for every manifest
+ID and no header:
+
+```
+F-01	BOTH	P2	INCLUDE	BOTH
+F-02	CLAUDE-ONLY	P1	INCLUDE	provisional-P1
+F-03	CODEX-ONLY	P2	EXCLUDE	CODEX-ONLY-P2
+```
+
+Then write `03-findings.ndjson`, the normalized base packet of every canonical
+ID, one JSON object per line with exactly `id`, `severity`, `claim`,
+`locations`, `trigger`, `impact`, `observations`, `falsifier`,
+`proposed_checks`, `open_factual_questions` (the citation rules under Phase 5
+apply). It carries no origin, verdict, or provenance. `pre-consultation`
+validates it with `validate-verifier-packets.py --match-matrix-severity` (each
+base packet's severity equals the matrix's provisional severity; only a REFINE
+disposition may change it later) and accepts it into the ledger
+(`00-accepted.sha256`, see SKILL.md §Phase gate); it is the input every
+verifier packet is built from and may not change once consultation has begun.
+
+All three artifacts are complete ledgers, not best-effort shortlists. Deduplicate by
+canonical ID. The validator requires the selector to mirror every manifest ID,
+origin, and provisional severity exactly. **INCLUDE** every `CONFLICT`, every
+`BOTH`, and every provisional P0/P1 finding; **EXCLUDE** all others. The final
+predicate is the reason that row was selected or excluded.
+
+## Phase 4 — Set-level consultation
+
+Only after `phase-gate.sh pre-consultation` prints `CONSULTATION-OK` may the
+orchestrator consult Codex. The initial reviews remain blind and immutable; this
+is the first phase allowed to describe canonical findings and fair positions.
+The orchestrator is Claude's advocate, never the sealed lead agent. It records
+its position and any concession in `04-consultation.md`; it never changes
+`01-lead.md`.
+
+One self-contained prompt (`templates/codex-exchange.md`) contains **every**
+selected canonical ID, each finding's fair positions, source quotes/citations,
+and one falsifiable challenge. It must never name the artifact directory. Run exactly one monitored
+`--resume-last` consultation call for the entire set while a response remains
+in the unified budget. The JSON response has exactly one disposition per
+selected ID:
+
+- **MAINTAIN** — the specific trigger and why counter-evidence fails;
+- **RETRACT** — the specific fact that changes the position;
+- **REFINE** — a restated claim or severity; or
+- **VERIFY** — a factual question plus the specific command or trace that can
+  decide it.
+
+The response is one fenced `json` object with exactly `phase: "consultation"`
+and `dispositions`. It is validated with `validate-consultation.py`. Every
+strict normalized disposition contains only `id`, `action`, `claim`, `severity`,
+`locations`, `trigger`, `impact`, `observations`, `falsifier`,
+`proposed_checks`, and `open_factual_questions`; required factual fields are
+non-empty. It must not contain identity, origin, selection reason, review count,
+consensus, concession, rhetoric, transcript reference, debate verdict, or an
+artifact path. A malformed response, missing/extra ID, or failed runner produces
+`STATUS: PHASE 4 COMPLETE (SKIPPED — <reason>)`; Phase 5 then verifies the
+original normalized finding data.
+
+Accepted dispositions reach the verifiers only through
+`build-verifier-packets.py`, which `pre-verification` runs over the frozen
+base packets to produce `05-verifier-packets.ndjson`: **MAINTAIN** leaves the
+base packet unchanged; **REFINE** replaces every packet field with the
+disposition's; **VERIFY** and **RETRACT** keep the base claim, severity,
+locations, trigger, impact and falsifier and append the disposition's
+`observations`, `proposed_checks` and `open_factual_questions` (deduplicated,
+order preserved). The action itself is never written to a packet. A retraction
+is therefore a fact for the verifier to check, not a verdict: only Phase 5 may
+record REFUTED. New unrelated claims are logged as LATE and
+never block.
+
+The unified exchange budget is at most **two successful round-wide Codex
+responses** and **four total runner launches** across Phase 4 consultation and
+Phase 6 residual resolution. Consultation uses one successful response at most,
+leaving one for residual resolution. A retry counts as another launch.
+
+## Phase 5 — Verification
 
 For EVERY P0–P3 finding and every CONFLICT, regardless of who raised it or
 whether both did, establish ground truth, preferring in order:
@@ -43,48 +128,59 @@ maps each workspace package by EXACT match (`{ find: /^@scope\/pkg$/, replacemen
 `/contract`), import the repo's test helpers by absolute path, then run
 `npx --prefix <repo> vitest run --config <artifact>/repro/vitest.config.ts --root <artifact>/repro`.
 A test that FAILS at head for the predicted reason is the E0 proof; keep its log
-as `04-<id>-repro.log`.
-
-Codex cannot execute tests or builds in its sandbox, so every rung-(a) and
-rung-(c) proof is the orchestrator's to run. Budget Phase 4 accordingly.
+as `05-<id>-repro.log`.
 
 With `--workflow` (`references/workflow-mode.md`): rungs (a), (b) and (d) run
 per finding, concurrently, in `finding-verifier` agents through the shipped
-workflow script; each returns CONFIRMED / REFUTED / UNVERIFIABLE with its
-method and quoted evidence, which you copy into `04-verification.md` under the
-finding. Rung (c) — the project's suite, linter, typechecker — is never run by
-those agents (concurrent suites in one checkout collide on build output); run
-it once yourself, sequentially, for the findings that still need it. A verifier
-that returns nothing (null) leaves its finding to you, in-context.
+workflow script; each receives only the strict normalized packet and returns
+CONFIRMED / REFUTED / UNVERIFIABLE with its method and quoted evidence. Rung
+(c) — the project's suite, linter, typechecker — is never run by those agents
+(concurrent suites in one checkout collide on build output); run it once,
+sequentially, for the findings that still need it. A verifier that returns
+nothing (null) leaves its finding to you, in-context.
 
-Mark each CONFIRMED / REFUTED / UNVERIFIABLE with the method used. Delete
-REFUTED from the main report; list them in the false-positive appendix with the
-refuting evidence. Agreement between you and Codex is NOT evidence. Report exact
-commands and results.
+Only this phase may mark a finding CONFIRMED or REFUTED. Consultation agreement
+is not evidence. Delete REFUTED from the main report; list it in the
+false-positive appendix with the refuting evidence. Report exact commands and
+results.
 
-## Phase 5 — Bounded debate
+`05-verifier-packets.ndjson` is generated by `pre-verification` (see Phase 4)
+and covers every `03-matrix.tsv` ID exactly once; verify from it and never
+edit it — `pre-resolution` and `pre-report` rebuild it from `03-findings.ndjson`
+and `04-consultation.json` and reject any difference. Write `05-verdicts.tsv` with one
+`F-nn<TAB>verdict<TAB>method<TAB>evidence` line per matrix ID (verdict =
+CONFIRMED, REFUTED, or UNVERIFIABLE; method = repro, trace, suite, history, or
+none, or the rung spelling the verifier returns such as `(b) trace`; evidence = the strongest single `path:line[@sha] "quote"` citation or
+`cmd: <command> -> <output excerpt>`). A CONFIRMED or REFUTED row needs a real
+method and evidence that passes the packet citation rules; `validate-verdicts.py`
+enforces this at `pre-resolution` and `pre-report`. This is the machine-readable
+ledger `pre-report` cross-checks
+`06-resolution-selection.ids` against, rejecting any ID not marked
+UNVERIFIABLE. Citations in `locations`/`observations` are repository-relative
+`path:line` or `path:line@sha "quote"`; wrap a path that contains spaces in
+double quotes (`"docs/API guide.md":42`). Absolute paths, `.`/`..` segments,
+scratch directories and this skill's run-artifact names (`00-brief.md`,
+`05-verdicts.tsv`, …) at any depth are rejected by the validators.
 
-Only for items still UNVERIFIABLE or CONFLICT. Maximum 2 exchanges.
+## Phase 6 — Residual resolution
 
-Send Codex: the finding, both positions stated fairly, and your verification
-evidence. Require exactly one response type, each with a code citation:
-- **MAINTAIN** — the specific trigger, and why the counter-evidence fails
-- **RETRACT** — the specific fact that changed its mind
-- **REFINE** — restated claim, possibly at different severity
-- **VERIFY** — the point is factual and checkable; commit to a specific command
-  or trace, run it, and let the output decide. Prefer this over arguing.
+Only for items still UNVERIFIABLE after Phase 5 (a CONFLICT-origin item the
+verifier could settle is CONFIRMED or REFUTED like any other), only if Phase 2
+SUCCEEDED, and only when the shared successful-response/launch budget allows it.
+Write `06-resolution-selection.ids` with one residual canonical ID per line;
+`pre-report` validates it against `05-verdicts.tsv` and rejects any ID whose
+verdict is not UNVERIFIABLE. Use the same fenced JSON exchange
+protocol once with the executed verification evidence; `validate-consultation.py
+--manifest ... --verdicts 05-verdicts.tsv --ids ... --phase resolution` requires
+one complete disposition per residual ID before report generation. Change
+position ONLY for new code-level evidence — never because the second opinion
+sounds confident, never to end the exchange, and never because it is the second
+opinion. If skipped, write `06-resolution.md` with the reason and its STATUS
+line.
 
-Hold yourself to the same discipline, including retracting your own findings.
-Change position ONLY for new code-level evidence — never because Codex sounds
-confident, never to end the exchange, never because it is the "second opinion."
-
-New unrelated claims raised here are logged as LATE and unverified; they can
-never be blocking.
-
-After 2 exchanges, anything still contested is reported UNRESOLVED with both
-positions, the strongest evidence for each, and your recommended default —
-usually a QUESTION for the author, but P1 if the downside is data loss or a
-security hole (asymmetric risk breaks ties toward caution).
+Anything still contested is reported UNRESOLVED with both positions, the
+strongest evidence for each, and the recommended default — usually a QUESTION
+for the author, but P1 if the downside is data loss or a security hole.
 
 ## Verdict policy
 
@@ -99,5 +195,5 @@ Apply the first clause that matches, top to bottom. Exactly one verdict results.
    (CONFIRMED or UNRESOLVED); QUESTIONs may also remain.
 5. **APPROVE** — no P0–P3 finding remains; only QUESTIONs, if any.
 
-A finding that was never verified in Phase 4 cannot be CONFIRMED; it is
+A finding that was never verified in Phase 5 cannot be CONFIRMED; it is
 UNRESOLVED and still counts for clauses 2–4 at its canonical severity.
