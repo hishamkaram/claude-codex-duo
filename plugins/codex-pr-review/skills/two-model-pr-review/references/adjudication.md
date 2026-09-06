@@ -2,21 +2,44 @@
 
 ## Phase 3 — Reconciliation matrix
 
-Table every distinct finding from both reviews. Assign canonical `F-` IDs here;
-keep the originating `CL-`/`CX-` ID in a column.
+Table every distinct finding from the lead review and from every participant's blind
+review (`02-p<k>.stdout`, one per row of `00-participants.tsv`). Assign canonical `F-` IDs
+here; keep every originating `CL-`/`CX-` ID with its raiser in a column.
 
-Merge duplicates only when same root cause at same location. Two consequences of
-one root cause = one finding. Two independent defects at one location = two
-findings.
+Merge duplicates only when same root cause at same location — the rule is the same across
+any number of raisers: a finding raised by the lead and by three participants at the same
+location for the same cause is ONE canonical finding with four provenance rows. Two
+consequences of one root cause = one finding. Two independent defects at one location =
+two findings. Participant agreement is not evidence: three participants raising the same
+finding make it no more true than one (Phase 5 verifies every finding regardless).
 
-Label each: **BOTH** | **CLAUDE-ONLY** | **CODEX-ONLY** | **CONFLICT**.
-CONFLICT means both looked and disagree on existence, on root cause, or on
-severity in a way that crosses a verdict boundary (P0↔P1, P1↔P2) or spans 2+
-levels. A P1-vs-P2 disagreement is therefore a CONFLICT.
+Label each: **BOTH** | **CLAUDE-ONLY** | **CODEX-ONLY** | **CONFLICT**. These four literals
+are the origin vocabulary every validator enforces; with N participants they mean:
+BOTH — the lead and at least one participant raised it; CLAUDE-ONLY — only the lead;
+CODEX-ONLY — only participants (any number of them, whichever backend ran them);
+CONFLICT — any two raisers looked and disagree on existence, on root cause, or on
+severity in a way that crosses a verdict boundary (P0↔P1, P1↔P2) or spans 2+ levels. A
+P1-vs-P2 disagreement is therefore a CONFLICT, between the lead and a participant or
+between two participants alike.
 
 Every merged finding gets ONE canonical severity in the matrix. Provisionally
-record the higher of the two; Phase 5 evidence sets the final severity. Never
+record the highest any raiser gave; Phase 5 evidence sets the final severity. Never
 average severities and never let the last speaker decide.
+
+Who raised what is recorded once, in `03-provenance.tsv` — one tab-separated row per
+raiser of each canonical ID and no header:
+
+```
+F-01	lead	CL-03
+F-01	p2	CX-07
+F-03	p1	CX-02
+```
+
+`pre-consultation` validates it with `validate-provenance.py` (every matrix ID at least
+once, raisers are `lead` or a listed participant, no raiser twice per ID, original ids
+`CL-`/`CX-`, origin consistent with the raiser set) and accepts it as a draft. It is the
+report's source for per-participant counts and it never reaches a consultation packet,
+which stays provenance-free.
 
 Then write a machine-readable `03-matrix.tsv` with one tab-separated row per
 canonical finding and no header:
@@ -56,7 +79,10 @@ predicate is the reason that row was selected or excluded.
 ## Phase 4 — Set-level consultation
 
 Only after `phase-gate.sh pre-consultation` prints `CONSULTATION-OK` may the
-orchestrator consult Codex. The initial reviews remain blind and immutable; this
+orchestrator consult Codex — with N participants, the exchange participant the join
+recorded in `02-exchange-participant` (the lowest-numbered COMPLETE one), on that
+participant's session; the others are never consulted in this version. The initial
+reviews remain blind and immutable; this
 is the first phase allowed to describe canonical findings and fair positions.
 The orchestrator is Claude's advocate, never the sealed lead agent. It records
 its position and any concession in `04-consultation.md`; it never changes

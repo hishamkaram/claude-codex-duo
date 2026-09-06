@@ -68,7 +68,7 @@ Search consumers repo-wide for every symbol these files change. Write your findi
   )))
   const shardsOut = names.map((name, i) => ({ name, files: shards[name], result: results[i] }))
   const failed = shardsOut.filter(s => !s.result || s.result.status !== 'LEAD SEALED').map(s => s.name)
-  if (failed.length) log(`shards without a sealed file (review these in-context before opening any 02-codex.* file): ${failed.join(', ')}`)
+  if (failed.length) log(`shards without a sealed file (review these in-context before opening any 02-p<k>.* file): ${failed.join(', ')}`)
   return { stage: 'lead', shards: shardsOut, failed }
 }
 

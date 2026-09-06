@@ -1,6 +1,6 @@
 {
   "name": "codex-pr-review",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "description": "Two-model PR review: a lead-reviewer agent and blind Codex review the same brief concurrently, then conduct bounded set-level consultation before evidence-based verification and conditional residual resolution. One merge decision with an audit trail. Optional Workflow-tool fan-out.",
   "author": { "name": "Hesham Karm" },
   "keywords": ["code-review", "codex", "pr-review", "second-opinion"]

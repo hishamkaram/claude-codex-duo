@@ -1,6 +1,6 @@
 ---
 name: two-model-pr-review
-description: Two-model pull request review — runs an independent review, obtains a blind second review from Codex, reconciles both, verifies contested claims against the code, and emits one merge decision with a written audit trail. Use when asked to review a PR, diff, branch, or uncommitted local changes (working tree); for a second-opinion or cross-model code review; to adjudicate disagreeing review findings; or to decide whether a change is safe to merge. Review-only — never use to implement fixes.
+description: Two-model pull request review — runs an independent review, obtains blind second reviews from one or more participants (Codex, or any provider through the ccr gateway), reconciles them, verifies contested claims against the code, and emits one merge decision with a written audit trail. Use when asked to review a PR, diff, branch, or uncommitted local changes (working tree); for a second-opinion or cross-model code review; to adjudicate disagreeing review findings; or to decide whether a change is safe to merge. Review-only — never use to implement fixes.
 ---
 
 # Two-Model PR Review
@@ -8,9 +8,9 @@ description: Two-model pull request review — runs an independent review, obtai
 > `${CLAUDE_PLUGIN_ROOT}` is this plugin's install directory: two levels above this skill's base directory (`<root>/skills/<skill>`). Every script path below is relative to it.
 
 You are the orchestrator and the adjudicator. The lead review itself runs in the
-`lead-reviewer` agent shipped with this plugin, in its own context, while Codex
-reviews the same brief in parallel. You produce exactly one merge decision,
-backed by artifacts on disk.
+`lead-reviewer` agent shipped with this plugin, in its own context, while the
+second-model participants (one by default) review the same brief in parallel.
+You produce exactly one merge decision, backed by artifacts on disk.
 
 ## Hard constraints — apply for the entire run
 
@@ -54,6 +54,7 @@ backed by artifacts on disk.
 | Conventions | `CLAUDE.md`, `CONTRIBUTING.md`, `docs/adr/*`, nearby code |
 | Test/lint commands | `Makefile`, `package.json` scripts, CI config |
 | `--workflow` | optional; recognised anywhere in the argument list (local mode may omit the base ref, so it is not positional). Selects the Workflow-tool fan-out for Phase 5 verification (and Phase 1 above ~2000 LOC) per `references/workflow-mode.md`. Absent → default path. Any other `--token` is an error to report, never a mode. |
+| `--via` | optional, recognised anywhere: the second-model participants, a comma list of `codex` and `ccr:<alias>` entries (default `codex`; 1–8 entries; at most one `codex`, because the Codex companion resumes only the last thread in a repository). Each participant is one blind reviewer with its own claim, sidecars and session (§Participants). Aliases are machine-local; never assume one. |
 
 If PR/branch, base ref, or stated intent cannot be determined unambiguously, ask
 the user before doing anything else. Never infer intent from the implementation.
@@ -69,6 +70,22 @@ must resolve; both must restate the brief's own Target section, which is the
 frozen record of what Codex reviewed), and whether the index differs from the
 working tree.
 
+## Participants
+
+`--via` names the blind second-model reviewers: `codex` (default) or a comma list of
+`codex` and `ccr:<alias>` entries, 1 to 8, at most one `codex`. Phase 0 probes each and writes
+`00-participants.tsv` — `p<k><TAB>codex|ccr<TAB>alias-or-dash`, one row per entry in order —
+which `pre-codex` hashes with the packets and never changes afterwards. Participant p<k> owns
+the prefix `02-p<k>`: its own launch claim (`claim.p<k>=` on the `PREFLIGHT-OK` line), sidecars,
+session and terminal `02-p<k>.md`. Every participant receives the identical brief and is never
+told that other reviewers exist. Phase 2 is COMPLETE when at least one participant completed;
+the join records the **exchange participant** (`02-exchange-participant`, the lowest-numbered
+COMPLETE one) and the consultation and residual exchanges run on its session under the
+unchanged budget — the others are never consulted in this version. Reconciliation is over the
+lead plus every participant; who raised what goes to `03-provenance.tsv` (§Phase 3), while the
+origin column keeps its four literals. `pre-codex` also writes `00-schema` (`codex-pr-review/4`):
+a run directory without it, or with another marker, is a legacy directory every gate refuses.
+
 ## Artifact directory and blindness
 
 Fresh directory outside the repo, never overwritten:
@@ -81,39 +98,39 @@ transcripts sit beside the orchestrator's), and anything else the user owns. No
 file placement changes that. Blindness therefore rests on four things, in order
 of importance:
 
-1. **Unmotivated.** Codex is never told that another reviewer, another review,
-   or review artifacts exist. The brief template contains no such mention; do
-   not add one. Never reference the artifact directory in anything sent to Codex.
-2. **Frozen packets.** `00-scope.md` and `00-brief.md` are written in Phase 0
-   before any finding exists and their sha256 is recorded once by
+1. **Unmotivated.** No participant is ever told that another reviewer, another
+   review, or review artifacts exist. The brief template contains no such mention; do
+   not add one. Never reference the artifact directory in anything sent to a participant.
+2. **Frozen packets.** `00-scope.md`, `00-brief.md`, `00-participants.tsv` and `00-schema`
+   are written in Phase 0 before any finding exists and their sha256 is recorded once by
    `phase-gate.sh pre-codex`; every later gate compares and never rewrites.
-   Nothing is appended to either afterwards: run records go to `00-run.md`.
+   Nothing is appended to any of them afterwards: run records go to `00-run.md`.
 3. **No cross-output before the join.** The lead review runs in the
-   `lead-reviewer` agent, a context that never receives Codex output. Its
-   findings are sealed (mode 000) before any context reads Codex output, and
-   you open Codex output only after `phase-gate.sh pre-phase3` passes. Codex
-   output means `02-codex.stdout`, `.stderr` and `.joblog`. The runner's
-   control files `02-codex.exit` and `.meta` (outcome, ids, timings, byte
+   `lead-reviewer` agent, a context that never receives participant output. Its
+   findings are sealed (mode 000) before any context reads participant output, and
+   you open participant output only after `phase-gate.sh pre-phase3` passes. Participant
+   output means any `02-p<k>.stdout`, `.stderr` and `.joblog`. The runner's
+   control files `02-p<k>.exit` and `.meta` (outcome, ids, timings, byte
    count, last error line) carry no review text and may be read on
-   completion; `02-codex.progress` embeds the last job-log line, which can
-   carry Codex text, so before the join read it only as
-   `tail -n 1 "$ART/02-codex.progress" | cut -d'|' -f1` (elapsed, status,
-   idle). The Codex job and the lead agent are launched in the same turn,
-   runner first; the runner's completion line prints only outcome, job id,
-   elapsed time and byte count, so the notification carries no Codex text.
+   completion; `02-p<k>.progress` embeds the last log line, which can
+   carry review text, so before the join read it only as
+   `tail -n 1 "$ART/02-p<k>.progress" | cut -d'|' -f1` (elapsed, status,
+   idle). The participant runners and the lead agent are launched in the same turn,
+   runners first; a runner's completion line prints only outcome, ids,
+   elapsed time and byte count, so the notification carries no review text.
 4. **Defense-in-depth.** The lead file is named neutrally (`01-lead.md`), is
    `chmod 000` the moment it is written, and is restored to `600` only after
    the join gate. Under the read-only sandbox Codex cannot read, copy, or
    chmod a mode-000 file (verified 2026-09-02); it can still list the path.
 
 Never claim in `07-review.md` that blindness was structurally guaranteed, and never
-claim the lead ran before Codex: they run concurrently by design.
+claim the lead ran before the participants: they run concurrently by design.
 
 ## Reference map — read each at the phase that needs it, not before
 
 | At | Read |
 |---|---|
-| Phase 0 start | `references/review-rubric.md`, `templates/finding.md`, `templates/codex-brief.md`, `references/codex-protocol.md` (needed to write the brief and probe Codex) |
+| Phase 0 start | `references/review-rubric.md`, `templates/finding.md`, `templates/codex-brief.md`, `references/codex-protocol.md` (needed to write the brief, probe every participant and write `00-participants.tsv`) |
 | Join turn (Phases 1 ∥ 2) | re-read `references/codex-protocol.md` §Join turn; `references/workflow-mode.md` if `--workflow` and the diff exceeds ~2000 LOC |
 | Phase 3 start | `references/adjudication.md` |
 | Phase 4 / 6 start | `references/codex-protocol.md` (set-level consultation / residual resolution) |
@@ -159,10 +176,13 @@ younger than the ten-minute handoff grace window
 There are no process-liveness heuristics in the launch gates. Past the grace
 window an unstarted claim is reclaimed; a started claim whose runner died
 without writing `.exit` is recovered only by
-`phase-gate.sh release "$ART" <prefix>`, which refuses while the runner pid is
-alive or, when `.progress` names a job, while the codex plugin reports it
-running (and fails closed if the plugin cannot be found), then rotates the
-claim to spent, where it still counts as a launch. Never remove a claim
+`phase-gate.sh release "$ART" <prefix>` (prefix `02-p<k>`, `04-consultation` or
+`06-resolution`), which refuses while the runner pid or any descendant is alive; for a
+codex attempt, while `.progress` names a job the codex plugin reports running
+(failing closed if the plugin cannot be found); for a ccr attempt, while the
+recorded process group (`pgid=` on the launch line) has any member — a launch
+line without `pgid=` is refused, and the companion is never consulted — then
+rotates the claim to spent, where it still counts as a launch. Never remove a claim
 directory by hand. The next launch rotates any orphaned `.progress`/`.stderr`
 aside as `attemptN.*`. The gate refuses an eleventh launch of one phase. Launch
 the runner in the same turn as the gate: one claim authorizes one runner, and
@@ -178,16 +198,18 @@ directory wiped and re-joined over edited bodies is indistinguishable by its
 files alone, and the fingerprint is the only out-of-band pin (compare it with
 the `seal=` that `pre-consultation` prints).
 
-Specifically: no Codex launch before `phase-gate.sh pre-codex` prints
-`PREFLIGHT-OK` (brief and scope exist and are hashed; every `01-lead*.md`
-absent or mode 000) — it runs at the end of Phase 0 unconditionally, even when
-Codex is unavailable or declined, because it is also the lead's launch gate;
-no read of `02-codex.stdout`, `.stderr` or `.joblog` and no Phase 3 before
-`phase-gate.sh pre-phase3` prints `JOIN-OK` (`01-lead.md` non-empty and
-sealed, `02-codex.md` written with its STATUS line — the SKIPPED form needs no
-runner sidecar — hashes unchanged). `pre-phase3` writes the read-only review
-seal for either outcome (a COMPLETE review seals the raw Codex body, a SKIPPED
-one seals the status file) and accepts it into the ledger.
+Specifically: no participant launch before `phase-gate.sh pre-codex` prints
+`PREFLIGHT-OK` (brief, scope and participants file exist and are hashed, the schema
+marker is written; every `01-lead*.md` absent or mode 000) — it runs at the end of
+Phase 0 unconditionally, even when every participant is unavailable or declined,
+because it is also the lead's launch gate; no read of any `02-p<k>.stdout`,
+`.stderr` or `.joblog` and no Phase 3 before `phase-gate.sh pre-phase3` prints
+`JOIN-OK` (`01-lead.md` non-empty and sealed, every `02-p<k>.md` written with its
+STATUS line — the SKIPPED form needs no runner sidecar — hashes unchanged).
+`pre-phase3` writes the read-only review seal over the lead and every participant
+(a COMPLETE participant seals its raw body, a SKIPPED one its status file), records
+the exchange participant, and accepts them and the schema marker into the ledger
+after the seal.
 
 **The accept ledger.** Every artifact a gate accepts or generates is recorded
 once in `00-accepted.sha256` (mode 400, rewritten atomically) as
@@ -236,8 +258,11 @@ by name, each with a one-line sanity check), and any missing context. If the
 diff exceeds ~2000 LOC, plan subsystem-by-subsystem review with a per-subsystem
 coverage table.
 
-Probe Codex once with `${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe` and record the
-printed line (SUCCEEDED / UNAVAILABLE / FAILED) or DECLINED in `00-scope.md`.
+Probe each participant once — `${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe` for codex,
+`… --probe --via ccr:<alias> --record-dir "$ART"` for each ccr alias — and record every printed
+line (SUCCEEDED / UNAVAILABLE / FAILED) or DECLINED in `00-scope.md`, followed for a ccr alias by
+the `ccr model show` JSON the probe prints, verbatim in a fenced block. Then write
+`00-participants.tsv` (§Participants).
 
 Write the neutral Codex brief to `00-brief.md` NOW with
 `scripts/build-brief.sh` (see `references/codex-protocol.md`), before any
@@ -262,20 +287,21 @@ times, task and job ids, Workflow status); it is never hashed and no reviewer
 reads it. `00-scope.md` and `00-brief.md` must not change after the gate — the
 join gate will refuse the run if they do.
 
-**Join turn — Phase 1 ∥ Phase 2.** In ONE turn, in this order: (1) launch the
-monitored runner in the background from `00-brief.md` (`references/codex-protocol.md`
+**Join turn — Phase 1 ∥ Phase 2.** In ONE turn, in this order: (1) launch one
+monitored runner per usable participant in the background from `00-brief.md`, each with
+its own `--via`, prefix `02-p<k>` and claim token (`references/codex-protocol.md`
 §Join turn); (2) launch the `lead-reviewer` agent (Agent tool, type
 `codex-pr-review:lead-reviewer`; if that type is not registered, a fresh
 general-purpose agent given `agents/lead-reviewer.md` verbatim as its
 instructions — record which in `00-run.md`) with the run directory, the
 repository path, the plugin root and the `TREE-IS-HEAD` line below; (3) launch
 TWO `agent-watch.sh` jobs in the background over the lead's output file, an
-advisory one and a deadline one. Then wait for all of them. While either
-reviewer runs, do not open `02-codex.stdout`, `.stderr` or `.joblog`, do not
-read `01-lead.md`, and check Codex's liveness only with
-`tail -n 1 "$ART/02-codex.progress" | cut -d'|' -f1`. Record the lead agent's
-task id, the Codex job id, both watcher job ids, and every launch time in
-`00-run.md`.
+advisory one and a deadline one. Then wait for all of them. While any
+reviewer runs, do not open any `02-p<k>.stdout`, `.stderr` or `.joblog`, do not
+read `01-lead.md`, and check a participant's liveness only with
+`tail -n 1 "$ART/02-p<k>.progress" | cut -d'|' -f1`. Record the lead agent's
+task id, every participant's job or session id, both watcher job ids, and every
+launch time in `00-run.md`.
 
 ```bash
 W=${CLAUDE_PLUGIN_ROOT}/skills/two-model-pr-review/scripts/agent-watch.sh
@@ -323,29 +349,35 @@ read shard files only after Codex has finished or after sealing the merged
 file — never open Codex output in between — and re-seal every shard file
 (`chmod 000`) once `01-lead.md` is sealed.
 
-**Phase 2 — Codex blind review (in the background)** → `02-codex.md` + sidecars
-Follow `references/codex-protocol.md` exactly: the monitored runner launches
-Codex read-only in a fresh thread from `00-brief.md`. Raw stdout, stderr, exit,
-job log and metadata are kept as sidecar files. When the runner reports
-completion, write `02-codex.md` from the control files only (`.exit`, `.meta`):
-outcome line, exact command, `.meta` contents, and the STATUS line; embed the
-`.stdout` fence only once `pre-phase3` has passed (insert it above the STATUS
-line, which stays last). If Codex is unavailable, declined or fails,
-`02-codex.md` still exists, contains the verbatim probe line or failure, and
-ends with `STATUS: PHASE 2 COMPLETE (SKIPPED — <reason>)`; no runner sidecar
-exists in that case and the join gate does not expect one. Codex findings keep
-`CX-01`-style IDs until reconciliation.
+**Phase 2 — Blind participant reviews (in the background)** → `02-p<k>.md` + sidecars, one per participant
+Follow `references/codex-protocol.md` exactly: one monitored runner per usable
+participant launches it read-only in a fresh session from `00-brief.md`. Raw
+stdout, stderr, exit, log and metadata are kept as sidecar files. When a runner
+reports completion, write its `02-p<k>.md` from the control files only (`.exit`,
+`.meta`): outcome line, exact command, `.meta` contents, and the STATUS line;
+embed the `.stdout` fence only once `pre-phase3` has passed (insert it above the
+STATUS line, which stays last). If a participant is unavailable, declined or
+fails, its `02-p<k>.md` still exists, contains the verbatim probe line or
+failure, and ends with `STATUS: PHASE 2 COMPLETE (SKIPPED — <reason>)`; no runner
+sidecar exists in that case and the join gate does not expect one. Every
+participant's findings keep `CX-01`-style IDs (per participant) until
+reconciliation; the phase is COMPLETE when at least one participant completed.
 
 **Phase 3 — Reconciliation matrix** → `03-matrix.md`
 First run `phase-gate.sh pre-phase3 "$ART"`; it must print `JOIN-OK`. Only then
-`chmod 600 01-lead.md` and open `02-codex.stdout`. The header of `03-matrix.md`
-records: the `JOIN-OK` line verbatim; the mtime of `01-lead.md` (lead sealed);
-the first line of `02-codex.progress` (Codex launched); the time you opened
-`02-codex.stdout`; the lead agent type and task id; the Codex job id. Table
-every distinct finding from both sides.
+`chmod 600 01-lead.md` and open every `02-p<k>.stdout`. The header of `03-matrix.md`
+records: the `JOIN-OK` line verbatim (it names every participant's status and the
+exchange participant); the mtime of `01-lead.md` (lead sealed); the first line of
+each `02-p<k>.progress` (launched); the time you opened the first `02-p<k>.stdout`;
+the lead agent type and task id; every participant's job or session id. Table
+every distinct finding from the lead and from every participant.
 Assign canonical `F-` IDs here. Label BOTH / CLAUDE-ONLY / CODEX-ONLY /
-CONFLICT and assign each merged finding one canonical severity per
-`references/adjudication.md`. Then write `03-findings.ndjson`: the strict
+CONFLICT (their N-participant meaning is in `references/adjudication.md`: BOTH =
+lead and ≥1 participant, CODEX-ONLY = participants only, any number) and assign
+each merged finding one canonical severity. Then write `03-provenance.tsv`, one
+`F-nn<TAB>lead|p<k><TAB>original-id` row per raiser of every canonical ID;
+`pre-consultation` validates it with `validate-provenance.py` and accepts it as a
+draft (it never enters a packet). Then write `03-findings.ndjson`: the strict
 normalized base packet of every canonical ID, one JSON object per line
 (`id`, `severity`, `claim`, `locations`, `trigger`, `impact`, `observations`,
 `falsifier`, `proposed_checks`, `open_factual_questions` — no origin, no
@@ -355,9 +387,10 @@ ledger as a draft; every verifier packet is built from it.
 
 **Phase 4 — Set-level consultation** → `03-debate-selection.tsv`, `04-consultation.md` + sidecars
 After reconciliation, create the complete selector ledger and run
-`phase-gate.sh pre-consultation`. If Codex Phase 2 succeeded and at least one
+`phase-gate.sh pre-consultation`. If Phase 2 succeeded and at least one
 ID is selected, the orchestrator—not the immutable lead agent—sends one
-self-contained exchange containing every selected canonical finding. It records
+self-contained exchange containing every selected canonical finding to the
+exchange participant, on its session (the gate prints `exchange=p<k> via=…`). It records
 one MAINTAIN, RETRACT, REFINE, or VERIFY disposition per ID and never changes
 `01-lead.md`. The dispositions are applied mechanically by `pre-verification`
 (see Phase 5), never by hand. A runner or validation failure is recorded as skipped; it does
@@ -417,18 +450,23 @@ mandatory.
 
 ## Codex availability and degradation
 
-Probe once in Phase 0, before spending a full review's effort, using the exact
-command in `references/codex-protocol.md`. Record one of SUCCEEDED /
-UNAVAILABLE / FAILED / DECLINED (privacy, policy, or user choice). Confirm
-sending repo content to an external service is permitted.
+Probe every participant once in Phase 0, before spending a full review's effort, using the exact
+commands in `references/codex-protocol.md`. Record one of SUCCEEDED /
+UNAVAILABLE / FAILED / DECLINED (privacy, policy, or user choice) per participant. Confirm
+sending repo content to each participant's provider (OpenAI for Codex; the alias's provider,
+named by the probe line, for a ccr alias) is permitted. "Codex" in this file means the
+second-model participants whichever backend runs them, except where a backend is named; a
+participant that is unusable is SKIPPED on its own, and the review is single-model only when
+every participant is.
 
-If Codex is not usable: continue as a single-model review; Phases 2, 4, and 6
+If no participant is usable: continue as a single-model review; Phases 2, 4, and 6
 still produce their artifacts with SKIPPED status and the verbatim failure. The
 join turn then launches only the lead agent (after `pre-codex`, which still
-freezes the packets); `02-codex.md` is written with the SKIPPED status and no
-runner sidecar, `pre-phase3` accepts it, Phase 4's selector may still include
+freezes the packets); every `02-p<k>.md` is written with the SKIPPED status and no
+runner sidecar, `pre-phase3` accepts them, Phase 4's selector may still include
 eligible CLAUDE-ONLY P0/P1 or CONFLICT findings but none are ever sent, and
-Phase 5 verifies without consultation. `07-review.md` must then open with
+Phase 5 verifies without consultation. If some participants are unusable, only
+they are SKIPPED; the review is still a cross-review. `07-review.md` must then open with
 `SINGLE-MODEL REVIEW — cross-review not performed: <reason>`, its disagreement
 log must say so, and its blindness line must not claim two reviews ran. Do not
 raise any confidence level to compensate.
@@ -448,13 +486,15 @@ REFUTED finding remains in the main findings; every P0–P3 finding has a
 Phase-5 verification entry; every P0/P1 has a concrete trigger and is not LOW
 confidence; the selector contains every canonical matrix ID exactly once; a
 completed consultation has exactly the selected response IDs; consultation and
-resolution remain within two successful responses/four launches; Codex status
-and every job id are reported truthfully; the lead agent type and task id (or
+resolution remain within two successful responses/four launches; every
+participant's status and job or session id are reported truthfully (`07-review.md`
+§6 participants table, from `00-participants.tsv`, `02-p<k>.meta` and
+`03-provenance.tsv`); the exchange participant is named; the lead agent type and task id (or
 the in-context fallback and its reason) are recorded; `03-matrix.md` carries
-the `JOIN-OK` line and the lead-sealed time precedes the first Codex read (both
+the `JOIN-OK` line and the lead-sealed time precedes the first participant read (both
 from `00-run.md`); `phase-gate.sh pre-report "$ART"` prints `REPORT-OK`; the
 initial review-body seal is unchanged; `phase-gate.sh post-join "$ART"` prints
-`POST-JOIN-OK`; `01-lead.md` is back to mode 600; no Codex invocation used
+`POST-JOIN-OK`; `01-lead.md` is back to mode 600; no participant invocation used
 `--write`; if `--workflow` was passed, `07-review.md` §8 says whether the Workflow
 tool ran or the Agent-tool fallback was used; and the tree is unchanged: range
 mode — `git status` matches the Phase 0 baseline; local mode — recapturing the
