@@ -53,11 +53,13 @@ def read(rel, required=True):
     return open(p, encoding="utf-8", errors="replace").read()
 
 def fill(t, rep):
+    # Check the TEMPLATE's placeholders, never the filled text: materials quote template
+    # lines such as "Rounds run: {{k}}" verbatim (run 2026-09-07, round 1 refused to build).
+    left = sorted(set(re.findall(r"\{\{[^}]+\}\}", t)) - set(rep))
+    assert not left, f"unfilled placeholders: {left}"
     for k, v in rep.items():
         assert k in t, f"placeholder missing from template: {k}"
         t = t.replace(k, v)
-    left = re.findall(r"\{\{[^}]+\}\}", t)
-    assert not left, f"unfilled placeholders: {left}"
     return t
 
 def inputs_block():

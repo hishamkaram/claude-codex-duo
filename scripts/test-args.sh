@@ -423,13 +423,24 @@ chk "verdict: hypothesis-only BLOCKER"  1 "hypothesis-only"     python3 "$V" --e
 mkobj "$TMP/v-praise.json" 0 APPROVE '[]' "great plan, I agree"
 chk "verdict: praise language rejected" 1 "praise"              python3 "$V" --extract "$TMP/v-praise.json" --round 0
 mkobj "$TMP/v-badcite.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"MAJOR","claim":"c","evidence":["f.txt:2-2@'"$SHA2"' \"line nine\""],"proposed_change":"p","falsifier":"f"}]' "x"
-chk "verdict: fabricated citation caught" 1 "quote not found"   python3 "$V" --extract "$TMP/v-badcite.json" --round 0 --repo "$G2"
+chk "verdict: fabricated citation dropped, objection discarded" 0 "DROPPED_OBJECTION: X-1" python3 "$V" --extract "$TMP/v-badcite.json" --out "$TMP/v-badcite.out.json" --round 0 --repo "$G2"
+python3 -c "import json,sys; v=json.load(open('$TMP/v-badcite.out.json')); sys.exit(0 if v['objections']==[] and v.get('dropped_citations') and 'DROPPED_OBJECTION' in v.get('flags',[]) else 1)" && printf '  ok    %-42s\n' "dropped citation recorded in verdict json" || { printf '  FAIL  dropped citation not recorded\n'; FAIL=1; }
+# a non-verbatim citation beside a verbatim one only trims the evidence list
+mkobj "$TMP/v-mixcite.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"MAJOR","claim":"c","evidence":["f.txt:2-2@'"$SHA2"' \"line nine\"","f.txt:2-2@'"$SHA2"' \"line two\""],"proposed_change":"p","falsifier":"f"}]' "x"
+chk "verdict: one bad citation trims evidence" 0 "DROPPED_CITATION: X-1 lost 1" python3 "$V" --extract "$TMP/v-mixcite.json" --round 0 --repo "$G2"
+# a root cause whose only citation is not verbatim survives, flagged E4
+python3 - "$TMP/v-ok.json" "$TMP/v-rcbad.json" "$SHA2" <<'PY2'
+import json,sys
+v=json.load(open(sys.argv[1])); v["objections"]=[]; v["verdict"]="REJECT"
+v["root_causes"][0]["evidence"]=['f.txt:2-2@%s "line nine"' % sys.argv[3]]; json.dump(v,open(sys.argv[2],"w"))
+PY2
+chk "verdict: unverified root cause flagged" 0 "UNVERIFIED_ROOT_CAUSE: RC-1" python3 "$V" --extract "$TMP/v-rcbad.json" --round 0 --repo "$G2"
 # F-02: an unpinned path citation is not evidence
 mkobj "$TMP/v-unpinned.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"BLOCKER","claim":"c","evidence":["src/x.py:9999"],"proposed_change":"p","falsifier":"f"}]' "x"
 chk "verdict: unpinned citation rejected" 1 "no sha-pinned"     python3 "$V" --extract "$TMP/v-unpinned.json" --round 0
 # F-02: a citation to a commit other than the base is rejected
 mkobj "$TMP/v-later.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"MAJOR","claim":"c","evidence":["f.txt:2-2@'"$SHA_LATER"' \"line two\""],"proposed_change":"p","falsifier":"f"}]' "x"
-chk "verdict: non-base sha rejected"   1 "base SHA"             python3 "$V" --extract "$TMP/v-later.json" --round 0 --repo "$G2" --base-sha "$SHA2"
+chk "verdict: non-base sha citation dropped" 0 "base SHA"       python3 "$V" --extract "$TMP/v-later.json" --round 0 --repo "$G2" --base-sha "$SHA2"
 # F-11: extensionless paths are ordinary paths
 mkobj "$TMP/v-noext.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"MAJOR","claim":"c","evidence":["Dockerfile:1-1@'"$SHA2"' \"FROM python\""],"proposed_change":"p","falsifier":"f"}]' "x"
 chk "verdict: extensionless path accepted" 0 "OK"               python3 "$V" --extract "$TMP/v-noext.json" --round 0 --repo "$G2" --base-sha "$SHA2"
@@ -481,6 +492,21 @@ v["objection_resolutions"]=[{"id":"X-1","status":"WITHDRAWN","because":"you make
 json.dump(v,open(sys.argv[2],"w"))
 PY2
 chk "verdict: evidence-free withdrawal" 1 "praise"              python3 "$V" --extract "$TMP/v-r2.json" --round 2 --prior "$TMP/r1.json"
+python3 - "$TMP/v-r2.json" "$TMP/v-r2plan.json" <<'PY'
+import json,sys
+v=json.load(open(sys.argv[1]))
+v["objection_resolutions"]=[{"id":"X-1","status":"WITHDRAWN","because":"CH-3 and T-4b now carry the check"}]
+v["changed_positions"]=[{"objection_id":"X-1","from":"MAJOR","to":"WITHDRAWN","because":"CH-3, T-4b"}]
+json.dump(v,open(sys.argv[2],"w"))
+PY
+chk "verdict: withdrawal citing a plan row accepted" 0 "OK"      python3 "$V" --extract "$TMP/v-r2plan.json" --round 2 --prior "$TMP/r1.json"
+python3 - "$TMP/v-r2.json" "$TMP/v-r2bare.json" <<'PY'
+import json,sys
+v=json.load(open(sys.argv[1]))
+v["objection_resolutions"]=[{"id":"X-1","status":"WITHDRAWN","because":"the plan now handles it"}]
+json.dump(v,open(sys.argv[2],"w"))
+PY
+chk "verdict: withdrawal naming nothing rejected" 1 "without a citation or evidence id" python3 "$V" --extract "$TMP/v-r2bare.json" --round 2 --prior "$TMP/r1.json"
 python3 - "$TMP/r1.json" "$TMP/v-r2b.json" <<'PY2'
 import json,sys
 v=json.load(open(sys.argv[1])); v["round"]=2; v["objections"]=[]; v["objection_resolutions"]=[]

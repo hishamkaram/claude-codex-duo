@@ -47,6 +47,8 @@ ${CLAUDE_PLUGIN_ROOT}/skills/deep-plan-duo/scripts/validate-verdict.py --extract
 ${CLAUDE_PLUGIN_ROOT}/skills/deep-plan-duo/scripts/debate-status.py --art "$ART"
 ```
 
+A citation whose quote is not verbatim does not fail the reply: the validator drops that citation, drops an objection left without any sha-pinned citation, prints `WARN DROPPED_CITATION` / `DROPPED_OBJECTION` / `UNVERIFIED_ROOT_CAUSE` lines, and records `dropped_citations` and `flags` in the verdict JSON. Record every WARN line in the round artifact and treat an unverified root cause as E4. Only structural failures (schema, contract, praise, unresolved prior objections) fail the reply.
+
 If the validator fails: write `r<n>-prompt.retry.md` = the original prompt plus a final line
 `RETRY: the previous reply was rejected by the schema validator for: <reasons>. Return ONLY one fenced json block. Every objection needs evidence[] and a falsifier.`
 Run the runner once more with `--resume-last` and `--prompt-file` pointing at the retry file

@@ -30,11 +30,12 @@ RISK_UNMANAGED · SCOPE · TEST_GAP · MIGRATION_UNSAFE. Severity: BLOCKER · MA
    its verdict decides. Most deadlocks are unresolved facts wearing a costume.
 4. Value disputes (latency vs simplicity, scope vs speed) are never settled by more rounds →
    `DECISION-REQUIRED.md`.
-5. Conceding requires a citation or an evidence id in `because`. "Good point" fails validation.
+5. Conceding requires a citation, an evidence id, or the plan row (`CH-`/`T-`/`D-`/`ER-`) that answered the objection in `because`. "Good point" fails validation.
 6. `NO_OPINION_INSUFFICIENT_EVIDENCE` is a legitimate, respected answer.
 7. Codex's sha-pinned citations are run through `check-citations.py` before its verdict is
-   accepted. Correlated hallucination across two models is the real failure mode; only mechanical
-   verification catches it.
+   accepted; a citation that does not resolve verbatim is dropped (and an objection left without
+   one is discarded) rather than failing the reply. Correlated hallucination across two models is
+   the real failure mode; only mechanical verification catches it.
 
 ## `debate/divergence.md` (Phase 6)
 
@@ -68,7 +69,7 @@ printed by `debate-status.py`. Codex's raw reply is never pasted here; it lives 
 | T4 | An open BLOCKER whose falsifier is "a human must choose X over Y" | `DECISION-REQUIRED.md` |
 | T2 | Round cap reached (default 2, 3 with `--deep`, hard cap 3, never extended) | `DECISION-REQUIRED.md` if any BLOCKER/MAJOR is open, else `PLAN.md` + §Residual disagreements |
 | T3 | Two consecutive rounds with no new objection, class, citation or changed position | `PLAN.md` + §Residual disagreements |
-| T5 | Codex unavailable, or verdict invalid after the retry (runner exit ≠ 0 twice, or validator FAIL twice) | continue solo; `PLAN.md` stamped `SOLO`. Never simulate Codex. |
+| T5 | Codex unavailable, or verdict structurally invalid after the retry (runner exit ≠ 0 twice, or validator FAIL twice on schema/contract errors — a non-verbatim citation is dropped, never a failure) | relaunch round 0 `--fresh` once more before anything else; only if that also fails, continue solo with `PLAN.md` stamped `SOLO` and say so on line 1. Never simulate Codex. |
 
 T3 matters more than T2: the cap invites padding rounds to look thorough. Repetition is not
 convergence. A debate where nobody moved and nothing escalated is a failed debate; record that
