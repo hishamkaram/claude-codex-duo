@@ -1,8 +1,23 @@
 #!/bin/bash
-# codex-run.sh — run one read-only Codex task in the background, monitor it, return its result.
+# codex-run.sh — run one read-only second-model task in the background, monitor it, return its result.
 #
 # Usage:
-#   codex-run.sh <out-prefix> [--fresh|--resume-last] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>]
+#   codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last] --prompt-file <file>
+#                [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>]
+#                [--max-turns N] [--resume-session <id>]          (ccr backend only)
+#   codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]
+#
+#   --via codex (default): the Codex CLI plugin's companion (task/status/result/cancel).
+#   --via ccr:<alias>: a headless Claude Code launched through the claude-code-router gateway
+#   (`ccr launch --model <alias>`), routed to whatever provider the alias names on this machine.
+#   Both backends honour the same contract: prompt file in, the six sidecars out, exit 0-5, the
+#   claim directory, and the refusal of --write. The ccr backend is kept read-only by
+#   `--permission-mode plan` (Claude Code's own permission engine), an empty strict MCP config,
+#   and the disallowed edit tools — a disallow-list alone does not stop Bash from writing.
+#   Every ccr launch requires a recorded read-only smoke for the alias in the prefix's directory
+#   (`<dir>/.ccr-smoke.<alias>`, written by `--probe --via ccr:<alias> --record-dir <dir>`);
+#   without a matching record the launch is refused (exit 4) — fail closed, one smoke per alias
+#   per run directory.
 #
 #   --claim <token>: the launch was authorized by a gate that created <out-prefix>.claim/ (the
 #   two-model review's phase-gate.sh) and printed claim=<token>. The runner then writes NOTHING
@@ -15,39 +30,189 @@
 #
 # Writes:
 #   <out-prefix>.progress   one line per poll: elapsed, status, last log line   (tail this while waiting)
-#   <out-prefix>.stdout     Codex final message (from `result`), verbatim
+#   <out-prefix>.stdout     final message (Codex `result`, or the ccr child's `result` event text), verbatim
 #   <out-prefix>.stderr     launch + result stderr
-#   <out-prefix>.joblog     copy of the plugin's job log at the end
-#   <out-prefix>.meta       job id, thread id, outcome, timings, exact command
-#   <out-prefix>.exit       0 COMPLETED · 1 FAILED · 2 STALLED · 3 TIMEOUT · 4 LAUNCH-ERROR
+#   <out-prefix>.joblog     copy of the plugin's job log (codex) or the raw stream-json (ccr)
+#   <out-prefix>.meta       backend, job/session ids, thread id, outcome, timings, exact command
+#   <out-prefix>.exit       0 COMPLETED · 1 FAILED · 2 STALLED · 3 TIMEOUT · 4 LAUNCH-ERROR · 5 UNCONFIRMED-CANCEL
 #   Exit 4 with NO sidecar written: another runner already took <out-prefix>.claim/, or (--claim)
 #   no claim exists / the arguments are invalid.
+#   ccr backend also writes <dir>/.ccr-last-session (the session id --resume-last resumes).
 #
-# Safety: refuses --write. Cancels the job on STALLED/TIMEOUT so nothing is left running.
+# Safety: refuses --write. Cancels the job on STALLED/TIMEOUT so nothing is left running; a ccr
+# child runs in its own process group so the whole tree is signalled and its pgid is recorded.
 # Run it with the caller's background execution (Claude Code: run_in_background) so a foreground
-# shell limit can never kill the Codex worker mid-turn.
+# shell limit can never kill the worker mid-turn.
 
 set -u
-if [ "${1:-}" = "--probe" ]; then
-  CODEX_ROOT=$(python3 -c 'import json,os,glob
+CCR_MIN_VERSION="0.4.11"
+CCR_MAX_TURNS_DEFAULT=100
+# The exact read-only launch line for the ccr backend. It is the one line every ccr participant
+# runs and the one line the probe's smoke verifies; its digest is part of the smoke record so a
+# changed line invalidates every earlier smoke.
+ccr_launch_argv() {  # <alias> <max-turns> [session-id]
+  printf '%s\n' ccr launch --model "$1" --permission-mode plan -p --no-lifecycle --no-statusline -- \
+    --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+    --disallowedTools Write,Edit,MultiEdit,NotebookEdit,Agent --max-turns "$2"
+  [ -z "${3:-}" ] || printf '%s\n' --resume "$3"
+}
+ccr_launch_digest() { ccr_launch_argv ALIAS N | shasum -a 256 | cut -c1-16; }
+codex_root() {
+  python3 -c 'import json,os,glob
 p=os.path.expanduser("~/.claude/plugins/installed_plugins.json")
 try: print(json.load(open(p))["plugins"]["codex@openai-codex"][0]["installPath"]); raise SystemExit
 except Exception: pass
 c=sorted(glob.glob(os.path.expanduser("~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs")))
-print(os.path.dirname(os.path.dirname(c[-1])) if c else "")')
-  [ -n "$CODEX_ROOT" ] || { echo "PROBE UNAVAILABLE: codex plugin not found"; exit 1; }
-  OUT=$(node "$CODEX_ROOT/scripts/codex-companion.mjs" setup --json 2>&1) || { echo "PROBE FAILED: setup exited non-zero"; printf '%s\n' "$OUT" | tail -5; exit 1; }
-  printf '%s' "$OUT" | python3 -c 'import sys,json
+print(os.path.dirname(os.path.dirname(c[-1])) if c else "")'
+}
+# --- ccr helpers (shared by the probe and the launch path) -----------------------------------
+ccr_version() { ccr version 2>/dev/null | head -1 | sed -nE 's/^ccr[[:space:]]+v?([0-9]+\.[0-9]+\.[0-9]+).*$/\1/p'; }
+version_ge() {  # X.Y.Z >= A.B.C
+  python3 -c 'import sys
+a=[int(x) for x in sys.argv[1].split(".")]; b=[int(x) for x in sys.argv[2].split(".")]
+raise SystemExit(0 if a>=b else 1)' "$1" "$2"
+}
+ccr_model_json() { ccr model show "$1" --json 2>/dev/null; }
+ccr_model_field() {  # <json> <field>: alias provider provider_model claude_model_id compatibility tools
+  printf '%s' "$1" | python3 -c 'import sys,json
+d=json.load(sys.stdin); f=sys.argv[1]
+def find(o,k):
+    if isinstance(o,dict):
+        if k in o: return o[k]
+        for v in o.values():
+            r=find(v,k)
+            if r is not None: return r
+    if isinstance(o,list):
+        for v in o:
+            r=find(v,k)
+            if r is not None: return r
+    return None
+if f=="tools":
+    v=find(d.get("effective_capabilities",d),"supports_tools"); print("true" if v is True else "false")
+else:
+    v=d.get(f); print("" if v is None else v)' "$2" 2>/dev/null
+}
+# Read the parts of the ccr backend's precondition that do not depend on the run directory.
+# Sets CCR_VER, MODEL_JSON, PROVIDER, PROVIDER_MODEL, CLAUDE_MODEL, COMPAT, TOOLS; on failure sets REASON and returns 1.
+# (Not run in a command substitution: the variables must reach the caller.)
+ccr_preflight() {  # <alias>
+  command -v ccr >/dev/null 2>&1 || { REASON="ccr not found on PATH (install claude-code-router >= $CCR_MIN_VERSION)"; return 1; }
+  CCR_VER=$(ccr_version); [ -n "$CCR_VER" ] || { REASON="cannot parse 'ccr version' output"; return 1; }
+  version_ge "$CCR_VER" "$CCR_MIN_VERSION" || { REASON="requires ccr >= $CCR_MIN_VERSION (found $CCR_VER)"; return 1; }
+  MODEL_JSON=$(ccr_model_json "$1") && [ -n "$MODEL_JSON" ] || { REASON="ccr model show $1 --json failed (unknown alias on this machine?)"; return 1; }
+  PROVIDER=$(ccr_model_field "$MODEL_JSON" provider); PROVIDER_MODEL=$(ccr_model_field "$MODEL_JSON" provider_model)
+  CLAUDE_MODEL=$(ccr_model_field "$MODEL_JSON" claude_model_id); COMPAT=$(ccr_model_field "$MODEL_JSON" compatibility); TOOLS=$(ccr_model_field "$MODEL_JSON" tools)
+  [ -n "$PROVIDER" ] || { REASON="ccr model show $1 --json has no provider field"; return 1; }
+  [ "$TOOLS" = true ] || { REASON="alias $1 reports supports_tools=$TOOLS; a reviewer needs tool calls"; return 1; }
+  return 0
+}
+# Match the recorded smoke against the current alias: version, model and launch line must all agree.
+ccr_smoke_check() {  # <dir> <alias>  (needs ccr_preflight first)
+  local f="$1/.ccr-smoke.$2"
+  [ -r "$f" ] || { REASON="ccr smoke missing for $2: run 'codex-run.sh --probe --via ccr:$2 --record-dir $1' first (smoke record $f)"; return 1; }
+  grep -qxF "readonly=verified" "$f" || { REASON="ccr smoke for $2 is not 'readonly=verified' ($f)"; return 1; }
+  grep -qxF "ccr=$CCR_VER" "$f" || { REASON="ccr smoke for $2 was recorded with another ccr version (now $CCR_VER); re-run the probe"; return 1; }
+  grep -qxF "model=$PROVIDER_MODEL" "$f" || { REASON="ccr smoke for $2 was recorded for another model (now $PROVIDER_MODEL); re-run the probe"; return 1; }
+  grep -qxF "launch_sha256=$(ccr_launch_digest)" "$f" || { REASON="ccr smoke for $2 was recorded for another launch line; re-run the probe"; return 1; }
+  return 0
+}
+# Start a command in its own process group; echoes nothing, sets CHILD (pid) — pgid == pid.
+# exec, so that when it is called as `start_in_own_group … &` the background pid IS the child (and its pgid).
+start_in_own_group() { exec python3 -c 'import os,sys; os.setpgrp(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"; }
+pgid_of() { ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
+group_alive() { kill -0 -- "-$1" 2>/dev/null; }
+# TERM then KILL the whole group; return 0 when nothing in it is left, 1 when something survives.
+kill_group() {  # <pgid>
+  local i
+  kill -TERM -- "-$1" 2>/dev/null || true
+  for i in 1 2 3 4 5; do group_alive "$1" || return 0; sleep 1; done
+  kill -KILL -- "-$1" 2>/dev/null || true
+  for i in 1 2 3 4 5; do group_alive "$1" || return 0; sleep 1; done
+  return 1
+}
+# stream-json readers
+stream_field() {  # <joblog> init-session|init-model|result-text|has-result
+  python3 - "$1" "$2" <<'PY' 2>/dev/null
+import sys,json
+path,what=sys.argv[1],sys.argv[2]; sid=model=""; res=None
+for line in open(path,encoding="utf-8",errors="replace"):
+    line=line.strip()
+    if not line.startswith("{"): continue
+    try: e=json.loads(line)
+    except Exception: continue
+    if e.get("type")=="system" and e.get("subtype")=="init":
+        sid=sid or e.get("session_id","") or ""; model=model or e.get("model","") or ""
+    if e.get("type")=="result": res=e
+if what=="init-session": print(sid)
+elif what=="init-model": print(model)
+elif what=="has-result": print("yes" if res is not None else "no")
+elif what=="result-text":
+    if res is not None:
+        r=res.get("result")
+        if r is None: r=""
+        sys.stdout.write(r if isinstance(r,str) else json.dumps(r))
+PY
+}
+
+# --- probe -----------------------------------------------------------------------------------
+if [ "${1:-}" = "--probe" ]; then
+  shift; VIA=codex; RECORD_DIR=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --via) [ $# -ge 2 ] || { echo "PROBE UNAVAILABLE: --via requires a value"; exit 1; }; VIA="$2"; shift;;
+      --record-dir) [ $# -ge 2 ] || { echo "PROBE UNAVAILABLE: --record-dir requires a value"; exit 1; }; RECORD_DIR="$2"; shift;;
+      *) echo "PROBE UNAVAILABLE: unknown probe arg $1"; exit 1;;
+    esac; shift
+  done
+  case "$VIA" in
+    codex)
+      CODEX_ROOT=$(codex_root)
+      [ -n "$CODEX_ROOT" ] || { echo "PROBE UNAVAILABLE: codex plugin not found"; exit 1; }
+      OUT=$(node "$CODEX_ROOT/scripts/codex-companion.mjs" setup --json 2>&1) || { echo "PROBE FAILED: setup exited non-zero"; printf '%s\n' "$OUT" | tail -5; exit 1; }
+      printf '%s' "$OUT" | python3 -c 'import sys,json
 d=json.load(sys.stdin); ok=bool(d.get("ready")) and bool(d.get("auth",{}).get("loggedIn"))
 label="PROBE SUCCEEDED" if ok else "PROBE UNAVAILABLE"
-print(label, "ready=%s loggedIn=%s codex=%s" % (d.get("ready"), d.get("auth",{}).get("loggedIn"), d.get("codex",{}).get("detail")))
+print(label, "backend=codex ready=%s loggedIn=%s codex=%s" % (d.get("ready"), d.get("auth",{}).get("loggedIn"), d.get("codex",{}).get("detail")))
 raise SystemExit(0 if ok else 1)'
-  exit $?
+      exit $?;;
+    ccr:?*)
+      ALIAS="${VIA#ccr:}"
+      ccr_preflight "$ALIAS" || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS $REASON"; exit 1; }
+      # Read-only smoke: a disposable repository, the exact review launch line, and a prompt that
+      # asks for a write by the Write tool and by Bash. Any file created ⇒ readonly=violated.
+      SMOKE=$(mktemp -d 2>/dev/null) && [ -d "$SMOKE" ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS mktemp failed"; exit 1; }
+      git init -q "$SMOKE/repo" 2>/dev/null || mkdir -p "$SMOKE/repo"
+      printf '%s\n' "Smoke test. Do exactly these two things, then reply with the single word DONE:" \
+        "1. Use the Write tool to create a file named smoke-write.txt containing hello in the current directory." \
+        "2. Use the Bash tool to run: echo hello > smoke-bash.txt" \
+        "If a step is refused, say so and continue." > "$SMOKE/prompt.md"
+      ARGV=(); while IFS= read -r a; do ARGV+=("$a"); done < <(ccr_launch_argv "$ALIAS" 6)
+      ( cd "$SMOKE/repo" && "${ARGV[@]}" < "$SMOKE/prompt.md" > "$SMOKE/stream.jsonl" 2> "$SMOKE/stderr" ); SRC=$?
+      CREATED=$(cd "$SMOKE/repo" && find . -path ./.git -prune -o -type f -print | sed 's|^\./||')
+      if [ -n "$CREATED" ]; then
+        echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS readonly=violated files_created=$(printf '%s' "$CREATED" | tr '\n' ',') ccr=$CCR_VER"; rm -rf "$SMOKE"; exit 1
+      fi
+      if [ "$SRC" != 0 ]; then
+        echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke launch exited $SRC ccr=$CCR_VER"; tail -5 "$SMOKE/stderr"; rm -rf "$SMOKE"; exit 1
+      fi
+      [ "$(stream_field "$SMOKE/stream.jsonl" has-result)" = yes ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke produced no result event ccr=$CCR_VER"; rm -rf "$SMOKE"; exit 1; }
+      rm -rf "$SMOKE"
+      RECORDED="not recorded (pass --record-dir <run dir> so launches in it can verify the smoke)"
+      if [ -n "$RECORD_DIR" ]; then
+        [ -d "$RECORD_DIR" ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS --record-dir $RECORD_DIR is not a directory"; exit 1; }
+        printf 'alias=%s\nccr=%s\nmodel=%s\nprovider=%s\nreadonly=verified\nlaunch_sha256=%s\nrecorded=%s\n' "$ALIAS" "$CCR_VER" "$PROVIDER_MODEL" "$PROVIDER" "$(ccr_launch_digest)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RECORD_DIR/.ccr-smoke.$ALIAS"
+        RECORDED="recorded=$RECORD_DIR/.ccr-smoke.$ALIAS"
+      fi
+      echo "PROBE SUCCEEDED backend=ccr alias=$ALIAS provider=$PROVIDER model=$PROVIDER_MODEL compatibility=$COMPAT tools=$TOOLS readonly=verified ccr=$CCR_VER $RECORDED"
+      printf '%s\n' "$MODEL_JSON"
+      exit 0;;
+    *) echo "PROBE UNAVAILABLE: --via must be codex or ccr:<alias> (got '$VIA')"; exit 1;;
+  esac
 fi
-USAGE='usage: codex-run.sh <out-prefix> [--fresh|--resume-last] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>]
-       codex-run.sh --probe'
+USAGE='usage: codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>] [--max-turns N] [--resume-session <id>]
+       codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]'
 # Every invocation error exits 4 (LAUNCH-ERROR). Never exit 1 for a bad command line:
-# 1 means "Codex failed, retry once" in the documented contract, and a typo must not look like that.
+# 1 means "the second model failed, retry once" in the documented contract, and a typo must not look like that.
 PREFIX="${1:-}"
 case "$PREFIX" in ""|-*) echo "codex-run.sh: first argument must be an out-prefix path" >&2; echo "$USAGE" >&2; exit 4;; esac
 shift
@@ -61,21 +226,39 @@ CLAIM_MODE=0; CLAIM_TOKEN=""; for _a in "$@"; do [ "$_a" = "--claim" ] && CLAIM_
 # An argument error writes <prefix>.exit only for the claim-less sibling plugins: with --claim, or when a launch claim exists for the prefix (a gate-issued prefix), nothing is written (round-42 CL-04).
 die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
 need() { [ $# -ge 2 ] || die4 "$1 requires a value"; case "$2" in -*) die4 "$1 requires a value (got option $2)";; esac; }
-MODE="--fresh"; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15
+MODE="--fresh"; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --fresh|--resume-last) MODE="$1";;
+    --via) need "$@"; VIA="$2"; shift;;
     --prompt-file) need "$@"; PROMPT_FILE="$2"; shift;;
     --stall-min) need "$@"; STALL_MIN="$2"; shift;;
     --max-min) need "$@"; MAX_MIN="$2"; shift;;
     --poll-sec) need "$@"; POLL="$2"; shift;;
+    --max-turns) need "$@"; MAX_TURNS="$2"; shift;;
+    --resume-session) need "$@"; RESUME_SESSION="$2"; shift;;
     --claim) need "$@"; CLAIM_MODE=1; CLAIM_TOKEN="$2"; shift;;
     --write) die4 "--write is refused; this runner is read-only";;
     *) die4 "unknown arg $1";;
   esac; shift
 done
-for v in STALL_MIN MAX_MIN POLL; do
+case "$VIA" in
+  codex) BACKEND=codex; ALIAS="";;
+  ccr:?*) BACKEND=ccr; ALIAS="${VIA#ccr:}"; case "$ALIAS" in *[!A-Za-z0-9._-]*) die4 "--via ccr:<alias>: alias may contain only letters, digits, '.', '_' and '-' (got '$ALIAS')";; esac;;
+  ccr:|ccr) die4 "--via ccr: requires an alias (ccr:<alias>)";;
+  *) die4 "--via must be codex or ccr:<alias> (got '$VIA')";;
+esac
+if [ "$BACKEND" = codex ]; then
+  [ -z "$MAX_TURNS" ] || die4 "--max-turns is ccr-only (pass --via ccr:<alias>)"
+  [ -z "$RESUME_SESSION" ] || die4 "--resume-session is ccr-only (pass --via ccr:<alias>)"
+else
+  [ -n "$MAX_TURNS" ] || MAX_TURNS=$CCR_MAX_TURNS_DEFAULT
+  [ -z "$RESUME_SESSION" ] || [ "$MODE" != "--resume-last" ] || die4 "--resume-session and --resume-last are exclusive"
+  case "$RESUME_SESSION" in *[!A-Za-z0-9-]*) die4 "--resume-session: a session id has only letters, digits and '-' (got '$RESUME_SESSION')";; esac
+fi
+for v in STALL_MIN MAX_MIN POLL MAX_TURNS; do
   eval "val=\$$v"
+  [ "$v" != MAX_TURNS ] || [ -n "$val" ] || continue
   case "$val" in ''|*[!0-9]*) die4 "--$(echo "$v" | tr 'A-Z_' 'a-z-') requires a whole number (got '$val')";; esac
   # Strip to base 10: bash reads a leading-zero literal as octal, so "08" would
   # abort arithmetic later with "value too great for base". Also bound the range
@@ -86,12 +269,6 @@ done
 [ -n "$PROMPT_FILE" ] || die4 "--prompt-file is required"
 [ -r "$PROMPT_FILE" ] || die4 "prompt file not readable: $PROMPT_FILE"
 
-CODEX_ROOT=$(python3 -c 'import json,os,glob
-p=os.path.expanduser("~/.claude/plugins/installed_plugins.json")
-try: print(json.load(open(p))["plugins"]["codex@openai-codex"][0]["installPath"]); raise SystemExit
-except Exception: pass
-c=sorted(glob.glob(os.path.expanduser("~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs")))
-print(os.path.dirname(os.path.dirname(c[-1])) if c else "")')
 rotate_previous_attempt() {
   # never clobber a previous attempt: rotate its sidecars to <prefix>.attemptN.*
   # A launch error leaves .exit without .meta, and a runner killed mid-flight
@@ -149,15 +326,103 @@ stamp_claim() {
 }
 HELD_LOCK=""
 unlock_claim() { [ -z "$HELD_LOCK" ] || rmdir "$HELD_LOCK" 2>/dev/null; HELD_LOCK=""; }
-[ -n "$CODEX_ROOT" ] && [ -f "$CODEX_ROOT/scripts/codex-companion.mjs" ] || {
+# A launch error after the claim is owned: sidecars record it (outcome=LAUNCH-ERROR, .exit=4).
+launch_error() {  # <message> <command>
   stamp_claim; rotate_previous_attempt; unlock_claim
-  MSG="codex-run.sh: cannot locate the codex plugin (installed_plugins.json or ~/.claude/plugins/cache/openai-codex/codex/*)"
-  echo "$MSG" >&2; printf 'LAUNCH-ERROR\n%s\n' "$MSG" > "$PREFIX.stderr"; printf '0s LAUNCH-ERROR: codex plugin not found\n' > "$PREFIX.progress"
-  printf 'outcome=LAUNCH-ERROR\nlast_error=codex plugin not found\nmode=%s\ncommand=task %s --background --prompt-file %s\n' "$MODE" "$MODE" "$PROMPT_FILE" > "$PREFIX.meta"; echo 4 > "$PREFIX.exit"; exit 4; }
+  echo "codex-run.sh: $1" >&2; printf 'LAUNCH-ERROR\n%s\n' "$1" > "$PREFIX.stderr"; printf '0s LAUNCH-ERROR: %s\n' "$1" > "$PREFIX.progress"
+  printf 'outcome=LAUNCH-ERROR\nbackend=%s\nlast_error=%s\nmode=%s\ncommand=%s\n' "$BACKEND" "$1" "$MODE" "$2" > "$PREFIX.meta"; echo 4 > "$PREFIX.exit"; exit 4
+}
+START=$(date +%s); now() { date +%s; }; elapsed() { echo $(( $(now) - START )); }
+
+# =============================================================================================
+# ccr backend
+# =============================================================================================
+if [ "$BACKEND" = ccr ]; then
+  DIR=$(dirname "$PREFIX")
+  CMD="ccr launch --model $ALIAS --permission-mode plan -p ... --max-turns $MAX_TURNS $MODE${RESUME_SESSION:+ --resume-session $RESUME_SESSION}"
+  ccr_preflight "$ALIAS" || launch_error "$REASON" "$CMD"
+  ccr_smoke_check "$DIR" "$ALIAS" || launch_error "$REASON" "$CMD"
+  SESSION=""
+  if [ "$MODE" = "--resume-last" ]; then
+    SESSION=$(cat "$DIR/.ccr-last-session" 2>/dev/null | head -1 | tr -d ' ')
+    [ -n "$SESSION" ] || launch_error "--resume-last: no previous ccr session recorded in $DIR/.ccr-last-session" "$CMD"
+  elif [ -n "$RESUME_SESSION" ]; then SESSION="$RESUME_SESSION"; fi
+  ARGV=(); while IFS= read -r a; do ARGV+=("$a"); done < <(ccr_launch_argv "$ALIAS" "$MAX_TURNS" "$SESSION")
+  stamp_claim; rotate_previous_attempt; unlock_claim
+  : > "$PREFIX.progress"; : > "$PREFIX.stderr"; : > "$PREFIX.joblog"
+  start_in_own_group "${ARGV[@]}" < "$PROMPT_FILE" > "$PREFIX.joblog" 2>> "$PREFIX.stderr" &
+  CHILD=$!
+  sleep 1
+  PGID=$(pgid_of "$CHILD")
+  if [ "$PGID" != "$CHILD" ]; then
+    # Either the child already exited (fast failure — let the normal path report it) or the
+    # group could not be established; the latter is never left running.
+    if kill -0 "$CHILD" 2>/dev/null; then
+      # pgid == pid by construction (setpgrp before exec), so signal the group by that number too: a
+      # child the fake/gateway forked must not outlive this branch (a stray `sleep` was observed).
+      kill -KILL -- "-$CHILD" 2>/dev/null; kill -KILL "$CHILD" 2>/dev/null; wait "$CHILD" 2>/dev/null
+      echo "$(elapsed)s LAUNCH: process group of pid $CHILD could not be read (got '$PGID'); child killed" >> "$PREFIX.progress"
+      printf 'outcome=UNCONFIRMED-CANCEL\nbackend=ccr\nalias=%s\npid=%s\npgid=unknown\nlast_error=process group unreadable\nmode=%s\ncommand=%s\ncancel_confirmed=no\n' "$ALIAS" "$CHILD" "$MODE" "$CMD" > "$PREFIX.meta"
+      : > "$PREFIX.stdout"; echo 5 > "$PREFIX.exit"; echo "codex-run.sh: process group unreadable; child killed (exit 5)" >&2; exit 5
+    fi
+    PGID="$CHILD"
+  fi
+  echo "$(elapsed)s launched backend=ccr pid=$CHILD pgid=$PGID alias=$ALIAS" >> "$PREFIX.progress"
+
+  OUTCOME=""; LAST_ACTIVITY=$(now); PREV_SIG=""; IDLE=0
+  while :; do
+    sleep "$POLL"
+    SIG=$(fsig "$PREFIX.joblog"); LASTLINE=$(tail -n 1 "$PREFIX.joblog" 2>/dev/null | cut -c1-140)
+    if [ "$SIG" != "$PREV_SIG" ]; then LAST_ACTIVITY=$(now); PREV_SIG="$SIG"; fi
+    IDLE=$(( $(now) - LAST_ACTIVITY ))
+    if kill -0 "$CHILD" 2>/dev/null; then STATUS=running; else STATUS=exited; fi
+    echo "$(elapsed)s status=$STATUS idle=${IDLE}s | $LASTLINE" >> "$PREFIX.progress"
+    [ "$STATUS" = running ] || { OUTCOME=EXITED; break; }
+    if [ "$IDLE" -ge $(( STALL_MIN * 60 )) ]; then OUTCOME=STALLED; break; fi
+    if [ "$(elapsed)" -ge $(( MAX_MIN * 60 )) ]; then OUTCOME=TIMEOUT; break; fi
+  done
+  UNCONFIRMED_CANCEL=0
+  if [ "$OUTCOME" = STALLED ] || [ "$OUTCOME" = TIMEOUT ]; then
+    if kill_group "$PGID"; then
+      echo "$(elapsed)s $OUTCOME → process group $PGID terminated (confirmed: no member left)" >> "$PREFIX.progress"
+    else
+      UNCONFIRMED_CANCEL=1
+      echo "$(elapsed)s $OUTCOME → cancel of process group $PGID NOT confirmed; a process may still be running" >> "$PREFIX.progress"
+      echo "codex-run.sh: cancel of process group $PGID not confirmed; DO NOT retry — check with: ps -o pid,pgid,command -g $PGID" >&2
+    fi
+  fi
+  wait "$CHILD" 2>/dev/null; CHILD_RC=$?
+  SESSION_ID=$(stream_field "$PREFIX.joblog" init-session); ROUTED_MODEL=$(stream_field "$PREFIX.joblog" init-model)
+  HAS_RESULT=$(stream_field "$PREFIX.joblog" has-result)
+  stream_field "$PREFIX.joblog" result-text > "$PREFIX.stdout"
+  if [ "$OUTCOME" = EXITED ]; then
+    if [ "$CHILD_RC" = 0 ] && [ "$HAS_RESULT" = yes ]; then OUTCOME=COMPLETED; else OUTCOME=FAILED; fi
+  fi
+  [ "$OUTCOME" != COMPLETED ] || [ -z "$SESSION_ID" ] || printf '%s\n' "$SESSION_ID" > "$DIR/.ccr-last-session"
+  {
+    echo "outcome=$OUTCOME"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "provider=$PROVIDER"; echo "provider_model=$PROVIDER_MODEL"
+    echo "claude_model_id=$CLAUDE_MODEL"; echo "routed_model=${ROUTED_MODEL:-unknown}"; echo "compatibility=$COMPAT"; echo "ccr_version=$CCR_VER"
+    echo "pid=$CHILD"; echo "pgid=$PGID"; echo "child_exit=$CHILD_RC"; echo "thread=${SESSION_ID:-unknown}"
+    echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "max_turns=$MAX_TURNS"
+    echo "mode=$MODE"; echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
+    LASTERR=$(grep -E 'error|Error|exit status' "$PREFIX.stderr" | tail -1 | cut -c1-300)
+    echo "last_error=${LASTERR:-none}"; echo "cancel_confirmed=$([ "$UNCONFIRMED_CANCEL" = 1 ] && echo no || echo "$([ "$OUTCOME" = STALLED ] || [ "$OUTCOME" = TIMEOUT ] && echo yes || echo n/a)")"
+  } > "$PREFIX.meta"
+  case "$OUTCOME" in COMPLETED) RC=0;; FAILED) RC=1;; STALLED) RC=2;; TIMEOUT) RC=3;; *) RC=1;; esac
+  [ "$UNCONFIRMED_CANCEL" = 1 ] && RC=5
+  echo "$RC" > "$PREFIX.exit"
+  echo "codex-run.sh: $OUTCOME backend=ccr alias=$ALIAS session=${SESSION_ID:-unknown} elapsed=$(elapsed)s stdout=$(wc -c < "$PREFIX.stdout" | tr -d ' ')B → $PREFIX.{stdout,progress,meta}"
+  exit "$RC"
+fi
+
+# =============================================================================================
+# codex backend (the Codex CLI plugin's companion)
+# =============================================================================================
+CODEX_ROOT=$(codex_root)
+[ -n "$CODEX_ROOT" ] && [ -f "$CODEX_ROOT/scripts/codex-companion.mjs" ] || launch_error "cannot locate the codex plugin (installed_plugins.json or ~/.claude/plugins/cache/openai-codex/codex/*)" "task $MODE --background --prompt-file $PROMPT_FILE"
 cc() { node "$CODEX_ROOT/scripts/codex-companion.mjs" "$@"; }
 jobfield() { python3 -c "import sys,json;d=json.load(sys.stdin);j=d.get('job') or {};print(j.get('$1') or '')" 2>/dev/null; }
 
-START=$(date +%s); now() { date +%s; }; elapsed() { echo $(( $(now) - START )); }
 stamp_claim; rotate_previous_attempt; unlock_claim
 : > "$PREFIX.progress"; : > "$PREFIX.stderr"
 CMD="task $MODE --background --prompt-file $PROMPT_FILE"
@@ -165,7 +430,7 @@ LAUNCH=$(cc task "$MODE" --background --prompt-file "$PROMPT_FILE" 2>>"$PREFIX.s
 JOB=$(printf '%s' "$LAUNCH" | grep -oE 'task-[a-z0-9]+-[a-z0-9]+' | head -1)
 if [ -z "$JOB" ]; then
   printf 'LAUNCH-ERROR\n%s\n' "$LAUNCH" >> "$PREFIX.stderr"
-  printf 'outcome=LAUNCH-ERROR\nmode=%s\ncommand=%s\n' "$MODE" "$CMD" > "$PREFIX.meta"; echo 4 > "$PREFIX.exit"
+  printf 'outcome=LAUNCH-ERROR\nbackend=codex\nmode=%s\ncommand=%s\n' "$MODE" "$CMD" > "$PREFIX.meta"; echo 4 > "$PREFIX.exit"
   echo "codex-run.sh: LAUNCH-ERROR (see $PREFIX.stderr)"; exit 4
 fi
 echo "$(elapsed)s launched job=$JOB" >> "$PREFIX.progress"
@@ -232,7 +497,7 @@ cc result "$JOB" > "$PREFIX.stdout" 2>>"$PREFIX.stderr" || true
 [ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && cp "$LOGFILE" "$PREFIX.joblog" 2>/dev/null
 THREAD=$(grep -oE 'Codex session ID: [0-9a-f-]+' "$PREFIX.stdout" | head -1 | awk '{print $4}')
 {
-  echo "outcome=$OUTCOME"; echo "job=$JOB"; echo "thread=${THREAD:-unknown}"
+  echo "outcome=$OUTCOME"; echo "backend=codex"; echo "job=$JOB"; echo "thread=${THREAD:-unknown}"
   echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"
   echo "mode=$MODE"; echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
   LASTERR=""; [ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && LASTERR=$(grep -E "Codex error:|Turn failed" "$LOGFILE" | tail -1 | cut -c1-300)

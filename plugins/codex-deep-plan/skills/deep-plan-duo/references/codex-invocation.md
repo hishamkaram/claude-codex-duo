@@ -1,16 +1,22 @@
-# Codex invocation
+# Second-model invocation (Codex plugin, or a ccr alias)
 
 ## The only permitted path: the monitored runner
 
-`${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh` launches the Codex plugin's `task` in the
-background, refuses `--write`, polls the job, detects a dead worker or a stalled job log, cancels
-anything it abandons, verifies the cancel, and writes sidecars. A foreground `task` call is
-forbidden: a 10-minute shell limit killed one mid-round on 2026-09-02 and left a phantom job.
+`${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh` launches the second model in the background,
+refuses `--write`, polls it, detects a dead worker or a stalled log, cancels anything it
+abandons, verifies the cancel, and writes sidecars. With the default backend it drives the Codex
+plugin's `task`; with `--via ccr:<alias>` it drives a headless Claude Code through the
+claude-code-router gateway (see "ccr backend" below). A foreground call is forbidden: a 10-minute
+shell limit killed one mid-round on 2026-09-02 and left a phantom job.
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/debate/r<n>-codex" --fresh|--resume-last \
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/debate/r<n>-codex" [--via codex|ccr:<alias>] --fresh|--resume-last \
     --prompt-file "$ART/debate/r<n>-prompt.md" [--stall-min 8] [--max-min 30] [--poll-sec 15]
 ```
+
+`--via` comes from `meta.json` (`via`, recorded by `init-plan.sh`); pass the same value on every
+call of the run. The word "Codex" in the rest of this file means the second model whichever
+backend runs it, except where a backend is named.
 
 Always call it with the caller's background execution (Claude Code: `run_in_background: true`);
 you are notified when it exits. Meanwhile `tail -n 5 "$ART/debate/r<n>-codex.progress"` shows
@@ -61,13 +67,58 @@ verdict. Do not author one.
 ## Probe (Phase 0, once)
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe                                   # codex backend
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe --via ccr:<alias> --record-dir "$ART"   # ccr backend
 ```
 
 `PROBE SUCCEEDED …` (exit 0) or `PROBE UNAVAILABLE/FAILED …` (exit 1); record the line verbatim in
-`00-scope.md`. On failure tell the user `/codex:setup` exists; do not improvise auth. Confirm with
-the user that sending repository content to Codex (OpenAI) is permitted for this repository;
-record DECLINED if not. `--solo` skips the probe and records SOLO.
+`00-scope.md` — for the ccr backend also the `ccr model show` JSON the probe prints after it, in a
+fenced block. On failure tell the user `/codex:setup` exists (codex) or `ccr model list` /
+`ccr model show <alias>` (ccr); do not improvise auth. Confirm with the user that sending
+repository content to the second model's provider (OpenAI for Codex; whatever provider the alias
+routes to for ccr — the probe line names it) is permitted for this repository; record DECLINED
+if not. `--solo` skips the probe and records SOLO.
+
+## ccr backend (`--via ccr:<alias>`)
+
+The gateway is the user's `ccr` (claude-code-router, >= 0.4.11). Aliases are machine-local
+(`ccr model list`); never write one into a shipped file, and never default to one. The runner's
+launch line is fixed and is the only one the plugin ever uses:
+
+```
+ccr launch --model <alias> --permission-mode plan -p --no-lifecycle --no-statusline -- \
+  --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+  --disallowedTools Write,Edit,MultiEdit,NotebookEdit,Agent --max-turns <N> [--resume <session>]
+```
+
+Read-only rests on three controls, in order of importance: `--permission-mode plan` (Claude
+Code's own permission engine blocks every write, Bash included, while read-only Bash such as
+`git log` still runs), the empty strict MCP config (removes the user's MCP tools), and the
+disallowed edit tools. A disallow-list alone is NOT enough: a nested session inherits the user's
+permission settings, and Bash writes were observed with only `--disallowedTools` set. The probe
+therefore runs a read-only smoke for the alias (a disposable repository, this launch line, a
+prompt that asks for a write by the Write tool and by Bash) and records `readonly=verified` in
+`<dir>/.ccr-smoke.<alias>`; every ccr launch in that directory refuses to start (exit 4) unless a
+matching record exists (same ccr version, model and launch line). One smoke per alias per run.
+
+Thread semantics: `thread=` in `.meta` is the child's `session_id` from the stream's `init`
+event. `--resume-last` resumes the session recorded in `<dir>/.ccr-last-session` (written by
+every completed ccr launch in the directory); `--resume-session <id>` names one explicitly
+(needed when several ccr participants share a directory); `--fresh` starts a new session.
+`--max-turns <N>` (default 100) bounds the child's agentic turns; both options are ccr-only.
+
+Sidecars keep their names and meaning: `.joblog` is the raw stream-json, `.stdout` the `result`
+event's text verbatim, `.progress` lines `elapsed status=running|exited idle=Ns | last event`, the
+first line `launched backend=ccr pid=<pid> pgid=<pgid> alias=<alias>` (the child runs in its own
+process group; stall or timeout signals the whole group and exit 5 means a member survived).
+`.meta` adds `backend=ccr`, `alias=`, `provider=`, `provider_model=`, `claude_model_id=`,
+`compatibility=`, `ccr_version=`, `pid=`, `pgid=`, `child_exit=`. The exit table is identical.
+The `--model`/`--effort` prohibition below applies to the codex backend; for ccr the alias IS the
+model choice and is the user's.
+
+Plan mode's own plan file under `~/.claude/plans/` is the one write a ccr child may make outside
+the artifact directory (Claude Code writes it when a plan-mode session ends); it holds nothing
+the run relies on.
 
 ## Thread semantics
 

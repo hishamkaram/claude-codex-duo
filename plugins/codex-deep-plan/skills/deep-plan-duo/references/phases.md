@@ -136,3 +136,34 @@ Then the completion gate in SKILL.md, then the plan-mode handoff.
 Question mode: fill `templates/ANSWER.md` instead — the answer in one paragraph, the evidence
 rows it rests on, what Codex's blind round added or disputed, and the defects found (if any) with
 the sentence "say 'plan it' to turn these into a plan". Print it; never enter plan mode.
+
+### Implementer handoff (`--implement ccr:<alias>`, after plan-mode approval only)
+
+Plan mode is the approval; the implementer is what happens next when the user asked for it.
+When `meta.json` carries `implement` and `ExitPlanMode` returned approval:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/scripts/implement-run.sh "$ART/implement" --via ccr:<alias> \
+    --repo "$REPO" --base "$BASE_SHA" --branch "plan/<slug>" --plan "$ART/PLAN.md" \
+    [--test-cmd "<the test command PLAN.md names>"]... [--max-min 90] [--stall-min 15]   # background
+```
+
+It is the only write-capable launcher in the plugin and a different script from the read-only
+runner: it creates `<ART>/worktree` on a new branch at the base SHA (`git worktree add -b`), writes
+the brief it will execute (`implement.brief.md` = fixed header + `PLAN.md` verbatim, digest in
+`implement.plan.sha256`), and launches `ccr launch --model <alias> --permission-mode acceptEdits`
+inside the worktree with the same stream, stall, timeout, process-group and exit contract as the
+runner. Sidecars: the usual six plus `.diff` (commits made on the branch), `.worktree`,
+`.brief.md`, `.plan.sha256`. The user's checkout, index and refs are untouched; the branch is the
+deliverable and the worktree is never removed by the plugin.
+
+When it exits, report: outcome and exit code, branch, worktree path, commit count and
+uncommitted-path count from `.meta`, the sidecar paths, and the ready-to-paste review command
+`/codex-pr-review:review-pr plan/<slug> <base-sha> "<the plan's summary line>"`. Exit 1/2/3 is
+reported as such with `.stderr` and the last `.progress` lines; exit 5 means a process may still
+be running (quote the `pgid=` and stop). Never relaunch over an existing worktree or branch: the
+script refuses, and the user decides what to do with the partial branch.
+
+With `--no-plan-mode`, when the outcome is `DECISION-REQUIRED.md`, or when the plan was not
+approved, do not launch: print the command above so the user can run it after approving.
+
