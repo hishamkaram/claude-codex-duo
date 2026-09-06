@@ -7,6 +7,8 @@
 #     Captures the aggregate working tree (staged + unstaged + deleted + non-ignored untracked) as a TREE
 #     object via an artifact-local scratch index, never touching the repo's index, refs, stash or files.
 #     Writes <out>.tree (the tree SHA) and <out>.baseline (NUL-separated status). Exit 3 = nothing to review.
+#     Both modes write <out>.repo (canonical repository path), <out>.base (base commit) and <out>.head (reviewed head: the snapshot tree or the head commit);
+#     phase-gate.sh pins Phase-5 citations to those two revisions.
 set -euo pipefail
 SK="$(cd "$(dirname "$0")/.." && pwd)"
 USAGE='usage: build-brief.sh --repo <path> --base-ref <name> --base <sha> (--head-ref <name> --head <sha> | --head WORKTREE) \\
@@ -27,6 +29,9 @@ if [ "$HSHA" != "WORKTREE" ] && [ -z "${HREF:-}" ]; then die2 "--head-ref is req
 [ -r "$INTENT" ] || die2 "--intent-file not readable: $INTENT"
 [ -r "$CONV" ] || die2 "--conventions-file not readable: $CONV"
 REPO="$(cd "$REPO" && pwd -P)"; OUTDIR="$(cd "$(dirname "$OUT")" && pwd -P)"
+# Full object ids only: the gates pin citations to the 40-hex ids in the brief's Target lines.
+BSHA=$(git -C "$REPO" rev-parse --verify --quiet "$BSHA^{commit}") || die2 "--base does not resolve to a commit in $REPO"
+if [ "$HSHA" != "WORKTREE" ]; then HSHA=$(git -C "$REPO" rev-parse --verify --quiet "$HSHA^{commit}") || die2 "--head does not resolve to a commit in $REPO"; fi
 case "$OUTDIR" in "$REPO"/*|"$REPO") echo "refusing: --out must be outside the repository (scratch index would leak into the snapshot)" >&2; exit 2;; esac
 HEADNOTE=""
 if [ "$HSHA" = "WORKTREE" ]; then
@@ -52,6 +57,7 @@ else
   FILES=$(git -C "$REPO" diff --name-only "$BSHA..$HSHA" | LC_ALL=C sort | sed 's/^/  - /')
   DIFFCMD="git diff ${BSHA}..${HSHA}"
 fi
+printf '%s\n' "$BSHA" > "$OUT.base"; printf '%s\n' "$HSHA" > "$OUT.head"; (cd "$REPO" && pwd -P) > "$OUT.repo"
 python3 - "$SK" "$REPO" "$BREF" "$BSHA" "$HREF" "$HSHA" "$INTENT" "$CONV" "$OUT" "$FILES" "$DIFFCMD" "$HEADNOTE" <<'PY'
 import sys,re
 sk,repo,bref,bsha,href,hsha,intent,conv,out,files,diffcmd,headnote=sys.argv[1:]

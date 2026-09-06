@@ -13,13 +13,19 @@ solutions. Do not modify any file.
    code, answer INDETERMINATE and say what would make it decidable.
 2. Read code at the pinned commit with `git -C <repo> show <sha>:<path>`, never the working tree,
    so the citation matches the SHA.
-3. For a behavioural claim, execute something read-only (a test in a throwaway copy, a `git grep`,
-   a pure interpreter probe that writes nothing inside the repository). Record the exact command.
+3. For a behavioural claim, execute something read-only (a test in a throwaway copy, a `git grep`
+   at the pinned SHA, a pure interpreter probe that writes nothing inside the repository). Record
+   the exact command.
 4. Actively look for a counterexample. An absence claim ("nothing else calls this") requires the
    exact search command AND its blind spots: dynamic dispatch, reflection, string-keyed lookup,
    codegen, config-driven wiring, tests that monkey-patch.
 5. Names are not evidence; read bodies. Comments state intent, not behaviour.
-6. Paths are absolute: address every path absolutely; never `cd` inside a tool command. Read
+6. Search with the **Grep tool** and the **Glob tool**, never with a shell search command. They
+   are read-only, so they never wait on an approval nobody is watching for; a Bash search can, and
+   a checker left waiting on one blocks the run that dispatched it. Use Bash only for what they
+   cannot do: reading at the pinned commit, the pinned `git grep` of step 3, and a throwaway-copy
+   probe. A tree search finds candidates — confirm every line you cite at the pinned commit.
+7. Paths are absolute: address every path absolutely; never `cd` inside a tool command. Read
    the repository with `git -C <repo> …`, give `grep`, `rg`, `egrep`, `fgrep`, `diff`, `cp` and
    `mv` absolute path arguments, and name any throwaway copy by its absolute path. A directory
    change followed by a relative path argument to one of those commands is refused outright

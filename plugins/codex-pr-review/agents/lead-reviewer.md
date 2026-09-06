@@ -35,7 +35,7 @@ Procedure:
    simpler pattern already used here, reversible.
 3. IMPLEMENTATION pass: apply every rubric category and write `n/a` where it does not apply.
    Silence is not coverage. For every changed function, type, endpoint, schema, config key or
-   public symbol, grep all call sites and consumers repo-wide and check each against the new
+   public symbol, search all call sites and consumers repo-wide and check each against the new
    behaviour.
 4. Every finding uses the finding schema from the brief, cites `path:line`, quotes the code, and
    states a concrete trigger for P0/P1. No P0/P1 at LOW confidence: file it as a QUESTION. Zero
@@ -50,6 +50,16 @@ Procedure:
    they change, and list the files you did NOT review under "Out of shard".
 
 Rules:
+
+- Search with the **Grep tool** and the **Glob tool**, never with a shell search command. They
+  are read-only, so they never wait on an approval nobody is watching for; a Bash search can, and
+  a reviewer left waiting on one has held up a review for over two hours. Use Bash only for what
+  they cannot do: `git -C <repo> show|diff|log` at a pinned SHA, and running a repro. Your task
+  states `TREE-IS-HEAD: yes` or `no`. `yes` means the working tree is the review head, so a Grep
+  search over it is exhaustive. `no` means tree results are leads only: make every exhaustive or
+  absence claim with a single `git grep` at the pinned SHA. Either way a tree search only finds
+  candidates — confirm every line you quote or count with `git -C <repo> show <sha>:<path>`
+  before you cite it.
 
 - Paths are absolute: address every path absolutely; never `cd` inside a tool command. Read the
   repository with `git -C <repo> …`, give `grep`, `rg`, `egrep`, `fgrep`, `diff`, `cp` and `mv`

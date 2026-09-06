@@ -25,15 +25,19 @@ description. Then: whether that matches the stated intent.}}
 ## 5. QUESTIONS FOR THE AUTHOR
 {{...}}
 
-## 6. DISAGREEMENT LOG
+## 6. CONSULTATION & DISAGREEMENT LOG
 BOTH: {{n}} | CLAUDE-ONLY: {{n}} | CODEX-ONLY: {{n}} | CONFLICT: {{n}}
-Codex status: {{SUCCEEDED | UNAVAILABLE | FAILED | DECLINED — reason}} · job ids: {{from 02-codex.meta / 05-exchange-*.meta}}
-Lead: {{`codex-pr-review:lead-reviewer` task <id> | general-purpose fallback (reason) | in-context fallback (reason)}} · join: {{JOIN-OK line from 03-matrix.md}}
+Selection: {{candidate count}} candidates · {{exact selector artifact and predicate summary}}
+Consultation: {{COMPLETE | SKIPPED — reason}} · dispositions: {{selected/returned ID equality}} · job ids: {{from 04-consultation*.meta}}
+Verification: {{every P0–P3 finding verified from normalized evidence-only packets}}
+Residual resolution: {{COMPLETE | SKIPPED — reason}} · job ids: {{from 06-resolution*.meta}}
+Codex status: {{SUCCEEDED | UNAVAILABLE | FAILED | DECLINED — reason}} · blind job id: {{from 02-codex.meta}} · unified budget: {{successful responses}}/2 responses, {{launches}}/4 launches
+Lead: {{`codex-pr-review:lead-reviewer` task <id> | general-purpose fallback (reason) | in-context fallback (reason)}} · join: {{JOIN-OK line from 03-matrix.md}} · review seal: {{unchanged | not applicable}}
 Blindness: procedural (neutral packets hashed before any finding + lead sealed before any Codex output was read + lead in its own context + mode-000 defense-in-depth); not structurally guaranteed. {{Concurrency: the two reviews overlapped from <lead start> to <first end> (00-run.md) | single-model run: no cross-review, nothing ran concurrently}}
 {{every UNRESOLVED item with both positions and strongest evidence for each}}
 
 **Escalate one at a time (optional):** for each UNRESOLVED item, a ready-to-paste line:
-`/debate "{{finding title as a falsifiable defect claim, with path:line}}" hypothesis 3 --seed {{artifact dir}}/04-verification.md`
+`/debate "{{finding title as a falsifiable defect claim, with path:line}}" hypothesis 3 --seed {{artifact dir}}/05-verification.md`
 
 ## 7. FALSE-POSITIVE APPENDIX
 {{every claim either model raised and refuted, with the refuting evidence.

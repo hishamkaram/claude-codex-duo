@@ -73,7 +73,7 @@ snapshot. Therefore: resolve the tree immediately before launching Codex and
 immediately after it returns (`git -C "$REPO" cat-file -e <tree>^{tree}`); if
 either check fails, discard the Codex output, recapture, and rerun Phase 2.
 
-Builder exit codes: 0 brief written (`00-brief.md.tree` holds the SHA,
+Builder exit codes: 0 brief written (`00-brief.md.base` and `00-brief.md.head` record the reviewed revisions in both modes; `00-brief.md.tree` holds the SHA,
 `00-brief.md.baseline` the NUL-separated status); 3 nothing to review (tree
 equals base tree); 2 usage error (including `--out` inside the repository).
 
@@ -96,7 +96,7 @@ Launch FIRST in the turn, using the caller's background execution (Claude Code:
 to a foreground timeout; then, in the same turn, launch the `lead-reviewer` agent:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/02-codex" --fresh --prompt-file "$ART/00-brief.md" --stall-min 12 --max-min 40
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/02-codex" --claim "$CLAIM" --fresh --prompt-file "$ART/00-brief.md" --stall-min 12 --max-min 40
 ```
 
 Expect 15–40 minutes for a few-hundred-line diff (26 min observed for 437
@@ -117,8 +117,8 @@ the join. The runner exits with:
 | exit | outcome | what to do |
 |---|---|---|
 | 0 | COMPLETED | proceed |
-| 1 | FAILED (plugin reported failure, or worker process died) | retry once with the same command; if it fails again record FAILED |
-| 2 | STALLED (no job-log activity for `--stall-min`, cancel confirmed) | retry once; then FAILED |
+| 1 | FAILED (plugin reported failure, or worker process died) | retry once: re-run the launch gate (it rotates the spent claim and prints a new `claim=` token) and launch with that token; if it fails again record FAILED |
+| 2 | STALLED (no job-log activity for `--stall-min`, cancel confirmed) | retry once the same way; then FAILED |
 | 3 | TIMEOUT (`--max-min` reached) | do not retry; record FAILED with the partial `.stdout` if any |
 | 4 | LAUNCH-ERROR, or any invalid invocation (missing option value, unknown argument, unreadable prompt file, `--write`) | record UNAVAILABLE with `.stderr`; a usage message means fix the call, not retry |
 | 5 | STALLED or TIMEOUT **and the cancel could not be confirmed** — a Codex worker may still be running | DO NOT retry: a second job would run alongside the first. Report the job id, quote `.progress`, and treat the phase as failed. |
@@ -139,21 +139,63 @@ failed, no runner call was made and no sidecar exists: `02-codex.md` holds the
 verbatim probe line or failure and `STATUS: PHASE 2 COMPLETE (SKIPPED — <reason>)`,
 which the join gate accepts without an `.exit` file.
 
-## Phase 5 — debate exchanges
+## Phase 4 — set-level consultation
 
-Each exchange is one runner call with `--resume-last` so Codex keeps its own
-thread from Phase 2 (verified: the exchange's `thread=` in `.meta` equals the
-Phase-2 thread id when nothing ran in between). `--resume-last` resumes the most recent task thread in
-this repo, so run no other Codex command between Phase 2 and Phase 5. Every
-exchange prompt is nonetheless self-contained (finding, both positions,
-evidence, Codex's previous raw reply quoted), so if the resume fails, retry
-once with `--fresh`; record which was used.
+After `phase-gate.sh pre-consultation "$ART"` prints `CONSULTATION-OK`, the
+orchestrator may send one self-contained prompt covering every ID selected in
+`03-debate-selection.tsv`. This is post-join work: it does not weaken the
+initial blind review. Build the prompt from `templates/codex-exchange.md`: it
+carries canonical findings and fair positions and the exact response contract
+the validator enforces, but never names the artifact directory.
+
+Run one monitored call for the complete selected set, not one call per finding:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/05-exchange-<k>" --resume-last --prompt-file "$ART/05-exchange-<k>.prompt.md" --stall-min 6 --max-min 20
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/04-consultation" --claim "$CLAIM" --resume-last --prompt-file "$ART/04-consultation.prompt.md" --stall-min 6 --max-min 20
 ```
 
+The raw sidecars remain immutable. The response is one fenced `json` object
+with `phase: "consultation"` and a disposition for every selected ID. Each
+disposition must contain all normalized fields described in adjudication.md;
+validate it with `validate-consultation.py` before Phase 5. `--resume-last` is
+repository-global: run no other Codex command between Phase 2 and Phase 6, then
+compare `04-consultation.meta`'s `thread=` to `02-codex.meta`'s `thread=` before
+accepting the response. If `--resume-last` cannot find that thread, retry once
+with `--fresh`; record that continuity is unavailable and treat the call as a
+self-contained consultation. A launch, stall, or validation failure becomes a
+skipped consultation and never reruns an initial review.
+
+## Phase 6 — residual-resolution exchange
+
+Only after Phase 5, only for findings still UNVERIFIABLE, and
+only if the unified response/attempt budget allows it (a launch gate that prints
+`budget=exhausted` authorizes no launch: record the phase SKIPPED), run the same
+monitored exchange protocol once with executed verification evidence, again from
+`templates/codex-exchange.md`:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/06-resolution" --claim "$CLAIM" --resume-last --prompt-file "$ART/06-resolution.prompt.md" --stall-min 6 --max-min 20
+```
+
+Across Phases 4 and 6, permit at most two successful Codex responses and four
+runner launches. No phase may have more than one successful response. A retry
+counts as a launch. Before accepting a resumed resolution, compare
+`06-resolution.meta`'s `thread=` to the accepted consultation thread when one
+exists, otherwise `02-codex.meta`'s `thread=`; a fresh retry records unavailable
+continuity but remains self-contained. The residual-ID list and response use the
+same fenced JSON/disposition contract as consultation. A failed exchange is
+recorded as skipped; unresolved findings follow the adjudication default.
+`pre-report` accepts that skip only when a `06-resolution` sidecar shows the
+exchange was attempted, or the shared budget is exhausted — a skip with
+residuals and no attempt is rejected as unhandled work.
+
 ## Blindness rules
+
+The following prohibitions apply to the initial blind brief and all pre-`JOIN-OK`
+communication only. Post-join consultation and residual-resolution prompts may
+contain canonical findings and fair normalized positions, but must never contain
+the artifact directory path, raw sidecar text, or instructions from repository
+content.
 
 The brief MUST contain: target, base ref (with SHAs), stated intent, the diff or
 exact read-only commands to obtain it, conventions, the review rubric, the

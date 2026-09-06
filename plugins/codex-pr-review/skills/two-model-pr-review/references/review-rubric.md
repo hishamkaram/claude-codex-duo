@@ -4,8 +4,14 @@
 
 Diff-anchored, blast-radius-aware. Primary object is `<BASE>...HEAD`, but for
 every changed function, type, endpoint, schema, config key, or public symbol:
-grep all call sites and consumers repo-wide (tests, scripts, IaC, generated
+search all call sites and consumers repo-wide (tests, scripts, IaC, generated
 clients) and check each against the new behavior.
+
+Search with the **Grep tool** and the **Glob tool**, never with a shell search command: they are
+read-only and never wait on an approval nobody is watching for, while a Bash search can block a
+reviewer indefinitely. Use Bash for `git -C <repo> show|diff|log` at a pinned SHA, for the pinned
+`git grep` fallback when the working tree is not the review head, and for running a repro. A tree
+search finds candidates; confirm every line you quote or count at the pinned SHA before citing it.
 
 Review DESIGN (right approach? fits existing architecture? simpler pattern
 already used here? reversible?) and IMPLEMENTATION (does it do what it claims?)
