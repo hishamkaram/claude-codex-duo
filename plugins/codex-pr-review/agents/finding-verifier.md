@@ -58,6 +58,14 @@ Output only this, nothing else:
     snapshot tree or head commit named in your prompt) or the base commit — a hex id, never HEAD or
     another commit: the review gate resolves it in the repository and rejects the verdict otherwise. A cmd: line documents what you ran; on its
     own it cannot confirm or refute, because nobody can re-verify output after the fact.
+    For a CONFIRMED P0 or P1, at least one citation must be a CHANGE ANCHOR: a path the reviewed
+    change actually touches (`git diff <base> <head> --name-only`). Confirming a blocking finding
+    asserts this change is unsafe to merge, so the evidence must point at something the change did.
+    If the defect is in unchanged code that a changed caller newly reaches, cite the changed line
+    that reaches it — that is the anchor — and give the unchanged site as a further citation. If the
+    behaviour is identical at base and head the finding is pre-existing and is not a P0/P1 for this
+    change; say so. List the anchor FIRST: only your strongest citation reaches the ledger, and the
+    gate rejects a CONFIRMED P0/P1 whose recorded citation has no anchor. REFUTED and P2/P3 are exempt.
     TRIGGER: <the concrete input, state or call sequence that reproduces it, or "none established">
     SEVERITY_NOTE: <one line if the evidence changes the claimed severity, else "unchanged">
     REFUTATION_SEARCHED: <what you looked for that would have refuted it>

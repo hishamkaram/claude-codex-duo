@@ -54,16 +54,99 @@ def fail(message: str) -> None:
     raise SystemExit(1)
 
 
-def manifest_ids(matrix: Path) -> set[str]:
-    ids = set()
+def manifest_rows(matrix: Path) -> dict[str, str]:
+    """Every matrix id mapped to its severity ("" when the row carries none).
+
+    The severity column is already in 03-matrix.tsv (id<TAB>origin<TAB>severity); it used to be
+    discarded here. The change-anchor rule below needs it to tell a blocking finding from a nit,
+    and reading it costs nothing extra.
+    """
+    rows: dict[str, str] = {}
     for line in matrix.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or line.startswith("STATUS:"):
             continue
-        head = line.split("\t")[0]
-        if ID_RE.fullmatch(head):
-            ids.add(head)
-    return ids
+        parts = line.split("\t")
+        if ID_RE.fullmatch(parts[0]):
+            rows[parts[0]] = parts[2].strip().upper() if len(parts) > 2 else ""
+    return rows
+
+
+_changed: dict[tuple[str, str, str], set[str] | None] = {}
+
+
+def changed_paths(repo: str, base: str, head: str) -> set[str] | None:
+    """Paths the reviewed change touches, or None when git cannot answer.
+
+    build-brief.sh pins the base to the merge base in range mode, so `base..head` here is the
+    rubric's `<BASE>...HEAD` — what this change introduces, not what the trunk did meanwhile.
+    """
+    key = (repo, base, head)
+    if key not in _changed:
+        # -z, not plain --name-only: git C-quotes any path outside its "safe" set, so
+        # `src/café.py` comes back as `"src/caf\303\251.py"` while the citation parser yields the
+        # real path. Comparing those two strings would reject a valid blocking finding for
+        # touching a file the change demonstrably touched. NUL-delimited output is never quoted.
+        proc = subprocess.run(
+            ["git", "-C", repo, "diff", "--name-only", "-z", f"{base}..{head}"], capture_output=True
+        )
+        _changed[key] = (
+            {p for p in proc.stdout.decode("utf-8", errors="replace").split("\0") if p}
+            if proc.returncode == 0
+            else None
+        )
+    return _changed[key]
+
+
+def anchor_error(value: str, repo: str, head: str | None, base: str | None) -> str | None:
+    """Why a blocking finding's evidence is not anchored in the reviewed change, or None.
+
+    A P0/P1 says this change is not safe to merge, so its recorded evidence must point at
+    something the change actually did. Nothing else in the pipeline tests this: citation_error
+    accepts any path that exists at head or base, which is how findings about untouched trunk
+    code reached P1 in a production run.
+
+    Deliberately narrow:
+      * CONFIRMED P0/P1 only. A REFUTED verdict often cites the base precisely to show the
+        problem predates the change, and P2/P3 are not merge-blocking.
+      * `cmd:` evidence is exempt — it carries no path, and citation_error already refuses to let
+        it confirm anything on its own.
+      * A finding on unchanged code that a changed caller newly reaches keeps its anchor in the
+        diff and passes; the rubric requires that repo-wide consumer search and this must not
+        punish it.
+    """
+    if not head or not base:
+        return None
+    value = normalize_evidence(value)
+    if value.startswith("cmd:"):
+        return None
+    m = CITATION_RE.match(value)
+    if not m:
+        return None  # shape is citation_error's business, not ours
+    path = m.group("path")
+    if path.startswith('"'):
+        path = path[1:-1]
+    changed = changed_paths(repo, base, head)
+    if changed is None:
+        return None  # git could not answer; citation_error already proved the revisions resolve
+    if not changed:
+        # An empty comparison makes every path "untouched", so the test has no discriminating
+        # power and would reject every blocking finding on no evidence. It means base == head:
+        # `git diff A..B` takes two ENDPOINTS, not a revision range, so a snapshot tree diffs
+        # against a commit perfectly well and worktree mode reaches this function with a real
+        # change set. A run whose diff is genuinely empty is refused far earlier — build-brief.sh
+        # exits 3 rather than build a brief for it — so in practice this guard only covers
+        # fixtures and a base that was pinned to the head by hand.
+        return None
+    if path in changed:
+        return None
+    return (
+        f"evidence cites {path}, which the reviewed change does not touch: a blocking finding "
+        f"must anchor its evidence in a path inside {base[:12]}..{head[:12]}. If the defect is in "
+        f"unchanged code that this change newly reaches, cite the changed line that reaches it and "
+        f"name the affected site among the other locations; if it is pre-existing, it belongs in "
+        f"the non-blocking list, not at P0/P1"
+    )
 
 
 def evidence_ok(value: str) -> str | None:
@@ -160,6 +243,8 @@ def main() -> None:
         fail("--matrix and --verdicts must be readable files")
     if args.repo and subprocess.run(["git", "-C", args.repo, "rev-parse", "--git-dir"], capture_output=True).returncode != 0:
         fail(f"--repo {args.repo} is not a git repository")
+    # Read once, before the row loop: the anchor rule needs each finding's severity.
+    severities = manifest_rows(matrix)
     seen: dict[str, str] = {}
     for number, raw in enumerate(ledger.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
@@ -194,8 +279,13 @@ def main() -> None:
                 err = citation_error(normalize_evidence(evidence), args.repo, args.head, args.base)
                 if err:
                     fail(f"row {number}: {fid} is {verdict} but its {err}")
+                # A CONFIRMED blocking finding must also be anchored in the change itself.
+                if verdict == "CONFIRMED" and severities.get(fid, "") in ("P0", "P1"):
+                    err = anchor_error(normalize_evidence(evidence), args.repo, args.head, args.base)
+                    if err:
+                        fail(f"row {number}: {fid} is CONFIRMED {severities[fid]} but its {err}")
         seen[fid] = verdict
-    ids = manifest_ids(matrix)
+    ids = set(severities)
     if set(seen) != ids:
         fail(f"verdict IDs differ from manifest (missing={sorted(ids - set(seen)) or 'none'} extra={sorted(set(seen) - ids) or 'none'})")
     print(f"OK verdicts={len(seen)}")

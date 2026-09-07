@@ -47,7 +47,10 @@ Every unit launched in the background gets the same pair of `agent-watch.sh` job
 gives the lead (SKILL.md §Join turn): one advisory, one deadline. A background job notifies once,
 at exit, so two single-purpose watchers are what produce an advisory and, later, a deadline.
 
-- **Lead shards.** One pair per shard, `--expect "$ART/01-lead.<shard>.md"`.
+- **Lead shards.** One pair per shard, `--expect "$ART/01-lead.<shard>.md" --expect-mode 000`. A
+  shard reviewer publishes and seals its file exactly as the lead does, so mode 000 is what marks
+  it finished; without `--expect-mode` both watchers clear the instant the file appears and
+  supervise nothing. Use the same 50 / 90-minute windows as the join turn.
 - **Phase 5.** A verifier agent itself returns a structured object and writes no file of its own —
   the `findings` the orchestrator passes to the script are the packets `pre-verification` generated
   into `05-verifier-packets.ndjson`, one per line, unchanged (see `references/adjudication.md`) — so
@@ -100,12 +103,17 @@ Copy each verdict into `05-verification.md` under its finding with the method us
 The shard manifest comes from the Phase 0 subsystem table. The script refuses to spawn anything
 unless every changed file is owned by exactly one shard and every shard file is a changed file
 (unowned, duplicate or unknown paths are listed in the error). One `lead-reviewer` per shard
-(parallel), each writing and sealing `01-lead.<shard>.md`, each still searching consumers
-repo-wide for the symbols its files change. Merge only after Codex has finished OR before
+(parallel), each PUBLISHING `01-lead.<shard>.md` atomically — one write to
+`01-lead.<shard>.md.part`, `chmod 000`, then rename — exactly as `agents/lead-reviewer.md` step 6
+requires, each still searching consumers repo-wide for the symbols its files change. The rename
+is what makes `--expect-mode 000` a completion test for the shard watchers above; a shard file
+created readable and sealed afterwards leaves a window in which it is a readable copy of a review.
+Merge only after Codex has finished OR before
 opening any `02-p<k>.*` file: `chmod 600` the shard files, concatenate them under one heading
 per shard with the per-shard coverage table the rubric already requires, add a "Cross-shard"
-section with anything you see spanning shards, write `01-lead.md`, `chmod 000` it, `chmod 000`
-every shard file again, and only then run `phase-gate.sh pre-phase3`. `pre-codex` refuses a
+section with anything you see spanning shards, publish `01-lead.md` the same atomic way
+(`01-lead.md.part`, `chmod 000`, rename), `chmod 000` every shard file again, and only then run
+`phase-gate.sh pre-phase3`. `pre-codex` refuses a
 resumed run while any `01-lead*.md` is readable. The shard files are never sent to Codex. Shard
 names must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}`; file lists reach each agent JSON-encoded, so
 a path with a newline or quote stays one token.

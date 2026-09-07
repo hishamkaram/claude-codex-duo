@@ -33,14 +33,15 @@ top_up_claims() {
 }
 fixture_revs() {  # what build-brief.sh (.base/.head), Phase 0 (00-participants.tsv) and pre-codex (00-repo.txt, 00-schema) record in a real run
   [ -e "$1/00-participants.tsv" ] || printf 'p1\tcodex\t-\n' > "$1/00-participants.tsv"
-  [ -e "$1/00-schema" ] || printf 'codex-pr-review/4\n' > "$1/00-schema"
+  [ -e "$1/00-schema" ] || printf 'codex-pr-review/5\n' > "$1/00-schema"
   [ -e "$1/00-brief.md.repo" ] || (cd "$G2" && pwd -P) > "$1/00-brief.md.repo"
   [ -e "$1/00-brief.md.base" ] || printf '%s\n' "$SHA2" > "$1/00-brief.md.base"
   [ -e "$1/00-brief.md.head" ] || printf '%s\n' "$SHA2" > "$1/00-brief.md.head"
   [ -e "$1/00-repo.txt" ] || printf 'repo=%s\nbase=%s\nhead=%s\n' "$(cd "$G2" && pwd -P)" "$SHA2" "$SHA2" > "$1/00-repo.txt"
+  [ -e "$1/00-brief.md.scope.json" ] || printf '{"schema":"scope/1","mode":"range","merge_base_applied":false,"excluded_by_merge_base":[],"excluded_count":0}\n' > "$1/00-brief.md.scope.json"
 }
 mkbrief() {  # a brief whose Target section restates fixture_revs: the gate pins 00-repo.txt to it (round-38 CX-02)
-  printf -- '- Repository: %s\n- Head: `HEAD` (%s)\n- Base: `HEAD` (%s)\nbrief\n' "$(cd "$G2" && pwd -P)" "$SHA2" "$SHA2" > "$1/00-brief.md"
+  printf -- '- Repository: %s\n- Tier: compact-v1\n- Head: `HEAD` (%s)\n- Requested base: `HEAD` (%s)\n- Base: `HEAD` (%s)\nbrief\n' "$(cd "$G2" && pwd -P)" "$SHA2" "$SHA2" "$SHA2" > "$1/00-brief.md"
 }
 # File mode, portable: GNU stat (-c) on Linux, BSD stat (-f) on macOS — the same detection phase-gate.sh uses.
 if stat --version >/dev/null 2>&1; then fmode() { stat -c %a "$1" 2>/dev/null; }; else fmode() { stat -f %Lp "$1" 2>/dev/null; }; fi
@@ -391,6 +392,80 @@ bash "$B" --repo "$G" --base-ref HEAD --base "$BASE" --head WORKTREE --intent-fi
 [ "$(cksum "$G/.git/index" | cut -d' ' -f1)" = "$IDX_BEFORE" ] && printf '  ok    %-42s\n' "repository index untouched" || { printf '  FAIL  index mutated\n'; FAIL=1; }
 grep -q '^  - b.txt  (A)$' "$TMP/dirty.md" && printf '  ok    %-42s\n' "untracked file listed as added" || { printf '  FAIL  untracked file missing from brief\n'; FAIL=1; }
 [ -e "$TMP/tmp-index" ] || ls "$TMP"/tmp-index.* >/dev/null 2>&1 && { printf '  FAIL  scratch index left behind\n'; FAIL=1; } || printf '  ok    %-42s\n' "scratch index cleaned up"
+
+echo "builder: the merge-base correction (review-rubric.md makes the object <BASE>...HEAD)"
+# A trunk that moved on after the branch diverged. With a two-dot diff against the trunk TIP the
+# trunk's own commits appear as deletions BY THE PR, which is how findings about untouched trunk
+# code reached P1 in production. The builder must review from the fork point instead.
+MB="$TMP/mbrepo"; mkdir -p "$MB"
+( cd "$MB" && git init -q && git config user.email t@t && git config user.name t \
+  && echo shared > shared.txt && git add -A && git commit -qm base && git branch -q feature \
+  && echo trunk > trunk-only.txt && git add -A && git commit -qm "trunk work after divergence" \
+  && git checkout -q feature && echo pr > pr-only.txt && git add -A && git commit -qm "the PR work" ) >/dev/null 2>&1
+MBB=$(git -C "$MB" rev-parse main 2>/dev/null || git -C "$MB" rev-parse master)
+MBH=$(git -C "$MB" rev-parse feature); MBM=$(git -C "$MB" merge-base "$MBB" "$MBH")
+bash "$B" --repo "$MB" --base-ref main --base "$MBB" --head-ref feature --head "$MBH" \
+  --intent-file "$PROMPT" --conventions-file "$PROMPT" --out "$TMP/mb.md" >/dev/null 2>&1
+code=$?
+[ $code -eq 0 ] && [ "$(cat "$TMP/mb.md.base" 2>/dev/null)" = "$MBM" ] \
+  && printf '  ok    %-42s\n' "non-ancestor base → merge base" \
+  || { printf '  FAIL  merge-base: exit=%s base=%s want=%s\n' "$code" "$(cat "$TMP/mb.md.base" 2>/dev/null)" "$MBM"; FAIL=1; }
+grep -q '^  - pr-only.txt$' "$TMP/mb.md" && ! grep -q 'trunk-only.txt' "$TMP/mb.md" \
+  && printf '  ok    %-42s\n' "trunk-only work is out of scope" \
+  || { printf '  FAIL  scope still contains trunk work\n'; FAIL=1; }
+# The Base line reaches an ANCHORED parser in phase-gate.sh: the annotation must live inside the
+# backticked ref field, and exactly one line may match.
+n=$(sed -n 's/^- Base: `[^`]*` (\([0-9a-f]\{40\}\))$/\1/p' "$TMP/mb.md" | wc -l | tr -d ' ')
+[ "$n" = 1 ] && [ "$(sed -n 's/^- Base: `[^`]*` (\([0-9a-f]\{40\}\))$/\1/p' "$TMP/mb.md")" = "$MBM" ] \
+  && printf '  ok    %-42s\n' "gate Base regex still parses the brief" \
+  || { printf '  FAIL  Base line unparseable by the gate (matches=%s)\n' "$n"; FAIL=1; }
+grep -q '^- Requested base: `main`' "$TMP/mb.md" && printf '  ok    %-42s\n' "requested base recorded beside it" || { printf '  FAIL  requested base missing\n'; FAIL=1; }
+python3 -c "
+import json,sys
+d=json.load(open('$TMP/mb.md.scope.json'))
+sys.exit(0 if d['merge_base_applied'] and d['excluded_by_merge_base']==['trunk-only.txt'] and d['mode']=='range' else 1)" \
+  && printf '  ok    %-42s\n' "scope sidecar names what it excluded" || { printf '  FAIL  scope sidecar wrong\n'; FAIL=1; }
+# Unrelated histories share no ancestor: the comparison is undefined and guessing reviews a scope
+# nobody chose.
+UR="$TMP/unrelated"; mkdir -p "$UR"
+( cd "$UR" && git init -q && git config user.email t@t && git config user.name t && echo x > x.txt && git add -A && git commit -qm one \
+  && git checkout -q --orphan other && git rm -q -rf . && echo y > y.txt && git add -A && git commit -qm two ) >/dev/null 2>&1
+URA=$(git -C "$UR" rev-parse main 2>/dev/null || git -C "$UR" rev-parse master); URB=$(git -C "$UR" rev-parse other)
+chk "builder: no common ancestor refused" 2 "no common ancestor" \
+  bash "$B" --repo "$UR" --base-ref main --base "$URA" --head-ref other --head "$URB" --intent-file "$PROMPT" --conventions-file "$PROMPT" --out "$TMP/ur.md"
+chk "builder: unknown tier refused" 2 "compact-v1 or full" \
+  bash "$B" --repo "$MB" --base-ref main --base "$MBB" --head-ref feature --head "$MBH" --intent-file "$PROMPT" --conventions-file "$PROMPT" --out "$TMP/t.md" --tier turbo
+bash "$B" --repo "$MB" --base-ref main --base "$MBB" --head-ref feature --head "$MBH" \
+  --intent-file "$PROMPT" --conventions-file "$PROMPT" --out "$TMP/tf.md" --tier full >/dev/null 2>&1
+grep -q '^- Tier: full$' "$TMP/tf.md" && grep -q '^- Tier: compact-v1$' "$TMP/mb.md" \
+  && printf '  ok    %-42s\n' "tier defaults compact-v1, --tier full honoured" \
+  || { printf '  FAIL  tier line wrong\n'; FAIL=1; }
+# Worktree mode has no commit ancestry to correct, and its base (HEAD) is an ancestor anyway.
+python3 -c "
+import json,sys
+d=json.load(open('$TMP/dirty.md.scope.json'))
+sys.exit(0 if d['mode']=='worktree' and not d['merge_base_applicable'] and not d['merge_base_applied'] else 1)" \
+  && printf '  ok    %-42s\n' "worktree: correction not applicable" || { printf '  FAIL  worktree scope sidecar\n'; FAIL=1; }
+# 05-scope-attribution.tsv records what the correction did to each finding, so "would the old
+# two-dot scope have produced this?" is a lookup rather than archaeology across a run directory.
+SA=plugins/codex-pr-review/skills/two-model-pr-review/scripts/scope-attribution.py
+printf 'F-01\tCLAUDE-ONLY\tP1\nF-02\tCODEX-ONLY\tP1\nF-03\tBOTH\tP3\n' > "$TMP/sa-matrix.tsv"
+printf 'F-01\tCONFIRMED\ttrace\tpr-only.txt:1 "pr"\nF-02\tREFUTED\ttrace\ttrunk-only.txt:1 "trunk"\nF-03\tUNVERIFIABLE\tnone\t\n' > "$TMP/sa-verdicts.tsv"
+sarow() { awk -F'\t' -v id="$2" '$1==id{print $4"|"$5"|"$6"|"$7}' "$1"; }
+out=$(python3 "$SA" --matrix "$TMP/sa-matrix.tsv" --verdicts "$TMP/sa-verdicts.tsv" --scope "$TMP/mb.md.scope.json" --repo "$MB" --out "$TMP/sa.tsv" 2>&1); code=$?
+[ $code -eq 0 ] \
+  && [ "$(sarow "$TMP/sa.tsv" F-01)" = "pr-only.txt|yes|yes|in-scope" ] \
+  && [ "$(sarow "$TMP/sa.tsv" F-02)" = "trunk-only.txt|yes|no|trunk-only" ] \
+  && [ "$(sarow "$TMP/sa.tsv" F-03)" = "-|-|-|unanchored" ] \
+  && printf '  ok    %-42s\n' "scope attribution separates trunk-only findings" \
+  || { printf '  FAIL  scope attribution: exit=%s out=%s rows=[%s]\n' "$code" "$out" "$(cat "$TMP/sa.tsv" 2>/dev/null)"; FAIL=1; }
+# Worktree mode has no second comparison to attribute against: every row must say so rather
+# than guess. Claiming "in-scope" there would be a fabricated audit trail.
+python3 "$SA" --matrix "$TMP/sa-matrix.tsv" --verdicts "$TMP/sa-verdicts.tsv" --scope "$TMP/dirty.md.scope.json" --repo "$G" --out "$TMP/sa-wt.tsv" >/dev/null 2>&1 \
+  && [ "$(sarow "$TMP/sa-wt.tsv" F-01)" = "pr-only.txt|unknown|unknown|unknown" ] \
+  && [ "$(sarow "$TMP/sa-wt.tsv" F-03)" = "-|-|-|unanchored" ] \
+  && printf '  ok    %-42s\n' "worktree run attributes nothing, honestly" \
+  || { printf '  FAIL  worktree attribution: rows=[%s]\n' "$(cat "$TMP/sa-wt.tsv" 2>/dev/null)"; FAIL=1; }
 
 echo "deep-plan: init-plan.sh usage errors exit 2, inputs are pinned verbatim, gh failures exit 3"
 I="$DS/init-plan.sh"
@@ -930,7 +1005,7 @@ out=$(pgw pre-codex "$GA" "$G2" 2>&1); tok=$(printf '%s' "$out" | grep -oE 'clai
 ( cd "$GA" && chk "gate: pre-codex with a relative ART" 0 "PREFLIGHT-OK" bash "$OLDPWD/$PG" pre-codex . "$G2" )
 GN="$TMP/gate-nopre"; mkdir -p "$GN"; printf 'scope\n' > "$GN/00-scope.md"; mkbrief "$GN"; printf 'lead\n' > "$GN/01-lead.md"; chmod 000 "$GN/01-lead.md"; printf 'x\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$GN/02-p1.md"
 chk "gate: pre-phase3 without pre-codex" 1 "pre-codex never ran" pgw pre-phase3 "$GN"
-printf 'lead\n' > "$GA/01-lead.md"; chmod 600 "$GA/01-lead.md"
+printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$GA/01-lead.md"; chmod 600 "$GA/01-lead.md"
 chk "gate: pre-codex, lead readable"   1 "not sealed"           pgw pre-codex "$GA" "$G2"
 chmod 000 "$GA/01-lead.md"
 chk "gate: pre-codex, lead sealed"     0 "PREFLIGHT-OK"         pgw pre-codex "$GA" "$G2"
@@ -994,6 +1069,19 @@ chk "CX-02r22: post-join catches an edited lead body" 1 "initial review bodies c
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$GA/01-lead.md"
 printf 'brief changed\n' > "$GA/00-brief.md"
 chk "gate: post-join, hash mismatch"   1 "changed since"        pgw post-join "$GA"
+
+# R-01: the join gate refuses a lead that never wrote its terminal marker. Before this check
+# pre-phase3 tested only existence, size and mode, so an early placeholder was sealed, hashed and
+# accepted as evidence, and only post-join noticed — after the fact.
+GM="$TMP/gate-marker"; mkdir -p "$GM"; printf 'scope\n' > "$GM/00-scope.md"; mkbrief "$GM"
+printf 'lead\nWORKING — findings to follow\n' > "$GM/01-lead.md"; chmod 000 "$GM/01-lead.md"
+pgw pre-codex "$GM" "$G2" >/dev/null || { printf '  FAIL  R-01: pre-codex fixture\n'; FAIL=1; }
+printf 'PROBE FAILED\nSTATUS: PHASE 2 COMPLETE (SKIPPED — probe failed)\n' > "$GM/02-p1.md"
+chk "R-01: unfinished lead refused at the join" 1 "the lead review is unfinished" pgw pre-phase3 "$GM"
+[ "$(fmode "$GM/01-lead.md")" = 0 ] && printf '  ok    %-42s\n' "R-01: the refused lead stays sealed" || { printf '  FAIL  R-01: lead left at mode %s\n' "$(fmode "$GM/01-lead.md")"; FAIL=1; }
+[ ! -e "$GM/02-review-seal.sha256" ] && printf '  ok    %-42s\n' "R-01: no seal minted over an unfinished lead" || { printf '  FAIL  R-01: seal minted over an unfinished lead\n'; FAIL=1; }
+chmod 600 "$GM/01-lead.md"; printf 'lead\nfindings\nSTATUS: PHASE 1 COMPLETE\n' > "$GM/01-lead.md"; chmod 000 "$GM/01-lead.md"
+chk "R-01: the finished lead joins" 0 "JOIN-OK" pgw pre-phase3 "$GM"
 
 # CX-01r22: pre-codex must refuse to relaunch over an exit-5 / unconfirmed-cancel
 # Phase-2 sidecar even when no seal (and no 02-p1.md) exists.
@@ -1099,7 +1187,7 @@ VP=plugins/codex-pr-review/skills/two-model-pr-review/scripts/validate-provenanc
 PA="$TMP/parts"; mkdir -p "$PA"; printf 'scope\n' > "$PA/00-scope.md"; mkbrief "$PA"
 printf 'p1\tcodex\t-\np2\tccr\tsome-alias\n' > "$PA/00-participants.tsv"
 out=$(pgw pre-codex "$PA" "$G2" 2>&1); rc=$?
-[ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'participants=2' && printf '%s' "$out" | grep -qE 'claim\.p1=[0-9a-f]{16}' && printf '%s' "$out" | grep -qE 'claim\.p2=[0-9a-f]{16}' && [ -d "$PA/02-p1.claim" ] && [ -d "$PA/02-p2.claim" ] && [ "$(cat "$PA/00-schema")" = codex-pr-review/4 ] && [ -s "$PA/00-participants.tsv.sha256" ] && printf '  ok    %-42s\n' "T-16: pre-codex claims every participant" || { printf '  FAIL  T-16: rc=%s out=%s\n' "$rc" "$out"; FAIL=1; }
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'participants=2' && printf '%s' "$out" | grep -qE 'claim\.p1=[0-9a-f]{16}' && printf '%s' "$out" | grep -qE 'claim\.p2=[0-9a-f]{16}' && [ -d "$PA/02-p1.claim" ] && [ -d "$PA/02-p2.claim" ] && [ "$(cat "$PA/00-schema")" = codex-pr-review/5 ] && [ -s "$PA/00-participants.tsv.sha256" ] && printf '  ok    %-42s\n' "T-16: pre-codex claims every participant" || { printf '  FAIL  T-16: rc=%s out=%s\n' "$rc" "$out"; FAIL=1; }
 PN="$TMP/parts-none"; mkdir -p "$PN"; printf 'scope\n' > "$PN/00-scope.md"; mkbrief "$PN"; fixture_revs "$PN"; rm -f "$PN/00-participants.tsv"
 chk "T-16: pre-codex without participants file" 1 "00-participants.tsv missing" bash "$PG" pre-codex "$PN" "$G2"
 printf 'p1\tcodex\t-\np2\tcodex\t-\n' > "$PN/00-participants.tsv"
@@ -1115,13 +1203,13 @@ printf 'p1\tcodex\t-\np2\tccr\tother-alias\n' > "$PA/00-participants.tsv"
 chk "T-17: participants edited after pre-codex" 1 "00-participants.tsv changed since" pgw pre-codex "$PA" "$G2"
 printf 'p1\tcodex\t-\np2\tccr\tsome-alias\n' > "$PA/00-participants.tsv"
 # T-26: the schema marker — missing or another contract fails every gate with the legacy message
-printf 'codex-pr-review/3\n' > "$PA/00-schema"
-chk "T-26: legacy schema marker refused" 1 "legacy run directory" pgw pre-codex "$PA" "$G2"
 printf 'codex-pr-review/4\n' > "$PA/00-schema"
-PL="$TMP/legacy"; mkdir -p "$PL"; printf 'scope\n' > "$PL/00-scope.md"; mkbrief "$PL"; fixture_revs "$PL"; printf 'lead\n' > "$PL/01-lead.md"; chmod 000 "$PL/01-lead.md"
+chk "T-26: legacy schema marker refused" 1 "legacy run directory" pgw pre-codex "$PA" "$G2"
+printf 'codex-pr-review/5\n' > "$PA/00-schema"
+PL="$TMP/legacy"; mkdir -p "$PL"; printf 'scope\n' > "$PL/00-scope.md"; mkbrief "$PL"; fixture_revs "$PL"; printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$PL/01-lead.md"; chmod 000 "$PL/01-lead.md"
 pgw pre-codex "$PL" "$G2" >/dev/null 2>&1; printf 'x\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$PL/02-p1.md"; rm -f "$PL/00-schema"
 chk "T-26: pre-phase3 without the marker" 1 "legacy run directory" bash "$PG" pre-phase3 "$PL"
-printf 'codex-pr-review/4\n' > "$PL/00-schema"
+printf 'codex-pr-review/5\n' > "$PL/00-schema"
 chk "T-26: marker back → hash mismatch is the next check" 0 "JOIN-OK" bash "$PG" pre-phase3 "$PL"
 grep -q ' 00-schema  pre-phase3  final$' "$PL/00-accepted.sha256" && awk '{print $2}' "$PL/00-accepted.sha256" | grep -n . | grep -q '02-review-seal.sha256' && printf '  ok    %-42s\n' "T-26: schema marker accepted after the seal" || { printf '  FAIL  T-26: ledger rows %s\n' "$(cat "$PL/00-accepted.sha256")"; FAIL=1; }
 # T-18: JOIN-OK needs every participant terminal; the seal lists lead + every body; the exchange participant is the lowest-k COMPLETE
@@ -1425,6 +1513,12 @@ rm -f "$CS/06-resolution.md" "$CS/06-resolution-selection.ids"; pgw pre-resoluti
 [ -z "$(grep ' 06-resolution-selection.ids ' "$CS/00-accepted.sha256")" ] && printf '  ok    %-42s\n' "ledger: removed draft selector retired by pre-resolution" || { printf '  FAIL  ledger: retired draft row still present\n'; FAIL=1; }
 printf 'resolution skipped\nSTATUS: PHASE 6 COMPLETE (SKIPPED — no residual conflicts)\n' > "$CS/06-resolution.md"
 chk "gate: pre-report"                  0 "REPORT-OK"            pgw pre-report "$CS"
+# R-04: NOT_RUN_POLICY is defined for Phase 4 alone. Phase 6 wearing it used to fall through
+# every `= SKIPPED` guard, which silently disabled the round-17 CX-02 unattempted-residual check.
+printf 'not run\nSTATUS: PHASE 6 NOT_RUN_POLICY compact-v1\n' > "$CS/06-resolution.md"
+chk "R-04: Phase 6 may not be omitted by policy" 1 "only Phase 4 may be omitted by policy" pgw pre-report "$CS"
+printf 'resolution skipped\nSTATUS: PHASE 6 COMPLETE (SKIPPED — no residual conflicts)\n' > "$CS/06-resolution.md"
+chk "R-04: the real terminal state still passes" 0 "REPORT-OK" pgw pre-report "$CS"
 # CX-03r26: pre-report also rebuilds the verifier packets and rejects an edit.
 cp "$CS/05-verifier-packets.ndjson" "$TMP/cs-packets2.bak"; chmod u+w "$CS/05-verifier-packets.ndjson"
 python3 - "$CS/05-verifier-packets.ndjson" <<'PY2'
@@ -1637,6 +1731,61 @@ chmod 000 "$SK4/01-lead.md"
 chk "F-03r4: pre-phase3 catches status downgrade" 1 "status changed after JOIN-OK" pgw pre-phase3 "$SK4"
 chmod 600 "$SK4/01-lead.md"
 chk "F-03r4: post-join catches status downgrade" 1 "status changed after JOIN-OK" pgw post-join "$SK4"
+
+echo "review: PHASE 4 NOT_RUN_POLICY (a deliberate omission, never a laundered failure)"
+# Each case needs its own directory: the Phase-3 artifacts are ledger-accepted at
+# pre-consultation, so a fixture cannot be edited and replayed through pre-verification.
+# validate-consultation.py's expected_decision(): only CONFLICT, BOTH and P0/P1 rows may be
+# INCLUDE. So the non-blocking candidate a policy omission is legal over is a BOTH/CONFLICT nit —
+# two reviewers disagreeing about a P3 — not a CLAUDE-ONLY one, which is EXCLUDEd by rule.
+mknp() {  # mknp <dir> <origin> <selected severity> <selection reason> <brief tier>
+  local d="$1" origin="$2" sev="$3" reason="$4" tier="$5"
+  mkdir -p "$d"; printf 'scope\n' > "$d/00-scope.md"; mkbrief "$d"
+  printf -- '- Repository: %s\n- Tier: %s\n- Head: `HEAD` (%s)\n- Requested base: `HEAD` (%s)\n- Base: `HEAD` (%s)\nbrief\n' "$(cd "$G2" && pwd -P)" "$tier" "$SHA2" "$SHA2" "$SHA2" > "$d/00-brief.md"
+  pgw pre-codex "$d" "$G2" >/dev/null || { printf '  FAIL  R-02: pre-codex fixture %s\n' "$d"; FAIL=1; }
+  printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$d/01-lead.md"; chmod 000 "$d/01-lead.md"
+  printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$d/02-p1.md"; printf '0\n' > "$d/02-p1.exit"; printf 'blind codex body\n' > "$d/02-p1.stdout"
+  pgw pre-phase3 "$d" >/dev/null || { printf '  FAIL  R-02: pre-phase3 fixture %s\n' "$d"; FAIL=1; }
+  chmod 600 "$d/01-lead.md"
+  printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$d/03-matrix.md"
+  printf 'F-01\t%s\t%s\n' "$origin" "$sev" > "$d/03-matrix.tsv"
+  base_packets "$d"
+  printf 'F-01\t%s\t%s\tINCLUDE\t%s\n' "$origin" "$sev" "$reason" > "$d/03-debate-selection.tsv"
+  pgw pre-consultation "$d" >/dev/null || { printf '  FAIL  R-02: pre-consultation fixture %s\n' "$d"; FAIL=1; }
+}
+# The legal case: a compact-tier run that skipped the exchange over a nit.
+NP1="$TMP/np-ok"; mknp "$NP1" BOTH P3 BOTH compact-v1
+printf 'not run\nSTATUS: PHASE 4 NOT_RUN_POLICY compact-v1\n' > "$NP1/04-consultation.md"
+chk "R-02: policy omission over a nit accepted" 0 "consultation=NOT_RUN_POLICY" pgw pre-verification "$NP1"
+# The omission must survive to the END of the run, not just past the gate that first sees it:
+# pre-resolution and pre-report each parse a later phase before validating the Phase-4 token, and
+# phase_status clears that token on every call. compact-v1 is the DEFAULT tier, so a run taking
+# the documented omission path completed six phases and was refused at the gate authorizing the
+# report — with a message accusing it of citing the wrong tier when it cited the right one.
+printf 'verification\nSTATUS: PHASE 5 COMPLETE\n' > "$NP1/05-verification.md"
+printf 'F-01\tCONFIRMED\ttrace\tf.txt:1@%s "line one"\n' "$SHA2" > "$NP1/05-verdicts.tsv"
+chk "R-02: the omission survives pre-resolution" 0 "RESOLUTION-OK" pgw pre-resolution "$NP1"
+printf 'resolution skipped\nSTATUS: PHASE 6 COMPLETE (SKIPPED — no residual conflicts)\n' > "$NP1/06-resolution.md"
+chk "R-02: the omission survives pre-report" 0 "REPORT-OK" pgw pre-report "$NP1"
+# The trap this guard exists for: in the production run that motivated the tier, the selected
+# candidates WERE the two genuine P1s. A tier may buy latency out of prose, never out of the
+# merge decision.
+NP2="$TMP/np-blocking"; mknp "$NP2" CLAUDE-ONLY P1 provisional-P1 compact-v1
+printf 'not run\nSTATUS: PHASE 4 NOT_RUN_POLICY compact-v1\n' > "$NP2/04-consultation.md"
+chk "R-02: omission over a blocking finding refused" 1 "never over the findings the merge decision turns on" pgw pre-verification "$NP2"
+# Tier full omits no phase, so the state itself is wrong there.
+NP3="$TMP/np-full"; mknp "$NP3" BOTH P3 BOTH full
+printf 'not run\nSTATUS: PHASE 4 NOT_RUN_POLICY full\n' > "$NP3/04-consultation.md"
+chk "R-02: tier full omits nothing" 1 "which omits no phase" pgw pre-verification "$NP3"
+# The omission must cite the tier that authorized it, not some other tier.
+NP4="$TMP/np-wrongtier"; mknp "$NP4" BOTH P3 BOTH compact-v1
+printf 'not run\nSTATUS: PHASE 4 NOT_RUN_POLICY full\n' > "$NP4/04-consultation.md"
+chk "R-02: omission citing another tier refused" 1 "must cite the tier that authorized it" pgw pre-verification "$NP4"
+# A phase that ran and failed is SKIPPED. Relabelling the failure would launder it into a decision.
+NP5="$TMP/np-attempted"; mknp "$NP5" BOTH P3 BOTH compact-v1
+printf 'not run\nSTATUS: PHASE 4 NOT_RUN_POLICY compact-v1\n' > "$NP5/04-consultation.md"
+mkdir -p "$NP5/04-consultation.claim.spent.1/runner"
+chk "R-02: omission with a recorded attempt refused" 1 "is SKIPPED, not a policy omission" pgw pre-verification "$NP5"
 
 # F-04 (round 4): when Codex is SKIPPED, pre-verification and pre-report must
 # reject PHASE 4 COMPLETE / PHASE 6 COMPLETE for consultation/resolution (a
@@ -1947,6 +2096,39 @@ chk "CX-02r34: citing the reviewed tree id directly accepted" 0 "RESOLUTION-OK" 
 printf 'F-01\tCONFIRMED\ttrace\tf.txt:1@%s "line one"\n' "$(printf %s "$SHA2" | cut -c1-12)" > "$SK1B/05-verdicts.tsv"
 chk "CX-02r34: abbreviated reviewed sha accepted" 0 "RESOLUTION-OK" pgw pre-resolution "$SK1B"
 chk "CX-01r23: command evidence accepted" 0 "OK verdicts=1" python3 "$VV" --matrix "$SK1B/03-matrix.tsv" --verdicts "$SK1B/05-verdicts.tsv"
+# R-03: the change-anchor rule. Every gate fixture pins base = head (fixture_revs), which makes
+# changed_paths() empty and anchor_error() short-circuit — so the rule is INERT in every test
+# above and the suite would stay green if it were deleted. These cases use $MB from the
+# merge-base block, the one repository in the suite with a real base..head: `pr-only.txt` is in
+# the diff, `shared.txt` exists at both ends and is untouched.
+MBBASE=$(git -C "$MB" merge-base "$MBB" "$MBH")
+printf 'F-01\tCLAUDE-ONLY\tP1\n' > "$TMP/anchor-matrix.tsv"
+anchorrun() { python3 "$VV" --matrix "$TMP/anchor-matrix.tsv" --verdicts "$TMP/anchor-verdicts.tsv" --repo "$MB" --base "$MBBASE" --head "$MBH"; }
+printf 'F-01\tCONFIRMED\ttrace\tshared.txt:1@%s "shared"\n' "$MBH" > "$TMP/anchor-verdicts.tsv"
+chk "R-03: CONFIRMED P1 off the change refused" 1 "which the reviewed change does not touch" anchorrun
+printf 'F-01\tCONFIRMED\ttrace\tpr-only.txt:1@%s "pr"\n' "$MBH" > "$TMP/anchor-verdicts.tsv"
+chk "R-03: CONFIRMED P1 anchored in the change accepted" 0 "OK verdicts=1" anchorrun
+# A refutation often cites the base precisely to show the defect predates the change.
+printf 'F-01\tREFUTED\ttrace\tshared.txt:1@%s "shared"\n' "$MBH" > "$TMP/anchor-verdicts.tsv"
+chk "R-03: REFUTED off the change is exempt" 0 "OK verdicts=1" anchorrun
+# Only P0/P1 block a merge, so only they carry the rule.
+printf 'F-01\tCLAUDE-ONLY\tP2\n' > "$TMP/anchor-matrix.tsv"
+printf 'F-01\tCONFIRMED\ttrace\tshared.txt:1@%s "shared"\n' "$MBH" > "$TMP/anchor-verdicts.tsv"
+chk "R-03: CONFIRMED P2 off the change is exempt" 0 "OK verdicts=1" anchorrun
+# Command evidence carries no path, so the anchor rule exempts it — but with --repo it never
+# reaches that branch: citation_error refuses command-only evidence for any CONFIRMED verdict
+# first. Assert WHICH rule fires, so a later reordering that let cmd: confirm a blocking finding
+# on no anchor is visible here.
+printf 'F-01\tCLAUDE-ONLY\tP1\n' > "$TMP/anchor-matrix.tsv"
+printf 'F-01\tCONFIRMED\tsuite\tcmd: bash t.sh -> ok\n' > "$TMP/anchor-verdicts.tsv"
+chk "R-03: cmd evidence refused by the command rule, not the anchor" 1 "command evidence cannot be verified after the fact" anchorrun
+# CX-04 of the self-review: git C-quotes unusual paths in --name-only, so the membership set
+# must come from -z output or a valid finding on such a file is rejected for touching nothing.
+( cd "$MB" && printf 'x\n' > "$(printf 'caf\303\251.txt')" && git add -A && git commit -qm "unicode path" ) >/dev/null 2>&1
+MBH2=$(git -C "$MB" rev-parse HEAD)
+UPATH=$(git -C "$MB" diff --name-only -z "$MBBASE..$MBH2" | tr '\0' '\n' | grep -a 'caf' | head -1)
+printf 'F-01\tCONFIRMED\ttrace\t%s:1@%s "x"\n' "$UPATH" "$MBH2" > "$TMP/anchor-verdicts.tsv"
+chk "R-03: a C-quotable path anchors correctly" 0 "OK verdicts=1" python3 "$VV" --matrix "$TMP/anchor-matrix.tsv" --verdicts "$TMP/anchor-verdicts.tsv" --repo "$MB" --base "$MBBASE" --head "$MBH2"
 # CX-01r29: a backticked citation (the Markdown habit the verifier contract used to show) is normalized, not rejected.
 printf 'F-01\tCONFIRMED\ttrace\t`f.txt:1@'"$SHA2"'` "line one"\n' > "$SK1B/05-verdicts.tsv"
 chk "CX-01r29: backticked citation accepted" 0 "OK verdicts=1" python3 "$VV" --matrix "$SK1B/03-matrix.tsv" --verdicts "$SK1B/05-verdicts.tsv"
@@ -2615,7 +2797,18 @@ S=$(date +%s); chk "watch: artifact present → 0" 0 "WATCH-OK" bash "$AW" "$WD/
 # success case: -s stats, it does not open, and the watcher must still see it.
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$WD/sealed.md"; chmod 000 "$WD/sealed.md"
 chk "watch: sealed (mode 000) artifact → 0"  0 "WATCH-OK"      bash "$AW" "$WD/sl" --expect "$WD/sealed.md" --after-sec 20 --poll-sec 1
+# --expect-mode turns the predicate into a COMPLETION test. The sealed file still passes; an
+# unsealed one must NOT, or both watchers clear on a placeholder the instant it appears — the
+# defect that made every watcher exit 0 within seconds of launch, every run.
+chk "watch: --expect-mode 000 + sealed → 0"  0 "WATCH-OK"      bash "$AW" "$WD/sm" --expect "$WD/sealed.md" --expect-mode 000 --after-sec 20 --poll-sec 1
 chmod 600 "$WD/sealed.md"
+printf 'PLACEHOLDER: review in progress\n' > "$WD/placeholder.md"
+chk "watch: --expect-mode 000 + unsealed → 3" 3 "WATCH-OVERDUE" bash "$AW" "$WD/pm" --expect "$WD/placeholder.md" --expect-mode 000 --after-sec 2 --poll-sec 1
+chk "watch: unsealed without --expect-mode → 0" 0 "WATCH-OK"    bash "$AW" "$WD/pn" --expect "$WD/placeholder.md" --after-sec 20 --poll-sec 1
+# A mode is three octal digits, never a number: num() strips 000 to 0 and would accept 8.
+chk "watch: --expect-mode non-octal"     2 "three octal digits" bash "$AW" "$WD/a" --expect x --after 1 --expect-mode 8
+chk "watch: --expect-mode one digit"     2 "three octal digits" bash "$AW" "$WD/a" --expect x --after 1 --expect-mode 0
+chk "watch: --expect-mode with no value" 2 "requires a value"   bash "$AW" "$WD/a" --expect x --after 1 --expect-mode
 # and the watcher's own sidecars must not collide with the glob pre-codex uses to refuse a
 # resumed run while any lead file is readable
 bash "$AW" "$WD/01-lead.advisory" --expect "$WD/present.md" --after-sec 5 --poll-sec 1 >/dev/null 2>&1

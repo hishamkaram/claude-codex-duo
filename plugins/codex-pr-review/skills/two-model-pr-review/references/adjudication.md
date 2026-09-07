@@ -149,6 +149,26 @@ whether both did, establish ground truth, preferring in order:
 Prefer a throwaway `git worktree` for anything that could touch the working
 tree. Never auto-clean or restore the user's worktree.
 
+**Causal attribution binds every rung, not just (c).** Whatever rung you use,
+a P0 or P1 verdict of CONFIRMED asserts that THIS CHANGE is not safe to merge —
+so establish that the defect is introduced or newly activated by the change,
+not merely present at head. Rung (a) shows it fails at head and does not fail at
+base for the same reason; rung (b) traces the changed symbol to the affected
+site; rung (d) shows the behaviour changed here rather than earlier. A defect
+that exists identically at base and head is pre-existing: it belongs in the
+non-blocking list at its own severity, however real it is.
+
+Mechanically, the evidence recorded for a CONFIRMED P0/P1 must cite a path the
+change touches — its **change anchor**. `validate-verdicts.py` enforces exactly
+that and nothing more; the causal claim itself is yours to establish. When the
+defect lives in unchanged code that a changed caller newly reaches, the anchor
+is the changed line that reaches it and the unchanged site goes in the finding's
+other affected sites (`templates/finding.md` §Location). This is why the anchor
+rule does not conflict with the rubric's repo-wide consumer search: a consumer
+finding keeps a real anchor in the diff. REFUTED verdicts are exempt — citing
+the base is often the whole point of a refutation — as are P2/P3, which do not
+block a merge.
+
 Recipe for rung (a) without touching the repo (verified 2026-09-02 on a pnpm +
 vitest workspace): create `<artifact>/repro/`, symlink the repo's root
 `node_modules` into it, write a minimal `vitest.config.ts` whose `resolve.alias`

@@ -235,10 +235,10 @@ Everything is written outside the repository:
 
 ```text
 /tmp/two-model-pr-review/<repo>/<target>-<timestamp>/
-  00-scope.md (+ .sha256)  00-brief.md (+ .sha256 .tree .repo .base .head .baseline)  00-participants.tsv (the frozen reviewer list)  00-schema (codex-pr-review/4)  00-run.md  01-lead.md  02-p<k>.md per participant (+ .stdout .stderr .joblog .meta .progress .exit)  02-exchange-participant
+  00-scope.md (+ .sha256)  00-brief.md (+ .sha256 .tree .repo .base .head .baseline .scope.json — the frozen record of the merge-base correction, hashed with the packets)  00-participants.tsv (the frozen reviewer list)  00-schema (codex-pr-review/5)  00-run.md  01-lead.md  02-p<k>.md per participant (+ .stdout .stderr .joblog .meta .progress .exit)  02-exchange-participant
   00-accepted.sha256 (the accept ledger: one row per accepted or generated artifact, verified by every gate)  00-repo.txt (reviewed repository, base and head revisions, recorded by pre-codex; Phase-5 citations must resolve at one of those two revisions)
   02-review-seal.sha256  03-matrix.md (+ .tsv)  03-provenance.tsv (who raised each canonical finding)  03-findings.ndjson  03-debate-selection.tsv  04-consultation.md (+ .json .stdout .meta .exit .thread; .prompt.retry.md after a canonical repair)
-  05-verification.md (+ 05-verifier-packets.ndjson, generated; 05-verdicts.tsv)  06-resolution-selection.ids  06-resolution.md (+ .json .stdout .meta .exit; .prompt.retry.md after a canonical repair)  07-review.md
+  05-verification.md (+ 05-verifier-packets.ndjson, generated; 05-verdicts.tsv; 05-scope-attribution.tsv, generated at pre-report)  06-resolution-selection.ids  06-resolution.md (+ .json .stdout .meta .exit; .prompt.retry.md after a canonical repair)  07-review.md
   <phase>.cancel-resolved (immutable, SHA-bound proof after exit 5)  <phase>.claim/ (atomic launch claim, taken last; runner/ inside it is the record of a launch)  <phase>.claim.spentN/ (rotated claims, never deleted, at most nine; `phase-gate.sh release` is the only recovery for a started claim)  <phase>.claim.lock/ (held for milliseconds while a claim is created, rotated or taken; reclaimed after a minute)
 
 /tmp/codex-debate/<repo>/<motion-slug>-<timestamp>/

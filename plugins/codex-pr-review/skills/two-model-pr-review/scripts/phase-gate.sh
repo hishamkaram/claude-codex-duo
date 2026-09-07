@@ -12,7 +12,7 @@
 #   phase-gate.sh confirm-terminated <ART> <prefix>
 #
 # Every gate rechecks the frozen scope, blind brief and participants file, the schema
-# marker (00-schema = codex-pr-review/4: a 3.0.0 directory is never reinterpreted), then
+# marker (00-schema = codex-pr-review/5: an older directory is never reinterpreted), then
 # verifies the accept ledger (00-accepted.sha256): every artifact a gate has accepted or
 # generated is recorded there once and may never change afterwards. Launch gates take an
 # atomic claim as their last step — pre-codex one per participant of 00-participants.tsv
@@ -32,15 +32,20 @@ ART="$(cd "$ART" && pwd -P)"
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 VALIDATOR="$ROOT/scripts/validate-consultation.py"
 PROVENANCE_VALIDATOR="$ROOT/scripts/validate-provenance.py"
-SCHEMA_MARKER="codex-pr-review/4"
+# Bumped to /5: the terminal-state grammar gained NOT_RUN_POLICY and the brief gained a Tier line,
+# so a directory written under /4 must be refused rather than reinterpreted by these gates.
+SCHEMA_MARKER="codex-pr-review/5"
 PACKET_VALIDATOR="$ROOT/scripts/validate-verifier-packets.py"
 VERDICT_VALIDATOR="$ROOT/scripts/validate-verdicts.py"
 PACKET_BUILDER="$ROOT/scripts/build-verifier-packets.py"
+SCOPE_ATTRIBUTION="$ROOT/scripts/scope-attribution.py"
 LEDGER="$ART/00-accepted.sha256"
 # One scratch file for every validator dry run in this call; allocation failure
 # is a gate failure, never a silently-unusable response (round-37 CX-02).
 SCRATCH=$(mktemp "${TMPDIR:-/tmp}/phase-gate.XXXXXX") || { echo "GATE FAILED ($CMD): cannot allocate a scratch file in ${TMPDIR:-/tmp}" >&2; exit 1; }
 LEAD_WAS_SEALED=0   # set by unseal_lead_for_hash, cleared by reseal_lead_after_hash; on_exit reseals the lead if a hashing helper failed in between
+PST=""              # terminal state of the phase last parsed by phase_status
+PST_POLICY=""       # the tier token a NOT_RUN_POLICY line cited, empty for every other state
 HELD_LOCK=""        # claim lock held by claim_lock, released by claim_unlock or on_exit
 PKT_TMP=""          # packet build/recheck scratch file, removed by on_exit on any failure
 on_exit() { rm -f "$SCRATCH" "$PKT_TMP" 2>/dev/null; [ -z "$HELD_LOCK" ] || rmdir "$HELD_LOCK" 2>/dev/null; [ "$LEAD_WAS_SEALED" = 1 ] && chmod 000 "$ART/01-lead.md" 2>/dev/null; :; }
@@ -77,10 +82,25 @@ hashcheck() {
 phase_status() {
   local file="$1" phase="$2" last
   [ -s "$ART/$file" ] || fail "$file missing or empty"
+  PST_POLICY=""   # cleared every call: a stale token from an earlier phase must never authorize this one
   last=$(lastline "$ART/$file")
   case "$last" in
     "STATUS: PHASE $phase COMPLETE") PST=COMPLETE;;
     "STATUS: PHASE $phase COMPLETE (SKIPPED — "*")") PST=SKIPPED;;
+    # A third terminal state, distinct from SKIPPED on purpose. SKIPPED means the run TRIED and
+    # could not get a usable response, or the phase was ineligible — both derived from what
+    # happened. NOT_RUN_POLICY means the run CHOSE not to execute an eligible phase under a
+    # frozen tier. Collapsing the two would make "we decided to skip this" indistinguishable
+    # from "this broke" in the audit trail, which is the one thing the trail exists to prevent.
+    "STATUS: PHASE $phase NOT_RUN_POLICY "*)
+      # Phase 4 is the ONLY phase this state is defined for: it is the only one with a policy
+      # checker (policy_omission_check), and the only omission SKILL.md authorizes. Admitting it
+      # elsewhere puts a third value into guards written against COMPLETE/SKIPPED, where it falls
+      # through every `= SKIPPED` branch — on Phase 6 that silently disables the round-17 CX-02
+      # residual guard, and on Phase 2 it admits a blind review that never ran. Refuse the state
+      # wherever nothing validates it, rather than trusting each consumer to remember.
+      [ "$phase" = 4 ] || fail "$file records NOT_RUN_POLICY for phase $phase, but only Phase 4 may be omitted by policy (it is the only phase with a policy check); every other phase is COMPLETE or SKIPPED"
+      PST=NOT_RUN_POLICY; PST_POLICY="${last#"STATUS: PHASE $phase NOT_RUN_POLICY "}";;
     *) fail "$file does not end with a Phase $phase STATUS line (last non-blank line: ${last:0:80})";;
   esac
 }
@@ -142,8 +162,48 @@ all_prefixes() { phase2_prefixes; printf '%s\n' 04-consultation 06-resolution; }
 # every gate: a directory written under another contract (3.0.0's 02-codex prefixes) is
 # refused instead of being reinterpreted (round-1 X-4 of the 4.0.0 plan).
 schema_check() {
-  [ -s "$ART/00-schema" ] || fail "00-schema missing: this is a legacy run directory (or pre-codex never ran here) — start a fresh run directory under codex-pr-review 4.0.0"
+  [ -s "$ART/00-schema" ] || fail "00-schema missing: this is a legacy run directory (or pre-codex never ran here) — start a fresh run directory under codex-pr-review 5.0.0"
   [ "$(cat "$ART/00-schema")" = "$SCHEMA_MARKER" ] || fail "00-schema is '$(head -1 "$ART/00-schema")', expected '$SCHEMA_MARKER': legacy run directory — start a fresh run"
+}
+# The tier is the authority for a policy omission, and it lives in the frozen brief: hashcheck
+# already refuses a brief that changed after pre-codex, so no separate policy artifact is needed.
+# Read it back from the brief rather than trusting a caller-supplied value.
+brief_tier() { sed -n 's/^- Tier: //p' "$ART/00-brief.md" 2>/dev/null | head -1; }
+tier_check() {
+  local t; t=$(brief_tier)
+  [ -n "$t" ] || fail "00-brief.md has no '- Tier:' line: rebuild the brief with build-brief.sh (the tier selects the reviewers' output contract and authorizes policy omissions)"
+  case "$t" in
+    compact-v1|full) ;;
+    *) fail "00-brief.md names an unknown tier '$t': expected compact-v1 or full";;
+  esac
+}
+# A phase recorded NOT_RUN_POLICY was ELIGIBLE and deliberately not executed under the frozen
+# tier. Two things must hold, or the state is a bypass wearing a policy label: the tier must
+# actually permit the omission, and nothing may have been launched — a run that started the phase
+# and then relabelled the failure would otherwise launder it into a decision.
+policy_omission_check() {  # policy_omission_check <prefix> <policy-token>
+  local prefix="$1" token="$2" tier
+  tier=$(brief_tier)
+  [ "$token" = "$tier" ] || fail "$prefix.md is NOT_RUN_POLICY '$token' but the frozen brief names tier '$tier': the omission must cite the tier that authorized it"
+  [ "$tier" != full ] || fail "$prefix.md is NOT_RUN_POLICY but the run is tier 'full', which omits no phase; record the real terminal state"
+  # runner_count counts claims a RUNNER took, which is the fact that matters: something was
+  # launched. The bare claim directory is not that fact — pre-consultation mints the claim as its
+  # last step, so an authorized-but-unused reservation is present on every legal omission and
+  # testing for it would make the state unreachable. A launch that left the runner directory
+  # behind is caught here; one whose runner directory was deleted still leaves sidecars, which
+  # launch_records_check reconciles against the claims.
+  [ "$(runner_count "$prefix")" -eq 0 ] || fail "$prefix.md is NOT_RUN_POLICY but $(runner_count "$prefix") attempt(s) were recorded: a phase that ran and failed is SKIPPED, not a policy omission"
+  [ ! -e "$ART/$prefix.exit" ] || fail "$prefix.md is NOT_RUN_POLICY but $prefix.exit records an attempt's outcome: a phase that ran is COMPLETE or SKIPPED, never a policy omission"
+  # A tier may buy latency out of nits, never out of the merge decision. Consultation is the only
+  # place the two models reconcile a disagreement, and the findings it is worth running for are
+  # precisely the blocking ones: in the production run that motivated this work, the selected
+  # candidates WERE the two genuine P1s. So a policy omission is legal only when nothing blocking
+  # was selected — otherwise the tier would be trading away the answer, not the prose.
+  if [ "$prefix" = 04-consultation ] && [ -s "$ART/03-debate-selection.tsv" ]; then
+    local blocking
+    blocking=$(awk -F'\t' '$4 == "INCLUDE" && ($3 == "P0" || $3 == "P1")' "$ART/03-debate-selection.tsv" | wc -l | tr -d ' ')
+    [ "$blocking" -eq 0 ] || fail "04-consultation.md is NOT_RUN_POLICY but $blocking blocking finding(s) (P0/P1) were selected for consultation: a tier may omit an exchange over nits, never over the findings the merge decision turns on — run the consultation"
+  fi
 }
 # participants_status: every participant's 02-p<k>.md is terminal. ST = COMPLETE when at
 # least one participant completed (SKIPPED when none); EXCH = the lowest-k COMPLETE
@@ -173,7 +233,7 @@ exchange_drift_check() {  # the exchange participant is recorded at the join and
     [ "$(cat "$ART/02-exchange-participant")" = "$EXCH" ] || fail "02-exchange-participant records $(cat "$ART/02-exchange-participant") but the lowest completed participant is now ${EXCH:-none}: a participant's status changed after the join (start a fresh run directory)"
   fi
 }
-initial_packets() { hashcheck 00-brief.md; hashcheck 00-scope.md; hashcheck 00-participants.tsv; hashcheck 00-schema; }
+initial_packets() { hashcheck 00-brief.md; hashcheck 00-scope.md; hashcheck 00-participants.tsv; hashcheck 00-schema; hashcheck 00-brief.md.scope.json; }
 # The seal attests the join for BOTH Phase-2 outcomes: a COMPLETE review hashes
 # the raw Codex body, a SKIPPED one hashes the status file itself, so a later
 # status edit or seal deletion is detectable either way (round-22 CX-02).
@@ -1042,13 +1102,24 @@ pre-codex)
       fail "02-$EXCH.md already records a completed blind review (every participant is terminal and complete); run pre-phase3 (or start a fresh run directory) instead of relaunching"
     fi
   fi
+  # `01-lead*.md` alone misses `01-lead.md.part`, the staging file of the atomic publish: between
+  # the agent's write and its chmod that file is a fully readable copy of the review, and the .part
+  # suffix puts it outside the glob. It is a lead artifact and is held to the same rule.
   LEAD=absent
-  for f in "$ART"/01-lead*.md; do
+  for f in "$ART"/01-lead*.md "$ART"/01-lead*.md.part; do
     [ -e "$f" ] || continue
     [ "$(mode "$f")" = 0 ] || fail "$(basename "$f") exists and is not sealed (mode $(mode "$f")); chmod 000 it or remove it before launching Codex"
-    LEAD=sealed
+    case "$f" in *.part) ;; *) LEAD=sealed;; esac
   done
+  # Order matters in both directions, and differs by whether a hash record exists yet.
+  # BEFORE the first record: hashcheck RECORDS on first sight, and that record is what makes the
+  # brief immutable — so failing after it while advising "rebuild the brief" would tell the
+  # operator to do the one thing that then fails on the recorded hash, discarding all of Phase 0.
+  # AFTER a record exists: the hash comparison must speak first, or a brief that was mutated (or
+  # that names the run directory) is reported as a brief with no Tier line (round-38 CX-02).
+  [ -e "$ART/00-brief.md.sha256" ] || tier_check
   initial_packets
+  tier_check
   repo_check sidecars  # after the hash check: the Target lines of the FROZEN brief are the pin (round-38 CX-02)
   # Written only once every check passed, so a refused re-entry never rewrites
   # it (round-36 CX-06); accepted final at the join.
@@ -1057,15 +1128,26 @@ pre-codex)
   # (round-27 CX-02). Every launch takes its own token (claim.p<k>=…).
   CLAIMS=""
   for id in $TO_LAUNCH; do claim_phase "02-$id" "02-$id.md"; CLAIMS="$CLAIMS claim.$id=$CLAIM_TOKEN"; done
-  echo "PREFLIGHT-OK lead=$LEAD participants=$(participant_ids | wc -l | tr -d ' ') brief=$(cut -c1-12 "$ART/00-brief.md.sha256") scope=$(cut -c1-12 "$ART/00-scope.md.sha256") schema=$SCHEMA_MARKER$CLAIMS"
+  echo "PREFLIGHT-OK lead=$LEAD participants=$(participant_ids | wc -l | tr -d ' ') brief=$(cut -c1-12 "$ART/00-brief.md.sha256") scope=$(cut -c1-12 "$ART/00-scope.md.sha256") schema=$SCHEMA_MARKER tier=$(brief_tier)$CLAIMS"
   ;;
 pre-phase3)
   [ -e "$ART/01-lead.md" ] || fail "01-lead.md missing: run Phase 1 in-context BEFORE opening any Codex output file"
   [ -s "$ART/01-lead.md" ] || fail "01-lead.md is empty"
   [ "$(mode "$ART/01-lead.md")" = 0 ] || fail "01-lead.md is not sealed (mode $(mode "$ART/01-lead.md")): it must stay mode 000 until this gate passes (mode 400 after an interrupted join means the seal hashing was cut short: chmod 000 it and re-run this gate)"
-  schema_check; codex_status; initial_packets; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
+  schema_check; codex_status; initial_packets; tier_check; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
   [ -s "$ART/00-repo.txt" ] || fail "00-repo.txt missing: pre-codex was not run in this directory (it records the reviewed repository for citation checks)"
   repo_check file
+  # The lead's terminal marker, checked BEFORE the review is sealed and accepted. post-join
+  # checks the same string, but only after the seal is minted and the ledger rows are written —
+  # by then an unfinished lead review has already been admitted as evidence. The checks above
+  # test existence, size and mode; none of them tests that the agent actually finished. This is
+  # its own unseal window rather than a line inside write_review_seal because that function
+  # short-circuits when the seal already exists, and a re-entered join must re-check the marker.
+  # fail() exits, and the EXIT trap reseals the lead, so a failure here cannot leave it readable.
+  unseal_lead_for_hash
+  LEAD_LAST=$(lastline "$ART/01-lead.md")   # read while unsealed: the diagnostic below cannot re-read a resealed file
+  reseal_lead_after_hash
+  [ "$LEAD_LAST" = "STATUS: PHASE 1 COMPLETE" ] || fail "01-lead.md does not end with STATUS: PHASE 1 COMPLETE: the lead review is unfinished (last non-blank line: $(printf '%s' "$LEAD_LAST" | cut -c1-80)). Do not seal or accept an incomplete review — rerun Phase 1."
   # Seal first, ledger rows second: each step is atomic and re-entrant, so a
   # join interrupted anywhere is completed by running this gate again
   # (round-40 CX-01), while a ledger that exists without a seal still means removal.
@@ -1081,6 +1163,7 @@ pre-phase3)
     chmod 400 "$tmp" && mv -f "$tmp" "$LEDGER" || { rm -f "$tmp"; fail "could not install the accept ledger"; }
   fi
   accept 00-repo.txt final
+  accept 00-brief.md.scope.json final
   accept 02-review-seal.sha256 final
   accept 00-schema final
   [ -z "$EXCH" ] || accept 02-exchange-participant final
@@ -1094,7 +1177,7 @@ pre-consultation)
   phase_status 03-matrix.md 3
   # Phase 3 (reconciliation) has no SKIPPED form — it is always required.
   [ "$PST" = COMPLETE ] || fail "03-matrix.md was skipped; reconciliation is required"
-  schema_check; codex_status; initial_packets; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
+  schema_check; codex_status; initial_packets; tier_check; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
   [ -e "$ART/02-review-seal.sha256" ] || fail "02-review-seal.sha256 missing: run pre-phase3 after the join"
   # Never authorize a Phase-4 launch while an earlier attempt may still be
   # alive (round-21 CX-01).
@@ -1134,10 +1217,10 @@ pre-consultation)
   fi
   ;;
 pre-verification)
-  schema_check; codex_status; initial_packets; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
+  schema_check; codex_status; initial_packets; tier_check; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
   [ -n "$(ledger_row 03-debate-selection.tsv)" ] && [ -n "$(ledger_row 03-findings.ndjson)" ] || fail "03-debate-selection.tsv / 03-findings.ndjson are not accepted; run pre-consultation first"
   phase_status 04-consultation.md 4
-  consultation=$PST
+  consultation=$PST; consultation_policy=$PST_POLICY   # captured together: a later phase_status clears the global
   reject_unconfirmed_cancel 04-consultation  # any attempt, current or rotated (round-17 L-01)
   schema_repair_prompt_check 04-consultation
   reject_skipped_after_accept
@@ -1165,11 +1248,19 @@ pre-verification)
       if [ "$candidates" -gt 0 ] && [ "$(runner_count 04-consultation)" -eq 0 ]; then
         fail "04-consultation.md is SKIPPED with $candidates selected finding(s) but no consultation attempt was recorded"
       fi
+    elif [ "$consultation" = NOT_RUN_POLICY ]; then
+      policy_omission_check 04-consultation "$consultation_policy"
     else
       fail "04-consultation.md has unknown terminal state"
     fi
   elif [ "$ST" = SKIPPED ]; then
-    [ "$consultation" = SKIPPED ] || fail "04-consultation.md is COMPLETE but Codex Phase 2 was SKIPPED; consultation cannot have run without Codex"
+    case "$consultation" in
+      SKIPPED) ;;
+      # Validated here too, not only at pre-resolution/pre-report: the earliest gate that can
+      # see the state is the one that should reject a bypass wearing a policy label.
+      NOT_RUN_POLICY) policy_omission_check 04-consultation "$consultation_policy";;
+      *) fail "04-consultation.md is $consultation but Codex Phase 2 was SKIPPED; consultation cannot have run without Codex";;
+    esac
   fi
   # The verifier inputs are generated here from the frozen base packets and the
   # accepted dispositions (round-26 CX-03); a draft until Phase 5 writes.
@@ -1179,11 +1270,12 @@ pre-verification)
   echo "VERIFICATION-OK consultation=$consultation codex=$ST attempts=$(( $(runner_count 04-consultation) + $(runner_count 06-resolution) )) responses=$(response_count)"
   ;;
 pre-resolution)
-  schema_check; initial_packets; codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
+  schema_check; initial_packets; tier_check; codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
   # Phase 4 must have reached a terminal state before Phase 5, and hence before
   # any Phase 6 launch (round-18 CX-04).
   phase_status 04-consultation.md 4
-  consultation=$PST
+  consultation=$PST; consultation_policy=$PST_POLICY   # captured together: a later phase_status clears the global
+  [ "$consultation" != NOT_RUN_POLICY ] || policy_omission_check 04-consultation "$consultation_policy"
   [ -n "$(ledger_row 05-verifier-packets.ndjson)" ] || fail "05-verifier-packets.ndjson is not accepted; run pre-verification first"
   reject_skipped_after_accept
   [ "$ST" = SKIPPED ] && [ "$consultation" = COMPLETE ] && fail "04-consultation.md is COMPLETE but Codex Phase 2 was SKIPPED; consultation cannot have run without Codex"
@@ -1237,9 +1329,9 @@ pre-resolution)
   echo "RESOLUTION-OK codex=$ST residual=$residual attempts=$(( $(runner_count 04-consultation) + $(runner_count 06-resolution) )) responses=$(response_count) schema_invalid=$SCHEMA_INVALID${CLAIM_TOKEN:+ claim=$CLAIM_TOKEN}${BUDGET:-}"
   ;;
 pre-report)
-  schema_check; initial_packets; codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
+  schema_check; initial_packets; tier_check; codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
   phase_status 04-consultation.md 4
-  consultation=$PST
+  consultation=$PST; consultation_policy=$PST_POLICY   # captured together: a later phase_status clears the global
   # Both exchange phases, first: a SKIPPED consultation may still hide an
   # exit-5 / unconfirmed-cancel sidecar (round-16 CX-03), and a possibly live
   # worker outranks every other inconsistency.
@@ -1262,6 +1354,7 @@ pre-report)
       fail "04-consultation.md is SKIPPED with $candidates selected finding(s) but no consultation attempt was recorded"
     fi
   fi
+  [ "$consultation" != NOT_RUN_POLICY ] || policy_omission_check 04-consultation "$consultation_policy"
   if [ "$ST" = COMPLETE ] && [ "$consultation" = COMPLETE ]; then
     [ -s "$ART/04-consultation.meta" ] || fail "04-consultation.meta missing after completed consultation"
     if [ ! -s "$ART/04-consultation.exit" ] || [ "$(cat "$ART/04-consultation.exit")" != 0 ]; then
@@ -1315,6 +1408,17 @@ pre-report)
   elif [ -e "$ART/06-resolution-selection.ids" ]; then
     validate_residual_ids || fail "06-resolution-selection.ids is invalid"
   fi
+  # 05-scope-attribution.tsv: per finding, whether its evidence path was in the requested
+  # base's comparison, the reviewed one, or neither — so "would the old two-dot scope have
+  # produced this finding?" is a lookup instead of archaeology. Descriptive only: it never
+  # fails a run (anchor_error in validate-verdicts.py is the blocking rule), and it is written
+  # once from inputs the ledger already froze, so a re-entered pre-report reuses it.
+  if [ ! -e "$ART/05-scope-attribution.tsv" ]; then
+    python3 "$SCOPE_ATTRIBUTION" --matrix "$ART/03-matrix.tsv" --verdicts "$ART/05-verdicts.tsv" \
+      --scope "$ART/00-brief.md.scope.json" --repo "$(repo_field repo)" \
+      --out "$ART/05-scope-attribution.tsv" >/dev/null || fail "could not write 05-scope-attribution.tsv"
+  fi
+  accept 05-scope-attribution.tsv final
   check_budget
   echo "REPORT-OK codex=$ST resolution=$resolution attempts=$(( $(runner_count 04-consultation) + $(runner_count 06-resolution) )) responses=$(response_count)"
   ;;
@@ -1323,7 +1427,7 @@ post-join)
   [ -s "$ART/01-lead.md" ] || fail "01-lead.md missing or empty"
   [ -r "$ART/01-lead.md" ] || fail "01-lead.md is still sealed (mode $(mode "$ART/01-lead.md")); Phase 3 restores it to 600"
   [ "$(lastline "$ART/01-lead.md")" = "STATUS: PHASE 1 COMPLETE" ] || fail "01-lead.md does not end with STATUS: PHASE 1 COMPLETE"
-  schema_check; codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
+  schema_check; tier_check; codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
   # The snapshot tree must still resolve after Codex returns, or Phase-5 citations at the head cannot be verified (codex-protocol.md).
   if [ -s "$ART/00-brief.md.tree" ]; then git -C "$(repo_field repo)" cat-file -e "$(cat "$ART/00-brief.md.tree")^{tree}" 2>/dev/null || fail "snapshot tree $(cat "$ART/00-brief.md.tree") no longer resolves in $(repo_field repo); it was garbage-collected or the repository moved"; fi
   echo "POST-JOIN-OK lead=complete codex=$ST participants=$PSTATUS brief=$(cut -c1-12 "$ART/00-brief.md.sha256") scope=$(cut -c1-12 "$ART/00-scope.md.sha256")"
