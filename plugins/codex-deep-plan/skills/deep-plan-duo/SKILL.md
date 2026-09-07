@@ -130,7 +130,7 @@ and is never silent.
 ## Codex availability and degradation
 
 Probe once in Phase 0 (`references/codex-invocation.md`; with `--via ccr:<alias>` the probe takes
-`--via ccr:<alias> --record-dir "$ART"` and prints the alias's `ccr model show` JSON, pasted verbatim
+`--via ccr:<alias> --record-dir "$ART/debate"` (the smoke record lives beside the round prefixes `$ART/debate/r<n>-codex`, which is where every launch looks for it) and prints the alias's `ccr model show` JSON, pasted verbatim
 into `00-scope.md` after the probe line). Record SUCCEEDED / UNAVAILABLE / FAILED / DECLINED / SOLO
 in `00-scope.md`, with the backend and alias. Confirm sending repository content to the second
 model's provider (OpenAI for Codex; the alias's provider, named by the probe line, for ccr) is
@@ -176,7 +176,7 @@ the artifact directory stays the source of record.
 With `--implement ccr:<alias>` (`meta.json` `implement`), and only once `ExitPlanMode` has returned
 approval: launch the implementer in the background (`references/phases.md` §8 "Implementer
 handoff") — `scripts/implement-run.sh "$ART/implement" --via ccr:<alias> --repo <repo> --base <sha>
---branch <slug> --plan "$ART/PLAN.md"` — then report the branch, the worktree, the sidecar paths
+--branch "plan/<slug>" --plan "$ART/PLAN.md"` (the same `plan/<slug>` branch `references/phases.md` §8 names) — then report the branch, the worktree, the sidecar paths
 and the ready-to-paste review command. This is the one step of the plugin that creates a branch
 and a worktree, and it is post-approval by construction; it never runs under `--no-plan-mode`,
 after a `DECISION-REQUIRED.md`, or through the read-only runner (which refuses write mode).

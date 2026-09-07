@@ -68,7 +68,7 @@ verdict. Do not author one.
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe                                   # codex backend
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe --via ccr:<alias> --record-dir "$ART"   # ccr backend
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe --via ccr:<alias> --record-dir "$ART/debate"   # ccr backend
 ```
 
 `PROBE SUCCEEDED …` (exit 0) or `PROBE UNAVAILABLE/FAILED …` (exit 1); record the line verbatim in

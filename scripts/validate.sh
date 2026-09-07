@@ -214,9 +214,12 @@ if [ -f "$IMPL" ]; then
   grep -q 'write mode is ccr-only' "$IMPL" && note ok "$IMPL refuses every backend but ccr" || note FAIL "$IMPL must refuse --via codex (write mode is ccr-only)"
 fi
 
-echo "14. Every command's argument hint lists --via"
+echo "14. Every command's argument hint lists --via, and every command body forwards \$ARGUMENTS verbatim"
+# A body that expands only $1..$N drops every argument it does not name — the advertised --via never
+# reached the skill until the two-model review of the ccr backend caught it (F-08, F-09).
 for f in plugins/*/commands/*.md; do
   grep -q -- '--via' "$f" && note ok "$f" || note FAIL "$f argument hint does not list --via"
+  grep -q '\$ARGUMENTS' "$f" && note ok "$f forwards \$ARGUMENTS" || note FAIL "$f does not forward \$ARGUMENTS (positional \$N expansions drop the options they do not name)"
 done
 
 echo "15. The debate protocol carries both the one-opponent and the N-participant grammars"

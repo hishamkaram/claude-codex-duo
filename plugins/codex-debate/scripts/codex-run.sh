@@ -146,6 +146,8 @@ for line in open(path,encoding="utf-8",errors="replace"):
 if what=="init-session": print(sid)
 elif what=="init-model": print(model)
 elif what=="has-result": print("yes" if res is not None else "no")
+elif what=="result-ok": print("yes" if res is not None and not res.get("is_error") and res.get("subtype","success")=="success" else "no")
+elif what=="result-subtype": print("" if res is None else "%s is_error=%s" % (res.get("subtype","success"), bool(res.get("is_error"))))
 elif what=="result-text":
     if res is not None:
         r=res.get("result")
@@ -177,30 +179,56 @@ raise SystemExit(0 if ok else 1)'
       exit $?;;
     ccr:?*)
       ALIAS="${VIA#ccr:}"
-      ccr_preflight "$ALIAS" || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS $REASON"; exit 1; }
-      # Read-only smoke: a disposable repository, the exact review launch line, and a prompt that
-      # asks for a write by the Write tool and by Bash. Any file created ⇒ readonly=violated.
-      SMOKE=$(mktemp -d 2>/dev/null) && [ -d "$SMOKE" ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS mktemp failed"; exit 1; }
-      git init -q "$SMOKE/repo" 2>/dev/null || mkdir -p "$SMOKE/repo"
-      printf '%s\n' "Smoke test. Do exactly these two things, then reply with the single word DONE:" \
-        "1. Use the Write tool to create a file named smoke-write.txt containing hello in the current directory." \
-        "2. Use the Bash tool to run: echo hello > smoke-bash.txt" \
-        "If a step is refused, say so and continue." > "$SMOKE/prompt.md"
-      ARGV=(); while IFS= read -r a; do ARGV+=("$a"); done < <(ccr_launch_argv "$ALIAS" 6)
-      ( cd "$SMOKE/repo" && "${ARGV[@]}" < "$SMOKE/prompt.md" > "$SMOKE/stream.jsonl" 2> "$SMOKE/stderr" ); SRC=$?
-      CREATED=$(cd "$SMOKE/repo" && find . -path ./.git -prune -o -type f -print | sed 's|^\./||')
-      if [ -n "$CREATED" ]; then
-        echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS readonly=violated files_created=$(printf '%s' "$CREATED" | tr '\n' ',') ccr=$CCR_VER"; rm -rf "$SMOKE"; exit 1
-      fi
-      if [ "$SRC" != 0 ]; then
-        echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke launch exited $SRC ccr=$CCR_VER"; tail -5 "$SMOKE/stderr"; rm -rf "$SMOKE"; exit 1
-      fi
-      [ "$(stream_field "$SMOKE/stream.jsonl" has-result)" = yes ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke produced no result event ccr=$CCR_VER"; rm -rf "$SMOKE"; exit 1; }
-      rm -rf "$SMOKE"
-      RECORDED="not recorded (pass --record-dir <run dir> so launches in it can verify the smoke)"
+      # The same alias grammar the launch path enforces (the alias becomes a file-name suffix), and the
+      # record directory is checked before a model call is spent (review round 1: F-05).
+      case "$ALIAS" in *[!A-Za-z0-9._-]*) echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS alias may contain only letters, digits, '.', '_' and '-'"; exit 1;; esac
       if [ -n "$RECORD_DIR" ]; then
         [ -d "$RECORD_DIR" ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS --record-dir $RECORD_DIR is not a directory"; exit 1; }
-        printf 'alias=%s\nccr=%s\nmodel=%s\nprovider=%s\nreadonly=verified\nlaunch_sha256=%s\nrecorded=%s\n' "$ALIAS" "$CCR_VER" "$PROVIDER_MODEL" "$PROVIDER" "$(ccr_launch_digest)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RECORD_DIR/.ccr-smoke.$ALIAS"
+        [ -w "$RECORD_DIR" ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS --record-dir $RECORD_DIR is not writable"; exit 1; }
+      fi
+      ccr_preflight "$ALIAS" || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS $REASON"; exit 1; }
+      # Read-only smoke: a disposable repository, the exact review launch line, and a prompt that
+      # asks for a write by the Write tool and by Bash, inside and outside the repository. Any file
+      # created ⇒ readonly=violated. The smoke runs in its own process group under a wall-clock bound
+      # (SMOKE_MAX_SEC, default 300 s): a provider that never answers is killed as a group and reported
+      # UNAVAILABLE instead of hanging Phase 0 (review round 1: F-04).
+      SMOKE=$(mktemp -d 2>/dev/null) && [ -d "$SMOKE" ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS mktemp failed"; exit 1; }
+      trap 'rm -rf "$SMOKE"' EXIT
+      git init -q "$SMOKE/repo" 2>/dev/null || mkdir -p "$SMOKE/repo"
+      mkdir -p "$SMOKE/outside"
+      printf '%s\n' "Smoke test. Do exactly these three things, then reply with the single word DONE:" \
+        "1. Use the Write tool to create a file named smoke-write.txt containing hello in the current directory." \
+        "2. Use the Bash tool to run: echo hello > smoke-bash.txt" \
+        "3. Use the Bash tool to run: echo hello > $SMOKE/outside/smoke-outside.txt" \
+        "If a step is refused, say so and continue." > "$SMOKE/prompt.md"
+      ARGV=(); while IFS= read -r a; do ARGV+=("$a"); done < <(ccr_launch_argv "$ALIAS" 6)
+      SMOKE_MAX_SEC="${CODEX_RUN_SMOKE_MAX_SEC:-300}"
+      ( cd "$SMOKE/repo" && start_in_own_group "${ARGV[@]}" ) < "$SMOKE/prompt.md" > "$SMOKE/stream.jsonl" 2> "$SMOKE/stderr" &
+      SCHILD=$!; sleep 1; SPGID=$(pgid_of "$SCHILD")
+      SWAITED=0; STIMED=0
+      while kill -0 "$SCHILD" 2>/dev/null; do
+        if [ "$SWAITED" -ge "$SMOKE_MAX_SEC" ]; then STIMED=1; break; fi
+        sleep 1; SWAITED=$((SWAITED+1))
+      done
+      if [ "$STIMED" = 1 ]; then
+        if [ -n "$SPGID" ] && kill_group "$SPGID"; then SKILL="process group $SPGID terminated"; else kill -KILL "$SCHILD" 2>/dev/null; SKILL="process group ${SPGID:-unknown} NOT confirmed terminated (check: ps -o pid,pgid,command -g ${SPGID:-0})"; fi
+        wait "$SCHILD" 2>/dev/null
+        echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke timed out after ${SMOKE_MAX_SEC}s ($SKILL) ccr=$CCR_VER"; exit 1
+      fi
+      wait "$SCHILD" 2>/dev/null; SRC=$?
+      CREATED=$( { cd "$SMOKE/repo" && find . -path ./.git -prune -o -type f -print | sed 's|^\./||'; cd "$SMOKE/outside" && find . -type f -print | sed 's|^\./|outside/|'; } 2>/dev/null)
+      if [ -n "$CREATED" ]; then
+        echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS readonly=violated files_created=$(printf '%s' "$CREATED" | tr '\n' ',') ccr=$CCR_VER"; exit 1
+      fi
+      if [ "$SRC" != 0 ]; then
+        echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke launch exited $SRC ccr=$CCR_VER"; tail -5 "$SMOKE/stderr"; exit 1
+      fi
+      [ "$(stream_field "$SMOKE/stream.jsonl" has-result)" = yes ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke produced no result event ccr=$CCR_VER"; exit 1; }
+      [ "$(stream_field "$SMOKE/stream.jsonl" result-ok)" = yes ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke result is an error event ($(stream_field "$SMOKE/stream.jsonl" result-subtype)) ccr=$CCR_VER"; exit 1; }
+      RECORDED="not recorded (pass --record-dir <run dir> so launches in it can verify the smoke)"
+      if [ -n "$RECORD_DIR" ]; then
+        printf 'alias=%s\nccr=%s\nmodel=%s\nprovider=%s\nreadonly=verified\nlaunch_sha256=%s\nrecorded=%s\n' "$ALIAS" "$CCR_VER" "$PROVIDER_MODEL" "$PROVIDER" "$(ccr_launch_digest)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RECORD_DIR/.ccr-smoke.$ALIAS" \
+          || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS cannot write $RECORD_DIR/.ccr-smoke.$ALIAS"; exit 1; }
         RECORDED="recorded=$RECORD_DIR/.ccr-smoke.$ALIAS"
       fi
       echo "PROBE SUCCEEDED backend=ccr alias=$ALIAS provider=$PROVIDER model=$PROVIDER_MODEL compatibility=$COMPAT tools=$TOOLS readonly=verified ccr=$CCR_VER $RECORDED"
@@ -209,7 +237,7 @@ raise SystemExit(0 if ok else 1)'
     *) echo "PROBE UNAVAILABLE: --via must be codex or ccr:<alias> (got '$VIA')"; exit 1;;
   esac
 fi
-USAGE='usage: codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>] [--max-turns N] [--resume-session <id>]
+USAGE='usage: codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>] [--max-turns N]
        codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]'
 # Every invocation error exits 4 (LAUNCH-ERROR). Never exit 1 for a bad command line:
 # 1 means "the second model failed, retry once" in the documented contract, and a typo must not look like that.
@@ -229,19 +257,20 @@ need() { [ $# -ge 2 ] || die4 "$1 requires a value"; case "$2" in -*) die4 "$1 r
 MODE="--fresh"; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --fresh|--resume-last) MODE="$1";;
+    --fresh|--resume-last) [ -z "$RESUME_SESSION" ] || die4 "--resume-session and $1 are exclusive"; MODE="$1";;
     --via) need "$@"; VIA="$2"; shift;;
     --prompt-file) need "$@"; PROMPT_FILE="$2"; shift;;
     --stall-min) need "$@"; STALL_MIN="$2"; shift;;
     --max-min) need "$@"; MAX_MIN="$2"; shift;;
     --poll-sec) need "$@"; POLL="$2"; shift;;
     --max-turns) need "$@"; MAX_TURNS="$2"; shift;;
-    --resume-session) need "$@"; RESUME_SESSION="$2"; shift;;
+    --resume-session) need "$@"; [ "$MODE" != "--resume-last" ] || die4 "--resume-session and --resume-last are exclusive"; MODE="--resume-session"; RESUME_SESSION="$2"; shift;;
     --claim) need "$@"; CLAIM_MODE=1; CLAIM_TOKEN="$2"; shift;;
     --write) die4 "--write is refused; this runner is read-only";;
     *) die4 "unknown arg $1";;
   esac; shift
 done
+[ "$MODE" != "--resume-session" ] || [ -n "$RESUME_SESSION" ] || die4 "--resume-session requires a session id"
 case "$VIA" in
   codex) BACKEND=codex; ALIAS="";;
   ccr:?*) BACKEND=ccr; ALIAS="${VIA#ccr:}"; case "$ALIAS" in *[!A-Za-z0-9._-]*) die4 "--via ccr:<alias>: alias may contain only letters, digits, '.', '_' and '-' (got '$ALIAS')";; esac;;
@@ -253,7 +282,6 @@ if [ "$BACKEND" = codex ]; then
   [ -z "$RESUME_SESSION" ] || die4 "--resume-session is ccr-only (pass --via ccr:<alias>)"
 else
   [ -n "$MAX_TURNS" ] || MAX_TURNS=$CCR_MAX_TURNS_DEFAULT
-  [ -z "$RESUME_SESSION" ] || [ "$MODE" != "--resume-last" ] || die4 "--resume-session and --resume-last are exclusive"
   case "$RESUME_SESSION" in *[!A-Za-z0-9-]*) die4 "--resume-session: a session id has only letters, digits and '-' (got '$RESUME_SESSION')";; esac
 fi
 for v in STALL_MIN MAX_MIN POLL MAX_TURNS; do
@@ -339,14 +367,14 @@ START=$(date +%s); now() { date +%s; }; elapsed() { echo $(( $(now) - START )); 
 # =============================================================================================
 if [ "$BACKEND" = ccr ]; then
   DIR=$(dirname "$PREFIX")
-  CMD="ccr launch --model $ALIAS --permission-mode plan -p ... --max-turns $MAX_TURNS $MODE${RESUME_SESSION:+ --resume-session $RESUME_SESSION}"
+  CMD="ccr launch --model $ALIAS --permission-mode plan -p ... --max-turns $MAX_TURNS $MODE${RESUME_SESSION:+ $RESUME_SESSION}"
   ccr_preflight "$ALIAS" || launch_error "$REASON" "$CMD"
   ccr_smoke_check "$DIR" "$ALIAS" || launch_error "$REASON" "$CMD"
   SESSION=""
   if [ "$MODE" = "--resume-last" ]; then
     SESSION=$(cat "$DIR/.ccr-last-session" 2>/dev/null | head -1 | tr -d ' ')
     [ -n "$SESSION" ] || launch_error "--resume-last: no previous ccr session recorded in $DIR/.ccr-last-session" "$CMD"
-  elif [ -n "$RESUME_SESSION" ]; then SESSION="$RESUME_SESSION"; fi
+  elif [ "$MODE" = "--resume-session" ]; then SESSION="$RESUME_SESSION"; fi
   ARGV=(); while IFS= read -r a; do ARGV+=("$a"); done < <(ccr_launch_argv "$ALIAS" "$MAX_TURNS" "$SESSION")
   stamp_claim; rotate_previous_attempt; unlock_claim
   : > "$PREFIX.progress"; : > "$PREFIX.stderr"; : > "$PREFIX.joblog"
@@ -396,7 +424,9 @@ if [ "$BACKEND" = ccr ]; then
   HAS_RESULT=$(stream_field "$PREFIX.joblog" has-result)
   stream_field "$PREFIX.joblog" result-text > "$PREFIX.stdout"
   if [ "$OUTCOME" = EXITED ]; then
-    if [ "$CHILD_RC" = 0 ] && [ "$HAS_RESULT" = yes ]; then OUTCOME=COMPLETED; else OUTCOME=FAILED; fi
+    # A result event that is an error (is_error, or a non-success subtype such as error_max_turns) is a
+    # failed attempt even if the child exited 0 (review round 1: F-10).
+    if [ "$CHILD_RC" = 0 ] && [ "$HAS_RESULT" = yes ] && [ "$(stream_field "$PREFIX.joblog" result-ok)" = yes ]; then OUTCOME=COMPLETED; else OUTCOME=FAILED; fi
   fi
   [ "$OUTCOME" != COMPLETED ] || [ -z "$SESSION_ID" ] || printf '%s\n' "$SESSION_ID" > "$DIR/.ccr-last-session"
   {
@@ -404,7 +434,8 @@ if [ "$BACKEND" = ccr ]; then
     echo "claude_model_id=$CLAUDE_MODEL"; echo "routed_model=${ROUTED_MODEL:-unknown}"; echo "compatibility=$COMPAT"; echo "ccr_version=$CCR_VER"
     echo "pid=$CHILD"; echo "pgid=$PGID"; echo "child_exit=$CHILD_RC"; echo "thread=${SESSION_ID:-unknown}"
     echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "max_turns=$MAX_TURNS"
-    echo "mode=$MODE"; echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
+    echo "mode=$MODE"; [ "$MODE" != "--resume-session" ] || echo "resume_session=$RESUME_SESSION"; echo "result_event=$(stream_field "$PREFIX.joblog" result-subtype)"
+    echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
     LASTERR=$(grep -E 'error|Error|exit status' "$PREFIX.stderr" | tail -1 | cut -c1-300)
     echo "last_error=${LASTERR:-none}"; echo "cancel_confirmed=$([ "$UNCONFIRMED_CANCEL" = 1 ] && echo no || echo "$([ "$OUTCOME" = STALLED ] || [ "$OUTCOME" = TIMEOUT ] && echo yes || echo n/a)")"
   } > "$PREFIX.meta"

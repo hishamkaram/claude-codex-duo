@@ -213,6 +213,7 @@ esac
 FAKE
 chmod +x "$CCRBIN/ccr"
 CCRD="$TMP/ccrrun"; mkdir -p "$CCRD"; CP="$CCRD/02-p2"
+mkdir -p "$TMP/ccrerr"; sed 's/"subtype":"success","is_error":false/"subtype":"error_max_turns","is_error":true/' "$CCRBIN/ccr" > "$TMP/ccrerr/ccr"; chmod +x "$TMP/ccrerr/ccr"   # a fake whose result event is an error (review round 1: F-10)
 ccr_run() { PATH="$CCRBIN:$PATH" bash "$R" "$@"; }
 # T-1 / T-2: argument errors, exit 4 and .exit=4 on a claim-less prefix
 chk "T-1: --via without a value"          4 "requires a value"      bash "$R" "$CP" --via
@@ -257,6 +258,27 @@ printf 'alias=x\nccr=0.4.10\nmodel=claude-haiku-4-5\nreadonly=verified\nlaunch_s
 chk "T-5c: record from another ccr version" 4 "another ccr version" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-py" --via ccr:y --prompt-file "$PROMPT"
 sed 's/^readonly=verified/readonly=violated/' "$CCRD/.ccr-smoke.x" > "$CCRD/.ccr-smoke.z"
 chk "T-5c: violated record"               4 "not 'readonly=verified'" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-pz" --via ccr:z --prompt-file "$PROMPT"
+# review round 1 F-02: the deep-plan layout — record beside the round prefixes ($ART/debate) and launch there
+mkdir -p "$CCRD/dp/debate"; PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/dp/debate" >/dev/null 2>&1
+chk "F-02: deep-plan prefix launches with its own record" 0 "COMPLETED" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/dp/debate/r0-codex" --via ccr:x --fresh --prompt-file "$PROMPT" --poll-sec 1
+grep -q -- '--record-dir "$ART/debate"' plugins/codex-deep-plan/skills/deep-plan-duo/references/codex-invocation.md && grep -q -- '--record-dir "$ART/debate"' plugins/codex-deep-plan/skills/deep-plan-duo/SKILL.md && printf '  ok    %-42s\n' "F-02: deep-plan documents --record-dir \$ART/debate" || { printf '  FAIL  F-02: deep-plan docs still record the smoke in $ART\n'; FAIL=1; }
+# review round 1 F-05: the probe validates the alias and the record directory before the smoke, and fails on a write error
+chk "F-05: probe refuses an alias with a slash" 1 "alias may contain only" env PATH="$CCRBIN:$PATH" bash "$R" --probe --via 'ccr:a/b' --record-dir "$CCRD"
+[ ! -e "$CCRD/.ccr-smoke.a" ] && [ ! -d "$CCRD/.ccr-smoke.a" ] && printf '  ok    %-42s\n' "F-05: nothing recorded for a bad alias" || { printf '  FAIL  F-05: a record was written for a/b\n'; FAIL=1; }
+mkdir -p "$CCRD/ro"; chmod 500 "$CCRD/ro"
+if [ "$(id -u)" != 0 ]; then
+  out=$(PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/ro" 2>&1); rc=$?
+  [ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'not writable' && ! printf '%s' "$out" | grep -q 'recorded=' && printf '  ok    %-42s\n' "F-05: read-only record dir → UNAVAILABLE, no recorded=" || { printf '  FAIL  F-05(ro): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+fi
+chmod 700 "$CCRD/ro"
+chk "F-05: --record-dir that is not a directory" 1 "is not a directory" env PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/nonexistent"
+# review round 1 F-04: a smoke that never returns is killed as a group and reported UNAVAILABLE within the bound
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=grandchild CODEX_RUN_SMOKE_MAX_SEC=3 bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'smoke timed out after 3s (process group [0-9]* terminated)' && ! pgrep -f 'sleep 600' >/dev/null && printf '  ok    %-42s\n' "F-04: hung smoke → UNAVAILABLE, group killed" || { printf '  FAIL  F-04: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; pkill -f 'sleep 600' 2>/dev/null; FAIL=1; }
+grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" && printf '  ok    %-42s\n' "F-04: the earlier record survives a failed re-probe" || { printf '  FAIL  F-04: record clobbered\n'; FAIL=1; }
+# F-10 (probe): a smoke whose result event is an error is not readonly=verified
+out=$(PATH="$TMP/ccrerr:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/dp" 2>&1); rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'smoke result is an error event (error_max_turns' && [ ! -e "$CCRD/dp/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "F-10: error result in the smoke → UNAVAILABLE" || { printf '  FAIL  F-10(probe): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
 rm -f "$CCRD/02-py".* "$CCRD/02-pz".* "$CCRD/.ccr-smoke.y" "$CCRD/.ccr-smoke.z"
 # T-7: happy path — exact argv, stdin = prompt, sidecars, thread = session id, last-session file
 printf 'review this\n' > "$CCRD/prompt.md"
@@ -268,10 +290,17 @@ out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8" bash "$R" "$CP" --via 
 [ "$rc" = 0 ] && grep -qx -- '--resume' "$TMP/argv8" && grep -qx 'sess-7' "$TMP/argv8" && grep -q 'resume:sess-7' "$CP.stdout" && [ -e "$CP.attempt1.meta" ] && printf '  ok    %-42s\n' "T-8: --resume-last passes --resume <last session>" || { printf '  FAIL  T-8(resume-last): rc=%s\n' "$rc"; FAIL=1; }
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8b" bash "$R" "$CP" --via ccr:x --resume-session s2 --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
 [ "$rc" = 0 ] && grep -qx 's2' "$TMP/argv8b" && grep -q 'resume:s2' "$CP.stdout" && printf '  ok    %-42s\n' "T-8: --resume-session passes --resume <id>" || { printf '  FAIL  T-8(resume-session): rc=%s\n' "$rc"; FAIL=1; }
+# review round 1 F-01: an explicit resume is its own mode, recorded for the gates
+grep -qx 'mode=--resume-session' "$CP.meta" && grep -qx 'resume_session=s2' "$CP.meta" && printf '  ok    %-42s\n' "F-01: --resume-session recorded as mode" || { printf '  FAIL  F-01: mode line %s\n' "$(grep '^mode=' "$CP.meta")"; FAIL=1; }
+chk "F-01: --resume-session with --resume-last refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-session s2 --resume-last --prompt-file "$CCRD/prompt.md"
+chk "F-01: --resume-last then --resume-session refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-last --resume-session s2 --prompt-file "$CCRD/prompt.md"
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8c" bash "$R" "$CP" --via ccr:x --fresh --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
 [ "$rc" = 0 ] && ! grep -qx -- '--resume' "$TMP/argv8c" && printf '  ok    %-42s\n' "T-8: --fresh passes no --resume" || { printf '  FAIL  T-8(fresh): rc=%s\n' "$rc"; FAIL=1; }
 mkdir -p "$CCRD/nolast"; cp "$CCRD/.ccr-smoke.x" "$CCRD/nolast/"
 chk "T-8: --resume-last without a session" 4 "no previous ccr session" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/nolast/02-p1" --via ccr:x --resume-last --prompt-file "$CCRD/prompt.md"
+# review round 1 F-10: a result event that is an error (is_error / non-success subtype) with child exit 0 is FAILED
+out=$(PATH="$TMP/ccrerr:$PATH" bash "$R" "$CCRD/02-perr" --via ccr:x --fresh --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 1 ] && grep -qx 'outcome=FAILED' "$CCRD/02-perr.meta" && grep -q '^result_event=error_max_turns is_error=True' "$CCRD/02-perr.meta" && printf '  ok    %-42s\n' "F-10: error result event with exit 0 → FAILED" || { printf '  FAIL  F-10: rc=%s meta=%s\n' "$rc" "$(grep -E '^(outcome|result_event)=' "$CCRD/02-perr.meta" | tr '\n' ' ')"; FAIL=1; }
 # T-9: child failure and missing result event
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=fail bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
 [ "$rc" = 1 ] && [ "$(cat "$CP.exit")" = 1 ] && grep -q '^outcome=FAILED' "$CP.meta" && grep -q '^child_exit=1' "$CP.meta" && printf '  ok    %-42s\n' "T-9: child exit 1 → FAILED" || { printf '  FAIL  T-9(fail): rc=%s\n' "$rc"; FAIL=1; }
@@ -385,6 +414,20 @@ out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=implement FAKE_CCR_ARGV_OUT="$TMP/argv1
 WT=$(cat "$IP.worktree" 2>/dev/null)
 [ "$rc" = 0 ] && grep -qx -- '--permission-mode' "$TMP/argv14" && grep -qx 'acceptEdits' "$TMP/argv14" && ! grep -qx 'plan' "$TMP/argv14" && grep -qx -- '--max-turns' "$TMP/argv14" && [ "$(cat "$TMP/cwd14")" = "$WT" ] && [ -d "$WT/.git" -o -f "$WT/.git" ] && [ "$(git -C "$WT" rev-parse --abbrev-ref HEAD)" = impl/hello ] && grep -q 'Add hello.txt' "$TMP/stdin14" && grep -q '^outcome=COMPLETED' "$IP.meta" && grep -q '^branch=impl/hello' "$IP.meta" && grep -q '^commits=1' "$IP.meta" && grep -q 'hello.txt' "$IP.diff" && [ "$(cat "$IP.plan.sha256")" = "$(shasum -a 256 "$IP.brief.md" | cut -d' ' -f1)" ] && [ "$(cat "$IP.exit")" = 0 ] && grep -q 'implemented' "$IP.stdout" && printf '  ok    %-42s\n' "T-14: implementer happy path" || { printf '  FAIL  T-14: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
 [ "$(git -C "$G2" rev-parse --abbrev-ref HEAD)" != impl/hello ] && [ -z "$(git -C "$G2" status --porcelain)" ] && printf '  ok    %-42s\n' "T-14: the user's checkout is untouched" || { printf '  FAIL  T-14: user checkout changed\n'; FAIL=1; }
+# review round 1 F-17: the launcher pre-allows git and the test commands, and commits what the child left uncommitted
+grep -qxF -- '--allowedTools' "$TMP/argv14" && grep -qxF 'Bash(git commit:*)' "$TMP/argv14" && grep -qxF 'Bash(git add:*)' "$TMP/argv14" && printf '  ok    %-42s\n' "F-17: git add/commit pre-allowed for the child" || { printf '  FAIL  F-17: allowedTools missing from argv\n'; FAIL=1; }
+cat > "$CCRBIN/ccr-impl-hook.sh" <<'HOOK'
+# an implementer that edits but cannot commit (headless git denied): leaves the work in the tree
+printf 'left\n' > left.txt
+HOOK
+IPU="$IMD/uncommitted/implement"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=implement FAKE_CCR_ARGV_OUT="$TMP/argv17" FAKE_CCR_RESULT="edited, could not commit" bash "$IM" "$IPU" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/left --plan "$IMD/PLAN.md" --test-cmd "bash scripts/test.sh" --test-cmd "python3 -m pytest" --poll-sec 1 2>&1); rc=$?
+WTU=$(cat "$IPU.worktree" 2>/dev/null)
+[ "$rc" = 0 ] && grep -qxF 'Bash(bash:*)' "$TMP/argv17" && grep -qxF 'Bash(python3:*)' "$TMP/argv17" && grep -q '^commits=1' "$IPU.meta" && grep -q '^launcher_committed_paths=1' "$IPU.meta" && grep -q '^uncommitted_paths=0' "$IPU.meta" && grep -q 'left.txt' "$IPU.diff" && git -C "$WTU" log -1 --format=%s | grep -q 'implement: uncommitted work' && printf '  ok    %-42s\n' "F-17: launcher commits uncommitted work; test cmds allowed" || { printf '  FAIL  F-17: rc=%s meta=%s\n' "$rc" "$(grep -E '^(commits|launcher_committed_paths|uncommitted_paths)=' "$IPU.meta" | tr '\n' ' ')"; FAIL=1; }
+cat > "$CCRBIN/ccr-impl-hook.sh" <<'HOOK'
+# executed by the fake ccr in "implement" mode: behave like an implementer inside cwd
+printf 'hello\n' > hello.txt; git add hello.txt >/dev/null 2>&1; git -c user.email=t@t -c user.name=t commit -qm "add hello" >/dev/null 2>&1
+HOOK
 chk "T-14: existing worktree refused"      4 "worktree path already exists" bash "$IM" "$IP" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/other --plan "$IMD/PLAN.md"
 IP2="$IMD/second/implement"
 chk "T-14: existing branch refused"        4 "branch already exists"  env PATH="$CCRBIN:$PATH" bash "$IM" "$IP2" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/hello --plan "$IMD/PLAN.md"
@@ -427,6 +470,10 @@ chk "init: non-numeric comment fragment" 2 "must be #issuecomment"  bash "$I" --
 # F-16: free text may begin with a dash
 bash "$I" --repo "$G2" --out "$TMP/art16" --request "-v is ignored" >/dev/null 2>&1 && grep -q '^-v is ignored$' "$TMP/art16/inputs/request-1.md" \
   && printf '  ok    %-42s\n' "request text may start with a dash" || { printf '  FAIL  dash-leading request rejected\n'; FAIL=1; }
+# review round 1 F-14: an explicit slug is normalised like a derived one (it names the run dir and the plan/<slug> branch)
+bash "$I" --repo "$G2" --out "$TMP/artslug" --slug "Fix Login!" --request x >/dev/null 2>&1
+python3 -c "import json; m=json.load(open('$TMP/artslug/meta.json')); assert m['slug']=='fix-login', m['slug']" \
+  && printf '  ok    %-42s\n' "F-14: explicit slug normalised" || { printf '  FAIL  F-14: slug not normalised\n'; FAIL=1; }
 # proportionality (debate 2026-09-03): --deep is recorded; the resolved mode is left to the skill
 bash "$I" --repo "$G2" --out "$TMP/artdeep" --deep --request x >/dev/null 2>&1
 python3 -c "import json; m=json.load(open('$TMP/artdeep/meta.json')); assert m['mode_requested']=='deep' and m['mode'] is None, m" \
@@ -1113,6 +1160,15 @@ chk "T-16: every participant complete → run pre-phase3" 1 "already records a c
 echo "review: consultation validator and state gates"
 CV=plugins/codex-pr-review/skills/two-model-pr-review/scripts/validate-consultation.py
 [ -x "$CV" ] && printf '  ok    %-42s\n' "consultation validator is executable" || { printf '  FAIL  consultation validator is not executable\n'; FAIL=1; }
+# review round 1 F-18: a citation quoting the runner's own option value "--via codex" is not an attribution
+python3 - <<'PY' && printf '  ok    %-42s\n' "F-18: '--via codex' passes, 'via codex' is caught" || { printf '  FAIL  F-18: provenance filter on the --via flag\n'; FAIL=1; }
+import sys; sys.path.insert(0, "plugins/codex-pr-review/skills/two-model-pr-review/scripts"); import review_common as rc
+assert rc.PROVENANCE_RE.search('argument-hint: [--via codex|ccr:<alias>[,...]]') is None
+assert rc.PROVENANCE_RE.search('default --via codex; at most one') is None
+assert rc.PROVENANCE_RE.search('reviewed via codex') is not None
+assert rc.PROVENANCE_RE.search('checked by Codex') is not None
+assert rc.PROVENANCE_RE.search('according to the lead') is not None
+PY
 CS="$TMP/consult"; mkdir -p "$CS"
 printf 'scope\n' > "$CS/00-scope.md"; mkbrief "$CS"
 pgw pre-codex "$CS" "$G2" >/dev/null || { printf '  FAIL  consultation fixture pre-codex\n'; FAIL=1; }
@@ -2483,9 +2539,20 @@ chk "T-27: DONE at convergence" 0 "DONE p1:convergence; p2:convergence; p3:conve
 ledger 'X3-01|p3|E0|OPEN|r0'
 touch "$ND/03-round-2-p3.md"
 chk "T-27: DONE at stalemate" 0 "p3:stalemate" no 3
+# review round 1 F-03: a round that changed only a Claude-owned row (conceded, verified) is not a stalemate round
+ledger 'C-1|claude|E1|CONCEDED-BY-CLAUDE|r2' 'X3-01|p3|E0|OPEN|r0'
+chk "F-03: Claude-row change in the pair's round → not a stalemate" 0 "NEXT p3 round=3 pair_round=3" no 5
+ledger 'X3-01|p3|E0|OPEN|r0'
 # pair cap: rounds 2 with two rounds held and a change in r2 → cap, not stalemate
 ledger 'X3-01|p3|E0|OPEN|r2'
 chk "T-27: DONE at the pair cap" 0 "p3:pair cap" no 2
+# review round 1 F-15: one-turn coverage keeps the cycle in progress — after p1,p2,p3,p1,p2 the turn is p3's
+rm -f "$ND"/03-round-*.md
+ledger 'X1-01|p1|E0|OPEN|r4' 'X2-01|p2|E2|OPEN|r5' 'X3-01|p3|E3|OPEN|r3'
+printf 'p1\tcodex\t-\np2\tccr\ta\np3\tccr\tb\n' > "$ND/00-participants.tsv"
+for f in 1-p1 2-p2 3-p3 4-p1 5-p2; do touch "$ND/03-round-$f.md"; done
+chk "F-15: partial cycle kept after a complete one" 0 "NEXT p3 round=6 pair_round=2 score=1 reason=highest dissent score, coverage turn" no 5 15
+rm -f "$ND"/03-round-*.md; printf 'p1\tcodex\t-\np2\tccr\ta\np3\tccr\tb\np4\tccr\tc\np5\tccr\td\n' > "$ND/00-participants.tsv"
 # gap in the round numbering → usage error
 touch "$ND/03-round-4-p1.md"
 chk "T-27: round-file gap refused" 2 "not numbered 1..n" no 3

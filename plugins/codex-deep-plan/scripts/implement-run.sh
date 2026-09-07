@@ -116,6 +116,8 @@ for line in open(path,encoding="utf-8",errors="replace"):
     if e.get("type")=="result": res=e
 if what=="init-session": print(sid)
 elif what=="has-result": print("yes" if res is not None else "no")
+elif what=="result-ok": print("yes" if res is not None and not res.get("is_error") and res.get("subtype","success")=="success" else "no")
+elif what=="result-subtype": print("" if res is None else "%s is_error=%s" % (res.get("subtype","success"), bool(res.get("is_error"))))
 elif what=="result-text":
     if res is not None:
         r=res.get("result"); r="" if r is None else r
@@ -154,8 +156,14 @@ WT=$(cd "$WT" && pwd -P); printf '%s\n' "$WT" > "$PREFIX.worktree"
 shasum -a 256 "$PREFIX.brief.md" | cut -d' ' -f1 > "$PREFIX.plan.sha256"
 
 # --- launch ----------------------------------------------------------------------------------
+# acceptEdits auto-approves file edits inside the worktree only; every Bash command still needs a
+# permission the headless session cannot ask for (verified live: git commit and test commands are
+# denied). The launcher therefore pre-allows the git subcommands the brief asks for and the first
+# word of every --test-cmd, and commits whatever the child leaves uncommitted (review round 1: F-17).
+ALLOWED=("Bash(git add:*)" "Bash(git commit:*)" "Bash(git status:*)" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(git rev-parse:*)")
+for c in ${TEST_CMDS[@]+"${TEST_CMDS[@]}"}; do set -- $c; [ -n "${1:-}" ] && ALLOWED+=("Bash($1:*)"); done
 ARGV=(ccr launch --model "$ALIAS" --permission-mode acceptEdits -p --no-lifecycle --no-statusline -- \
-      --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --max-turns "$MAX_TURNS")
+      --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --max-turns "$MAX_TURNS" --allowedTools "${ALLOWED[@]}")
 CMD="ccr launch --model $ALIAS --permission-mode acceptEdits -p ... --max-turns $MAX_TURNS (cwd=$WT)"
 : > "$PREFIX.progress"; : > "$PREFIX.joblog"
 ( cd "$WT" && start_in_own_group "${ARGV[@]}" ) < "$PREFIX.brief.md" > "$PREFIX.joblog" 2>> "$PREFIX.stderr" &
@@ -194,14 +202,21 @@ fi
 wait "$CHILD" 2>/dev/null; CHILD_RC=$?
 SESSION_ID=$(stream_field "$PREFIX.joblog" init-session); HAS_RESULT=$(stream_field "$PREFIX.joblog" has-result)
 stream_field "$PREFIX.joblog" result-text > "$PREFIX.stdout"
-if [ "$OUTCOME" = EXITED ]; then if [ "$CHILD_RC" = 0 ] && [ "$HAS_RESULT" = yes ]; then OUTCOME=COMPLETED; else OUTCOME=FAILED; fi; fi
+if [ "$OUTCOME" = EXITED ]; then if [ "$CHILD_RC" = 0 ] && [ "$HAS_RESULT" = yes ] && [ "$(stream_field "$PREFIX.joblog" result-ok)" = yes ]; then OUTCOME=COMPLETED; else OUTCOME=FAILED; fi; fi
+# Whatever the child left uncommitted is committed by the launcher, so the branch is the deliverable
+# even when the child could not run git; the sidecar records how many paths that was.
+LEFT=$(git -C "$WT" --no-optional-locks status --porcelain=v1 --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')
+if [ "$LEFT" != 0 ]; then
+  git -C "$WT" add -A >>"$PREFIX.stderr" 2>&1 && git -C "$WT" -c user.name="implement-run.sh" -c user.email="implement-run@localhost" commit -q -m "implement: uncommitted work left by the implementer ($LEFT paths; plan $(cat "$PREFIX.plan.sha256" | cut -c1-12))" >>"$PREFIX.stderr" 2>&1 \
+    && echo "$(elapsed)s launcher committed $LEFT uncommitted path(s)" >> "$PREFIX.progress" || echo "$(elapsed)s launcher could not commit $LEFT uncommitted path(s)" >> "$PREFIX.progress"
+fi
 git -C "$WT" diff "$BASE_SHA"..HEAD > "$PREFIX.diff" 2>>"$PREFIX.stderr" || true
 COMMITS=$(git -C "$WT" rev-list --count "$BASE_SHA"..HEAD 2>/dev/null || echo 0)
 DIRTY=$(git -C "$WT" --no-optional-locks status --porcelain=v1 --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')
 {
   echo "outcome=$OUTCOME"; echo "backend=ccr"; echo "mode=implement"; echo "alias=$ALIAS"; echo "provider=$PROVIDER"; echo "provider_model=$PROVIDER_MODEL"; echo "ccr_version=$CCR_VER"
   echo "pid=$CHILD"; echo "pgid=$PGID"; echo "child_exit=$CHILD_RC"; echo "thread=${SESSION_ID:-unknown}"
-  echo "repo=$REPO"; echo "base=$BASE_SHA"; echo "branch=$BRANCH"; echo "worktree=$WT"; echo "commits=$COMMITS"; echo "uncommitted_paths=$DIRTY"
+  echo "repo=$REPO"; echo "base=$BASE_SHA"; echo "branch=$BRANCH"; echo "worktree=$WT"; echo "commits=$COMMITS"; echo "launcher_committed_paths=$LEFT"; echo "uncommitted_paths=$DIRTY"; echo "result_event=$(stream_field "$PREFIX.joblog" result-subtype)"
   echo "plan_sha256=$(cat "$PREFIX.plan.sha256")"; echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "max_turns=$MAX_TURNS"
   echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
   LASTERR=$(grep -E 'error|Error|exit status' "$PREFIX.stderr" | tail -1 | cut -c1-300); echo "last_error=${LASTERR:-none}"

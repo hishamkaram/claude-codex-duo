@@ -55,7 +55,9 @@ PROVENANCE_RE = re.compile(
     # Attribution by preposition: "checked by Codex", "according to Codex",
     # "per Claude", "from the lead" — but not a path or tool name such as
     # "by codex-run.sh" (round-28 CX-01).
-    r"\b(?:by|from|per|according\s+to|via|with|against|to)\s+(?:claude|codex|the\s+lead)(?![\w./-])|"
+    # A leading "--" makes the preposition a flag name ("--via codex" is the runner's own option
+    # value, not an attribution) — review round 1 of the ccr backend, F-18.
+    r"(?<!-)\b(?:by|from|per|according\s+to|via|with|against|to)\s+(?:claude|codex|the\s+lead)(?![\w./-])|"
     r"\b(?:lead-reviewer|finding-verifier|fact-checker)\b|"
     r"\bgpt-?[0-9o][0-9a-z.-]*\b|\bclaude[\s-]+(?:opus|sonnet|haiku|fable|mythos)\b|"
     r"\b(?:the\s+)?(?:other|first|second|both)\s+(?:reviewer|opinion)s?\b|"

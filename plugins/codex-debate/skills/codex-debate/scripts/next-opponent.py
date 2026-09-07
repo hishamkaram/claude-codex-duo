@@ -41,7 +41,6 @@ WEIGHT = {"E0": 4, "E1": 3, "E2": 2, "E3": 1, "E4": 0}
 OPEN = ("OPEN", "VERIFY-PENDING")
 C_ID = re.compile(r"\bC-\d+\b")
 ROUND_FILE = re.compile(r"^03-round-(\d+)-(p\d+)\.md$")
-CHANGED = re.compile(r"\br(\d+)\b")
 
 
 def die(msg: str) -> None:
@@ -136,8 +135,12 @@ def main(argv: list[str]) -> int:
         return sum(WEIGHT.get(r["grade"], 0) for r in (attacking or rows))
 
     def changed_in(p: str, rnd: int) -> bool:
+        # Round rnd was held against p by construction of hist, so every row changed in it — the
+        # opponent's or a Claude claim conceded, verified or superseded — moved that pair; a
+        # stalemate is "pure MAINTAIN on both sides" (protocol.md), not "the opponent did not move"
+        # (review round 1: F-03).
         tag = f"r{rnd}"
-        return any(r["changed"] == tag for r in ledger if r["owner"] == p or r["status"].endswith(p.upper()))
+        return any(r["changed"] == tag for r in ledger)
 
     def terminal(p: str) -> str | None:
         if not open_rows(p):
@@ -159,13 +162,15 @@ def main(argv: list[str]) -> int:
         return 0
     # one-turn coverage: the current cycle is the tail of the history since the last point at
     # which every eligible participant had been faced at least once.
+    # Walk the history forwards: a cycle closes when every currently eligible participant has been
+    # faced once, and what follows the last closed cycle is the cycle in progress (review round 1:
+    # F-15 — a backward scan could reach the previous complete cycle and clear the current one).
     faced: set[str] = set()
-    for _, q in reversed(hist):
+    for _, q in hist:
         if q in eligible:
             faced.add(q)
         if faced >= set(eligible):
             faced = set()
-            break
     verify_pending = [p for p in eligible if any(r["status"] == "VERIFY-PENDING" for r in open_rows(p))]
     if verify_pending and hist and hist[-1][1] in verify_pending:
         pick, why = hist[-1][1], "VERIFY pending with the participant just faced"

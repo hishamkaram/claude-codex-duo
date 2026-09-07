@@ -253,8 +253,13 @@ monitored exchange protocol once with executed verification evidence, again from
 `templates/codex-exchange.md`:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/06-resolution" --claim "$CLAIM" --resume-last --prompt-file "$ART/06-resolution.prompt.md" --stall-min 6 --max-min 20
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/06-resolution" --claim "$CLAIM" --resume-last --prompt-file "$ART/06-resolution.prompt.md" --stall-min 6 --max-min 20                                            # codex participant
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/06-resolution" --via ccr:<alias> --claim "$CLAIM" --resume-session "$(cat "$ART/04-consultation.thread")" --prompt-file "$ART/06-resolution.prompt.md" --stall-min 6 --max-min 20   # ccr participant: the accepted anchor
 ```
+
+A `--resume-session` launch is recorded as `mode=--resume-session` (plus `resume_session=<id>`)
+and the gates anchor it exactly like `--resume-last`: its `thread=` must equal the exchange
+participant's session, or the attempt is unusable.
 
 Across Phases 4 and 6, permit at most two successful responses and four
 runner launches, whatever the number of participants (only the exchange

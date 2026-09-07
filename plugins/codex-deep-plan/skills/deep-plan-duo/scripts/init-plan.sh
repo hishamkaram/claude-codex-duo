@@ -292,6 +292,10 @@ for kind, value in inputs:
         records.append({"kind": "comment", "id": str(ref["comment_id"]), "url": d.get("html_url") or ref["url"], "file": f"inputs/{fn}",
                         "comment_kind": ref["comment_kind"], "parent": ref["number"], "title": title})
 
+if slug:
+    # An explicit slug is normalised exactly like a derived one: it names the artifact directory
+    # and the documented implementer branch plan/<slug> (review round 1: F-14).
+    slug = re.sub(r"[^a-z0-9]+", "-", slug.lower()).strip("-") or "plan"
 if not slug:
     first = records[0] if records else None
     if first and first["kind"] != "request":

@@ -419,7 +419,7 @@ attempt_usable() {
   fi
   case "$mode_val" in
     --fresh) return 0;;
-    --resume-last)
+    --resume-last|--resume-session)  # a ccr exchange names the session explicitly; it is anchored the same way (review round 1: F-01)
       expected=$(expected_thread 2>/dev/null) || return 1
       [ "$actual" = "$expected" ];;
     *) return 1;;
@@ -458,7 +458,7 @@ check_thread() {
   fi
   case "$mode_val" in
     --fresh) return 0;; # A documented self-contained retry cannot preserve thread continuity (and needs no prior thread).
-    --resume-last) ;;
+    --resume-last|--resume-session) ;;  # --resume-session (ccr) must name the exchange participant's session (review round 1: F-01)
     *) fail "$prefix.meta records no recognisable launch mode (mode=${mode_val:-missing})";;
   esac
   expected=$(expected_thread) || fail "cannot determine expected Codex thread"
@@ -838,13 +838,13 @@ pre-codex)
     printf '%s\n' "$SCHEMA_MARKER" > "$ART/00-schema" || fail "could not write 00-schema"
   fi
   schema_check
-  TO_LAUNCH=""; ANY_TERMINAL=0; ALL_COMPLETE=1
+  TO_LAUNCH=""; ANY_TERMINAL=0
   for id in $(participant_ids); do
     reject_unconfirmed_cancel "02-$id"
     if [ ! -s "$ART/02-$id.md" ] && [ -s "$ART/02-$id.exit" ] && [ "$(cat "$ART/02-$id.exit")" = 0 ] && [ -s "$ART/02-$id.stdout" ]; then
       fail "02-$id.exit records an accepted attempt with no 02-$id.md yet; write 02-$id.md from the existing sidecars instead of relaunching participant $id"
     fi
-    if [ -s "$ART/02-$id.md" ]; then ANY_TERMINAL=1; else ALL_COMPLETE=0; TO_LAUNCH="$TO_LAUNCH $id"; fi
+    if [ -s "$ART/02-$id.md" ]; then ANY_TERMINAL=1; else TO_LAUNCH="$TO_LAUNCH $id"; fi
   done
   if [ "$ANY_TERMINAL" = 1 ]; then
     # Re-entry with terminal participants: a joined run must still be consistent; an unjoined

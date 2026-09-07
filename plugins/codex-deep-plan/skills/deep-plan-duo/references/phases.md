@@ -153,9 +153,19 @@ runner: it creates `<ART>/worktree` on a new branch at the base SHA (`git worktr
 the brief it will execute (`implement.brief.md` = fixed header + `PLAN.md` verbatim, digest in
 `implement.plan.sha256`), and launches `ccr launch --model <alias> --permission-mode acceptEdits`
 inside the worktree with the same stream, stall, timeout, process-group and exit contract as the
-runner. Sidecars: the usual six plus `.diff` (commits made on the branch), `.worktree`,
+runner. Sidecars: the usual six plus `.diff` (the branch against the base SHA), `.worktree`,
 `.brief.md`, `.plan.sha256`. The user's checkout, index and refs are untouched; the branch is the
 deliverable and the worktree is never removed by the plugin.
+
+What bounds the implementer's writes is the nested session's own permission engine, not an OS
+sandbox: `acceptEdits` auto-approves file edits inside the worktree (its working directory) only,
+a Write or a shell redirection to a path outside it is denied, and every Bash command still needs
+a permission a headless session cannot ask for — verified live. The launcher therefore passes
+`--allowedTools` for the git subcommands the brief asks for (`add`, `commit`, `status`, `diff`,
+`log`, `show`, `rev-parse`) and for the first word of every `--test-cmd`; nothing else is
+pre-approved. If the child still leaves work uncommitted, the launcher commits it itself
+(`implement: uncommitted work left by the implementer`) so the branch carries everything; `.meta`
+reports `commits=`, `launcher_committed_paths=` and `uncommitted_paths=`.
 
 When it exits, report: outcome and exit code, branch, worktree path, commit count and
 uncommitted-path count from `.meta`, the sidecar paths, and the ready-to-paste review command
