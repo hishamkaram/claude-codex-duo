@@ -2,9 +2,9 @@
 # codex-run.sh — run one read-only second-model task in the background, monitor it, return its result.
 #
 # Usage:
-#   codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last] --prompt-file <file>
+#   codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file>
 #                [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>]
-#                [--max-turns N] [--resume-session <id>]          (ccr backend only)
+#                [--max-turns N]                                  (--max-turns and --resume-session: ccr backend only)
 #   codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]
 #
 #   --via codex (default): the Codex CLI plugin's companion (task/status/result/cancel).
@@ -203,15 +203,20 @@ raise SystemExit(0 if ok else 1)'
         "If a step is refused, say so and continue." > "$SMOKE/prompt.md"
       ARGV=(); while IFS= read -r a; do ARGV+=("$a"); done < <(ccr_launch_argv "$ALIAS" 6)
       SMOKE_MAX_SEC="${CODEX_RUN_SMOKE_MAX_SEC:-300}"
+      case "$SMOKE_MAX_SEC" in ''|*[!0-9]*|0*) echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS CODEX_RUN_SMOKE_MAX_SEC must be a positive whole number (got '$SMOKE_MAX_SEC')"; exit 1;; esac   # review round 2: F-03
       ( cd "$SMOKE/repo" && start_in_own_group "${ARGV[@]}" ) < "$SMOKE/prompt.md" > "$SMOKE/stream.jsonl" 2> "$SMOKE/stderr" &
       SCHILD=$!; sleep 1; SPGID=$(pgid_of "$SCHILD")
+      # Same guard as the launch path: signal only a group the child created (pgid == pid); a group id
+      # that is not the child's is the runner's own inherited group (review round 2: F-07).
+      [ "$SPGID" = "$SCHILD" ] || SPGID=""
       SWAITED=0; STIMED=0
       while kill -0 "$SCHILD" 2>/dev/null; do
         if [ "$SWAITED" -ge "$SMOKE_MAX_SEC" ]; then STIMED=1; break; fi
         sleep 1; SWAITED=$((SWAITED+1))
       done
       if [ "$STIMED" = 1 ]; then
-        if [ -n "$SPGID" ] && kill_group "$SPGID"; then SKILL="process group $SPGID terminated"; else kill -KILL "$SCHILD" 2>/dev/null; SKILL="process group ${SPGID:-unknown} NOT confirmed terminated (check: ps -o pid,pgid,command -g ${SPGID:-0})"; fi
+        if [ -n "$SPGID" ] && kill_group "$SPGID"; then SKILL="process group $SPGID terminated"
+        else kill -KILL -- "-$SCHILD" 2>/dev/null; kill -KILL "$SCHILD" 2>/dev/null; SKILL="process group ${SPGID:-$SCHILD} NOT confirmed terminated (check: ps -o pid,pgid,command -g ${SPGID:-$SCHILD})"; fi
         wait "$SCHILD" 2>/dev/null
         echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke timed out after ${SMOKE_MAX_SEC}s ($SKILL) ccr=$CCR_VER"; exit 1
       fi
@@ -254,17 +259,17 @@ CLAIM_MODE=0; CLAIM_TOKEN=""; for _a in "$@"; do [ "$_a" = "--claim" ] && CLAIM_
 # An argument error writes <prefix>.exit only for the claim-less sibling plugins: with --claim, or when a launch claim exists for the prefix (a gate-issued prefix), nothing is written (round-42 CL-04).
 die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
 need() { [ $# -ge 2 ] || die4 "$1 requires a value"; case "$2" in -*) die4 "$1 requires a value (got option $2)";; esac; }
-MODE="--fresh"; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""
+MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --fresh|--resume-last) [ -z "$RESUME_SESSION" ] || die4 "--resume-session and $1 are exclusive"; MODE="$1";;
+    --fresh|--resume-last) [ "$MODE_SET" != 1 ] || [ "$MODE" = "$1" ] || die4 "$MODE and $1 are exclusive"; MODE="$1"; MODE_SET=1;;
     --via) need "$@"; VIA="$2"; shift;;
     --prompt-file) need "$@"; PROMPT_FILE="$2"; shift;;
     --stall-min) need "$@"; STALL_MIN="$2"; shift;;
     --max-min) need "$@"; MAX_MIN="$2"; shift;;
     --poll-sec) need "$@"; POLL="$2"; shift;;
     --max-turns) need "$@"; MAX_TURNS="$2"; shift;;
-    --resume-session) need "$@"; [ "$MODE" != "--resume-last" ] || die4 "--resume-session and --resume-last are exclusive"; MODE="--resume-session"; RESUME_SESSION="$2"; shift;;
+    --resume-session) need "$@"; [ "$MODE_SET" != 1 ] || [ "$MODE" = "--resume-session" ] || die4 "$MODE and --resume-session are exclusive"; MODE="--resume-session"; MODE_SET=1; RESUME_SESSION="$2"; shift;;
     --claim) need "$@"; CLAIM_MODE=1; CLAIM_TOKEN="$2"; shift;;
     --write) die4 "--write is refused; this runner is read-only";;
     *) die4 "unknown arg $1";;

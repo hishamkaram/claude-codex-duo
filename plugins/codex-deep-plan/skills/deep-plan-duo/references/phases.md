@@ -162,10 +162,16 @@ sandbox: `acceptEdits` auto-approves file edits inside the worktree (its working
 a Write or a shell redirection to a path outside it is denied, and every Bash command still needs
 a permission a headless session cannot ask for — verified live. The launcher therefore passes
 `--allowedTools` for the git subcommands the brief asks for (`add`, `commit`, `status`, `diff`,
-`log`, `show`, `rev-parse`) and for the first word of every `--test-cmd`; nothing else is
-pre-approved. If the child still leaves work uncommitted, the launcher commits it itself
-(`implement: uncommitted work left by the implementer`) so the branch carries everything; `.meta`
-reports `commits=`, `launcher_committed_paths=` and `uncommitted_paths=`.
+`log`, `show`, `rev-parse`) and for each `--test-cmd` as a whole command (`Bash(python3 -m pytest:*)`,
+never `Bash(python3:*)`: an interpreter prefix rule is unrestricted shell — a `python3 -c` write
+outside the worktree was observed live under such a rule). Nothing else is pre-approved. What
+remains unbounded is inherent: a test command executes repository code, which no permission rule
+path-bounds, so name test commands that run the repository's own suite and nothing broader. If the
+child leaves work uncommitted, the launcher commits it itself (`implement: uncommitted work left by
+the implementer`) so the branch carries everything; if that commit fails (a hook, signing, a lock)
+the run is FAILED (exit 1) even when the child completed, because the branch is the deliverable.
+`.diff` is the branch against the base including anything still uncommitted; `.meta` reports
+`commits=`, `launcher_commit=ok|failed|none`, `launcher_committed_paths=` and `uncommitted_paths=`.
 
 When it exits, report: outcome and exit code, branch, worktree path, commit count and
 uncommitted-path count from `.meta`, the sidecar paths, and the ready-to-paste review command

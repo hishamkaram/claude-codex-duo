@@ -158,10 +158,21 @@ shasum -a 256 "$PREFIX.brief.md" | cut -d' ' -f1 > "$PREFIX.plan.sha256"
 # --- launch ----------------------------------------------------------------------------------
 # acceptEdits auto-approves file edits inside the worktree only; every Bash command still needs a
 # permission the headless session cannot ask for (verified live: git commit and test commands are
-# denied). The launcher therefore pre-allows the git subcommands the brief asks for and the first
-# word of every --test-cmd, and commits whatever the child leaves uncommitted (review round 1: F-17).
+# denied). The launcher therefore pre-allows the git subcommands the brief asks for and each
+# --test-cmd as a WHOLE command (leading NAME=value words dropped), and commits whatever the child
+# leaves uncommitted (review round 1: F-17). Never the interpreter alone: a rule such as
+# Bash(python3:*) is unrestricted shell — a python3 -c write outside the worktree was observed live
+# (review round 2: F-02). A test command still runs repository code, which no rule path-bounds.
 ALLOWED=("Bash(git add:*)" "Bash(git commit:*)" "Bash(git status:*)" "Bash(git diff:*)" "Bash(git log:*)" "Bash(git show:*)" "Bash(git rev-parse:*)")
-for c in ${TEST_CMDS[@]+"${TEST_CMDS[@]}"}; do set -- $c; [ -n "${1:-}" ] && ALLOWED+=("Bash($1:*)"); done
+test_rule() {  # test_rule "<cmd>": the command with leading environment assignments removed, or nothing
+  local cmd; cmd=$(printf '%s' "$1" | sed -E 's/^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*[[:space:]]+)*//; s/[[:space:]]+$//')
+  case "$cmd" in ""|*[!A-Za-z0-9_./=@:+,\ -]*) return 1;; esac   # a rule needs a plain command line: words of letters, digits, _ . / = @ : + , - (no shell metacharacters, no quotes)
+  printf '%s\n' "$cmd"
+}
+for c in ${TEST_CMDS[@]+"${TEST_CMDS[@]}"}; do
+  rule=$(test_rule "$c") || { echo "implement-run.sh: --test-cmd '$c' cannot be pre-allowed (empty after environment assignments, or contains shell metacharacters); the child will have to ask, which it cannot — pick a plain command" >&2; continue; }
+  ALLOWED+=("Bash($rule)" "Bash($rule:*)")
+done
 ARGV=(ccr launch --model "$ALIAS" --permission-mode acceptEdits -p --no-lifecycle --no-statusline -- \
       --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --max-turns "$MAX_TURNS" --allowedTools "${ALLOWED[@]}")
 CMD="ccr launch --model $ALIAS --permission-mode acceptEdits -p ... --max-turns $MAX_TURNS (cwd=$WT)"
@@ -206,17 +217,28 @@ if [ "$OUTCOME" = EXITED ]; then if [ "$CHILD_RC" = 0 ] && [ "$HAS_RESULT" = yes
 # Whatever the child left uncommitted is committed by the launcher, so the branch is the deliverable
 # even when the child could not run git; the sidecar records how many paths that was.
 LEFT=$(git -C "$WT" --no-optional-locks status --porcelain=v1 --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')
+LAUNCHER_COMMIT=none; LAUNCHER_COMMITTED=0
 if [ "$LEFT" != 0 ]; then
-  git -C "$WT" add -A >>"$PREFIX.stderr" 2>&1 && git -C "$WT" -c user.name="implement-run.sh" -c user.email="implement-run@localhost" commit -q -m "implement: uncommitted work left by the implementer ($LEFT paths; plan $(cat "$PREFIX.plan.sha256" | cut -c1-12))" >>"$PREFIX.stderr" 2>&1 \
-    && echo "$(elapsed)s launcher committed $LEFT uncommitted path(s)" >> "$PREFIX.progress" || echo "$(elapsed)s launcher could not commit $LEFT uncommitted path(s)" >> "$PREFIX.progress"
+  if git -C "$WT" add -A >>"$PREFIX.stderr" 2>&1 && git -C "$WT" -c user.name="implement-run.sh" -c user.email="implement-run@localhost" commit -q -m "implement: uncommitted work left by the implementer ($LEFT paths; plan $(cat "$PREFIX.plan.sha256" | cut -c1-12))" >>"$PREFIX.stderr" 2>&1; then
+    LAUNCHER_COMMIT=ok; LAUNCHER_COMMITTED=$LEFT; echo "$(elapsed)s launcher committed $LEFT uncommitted path(s)" >> "$PREFIX.progress"
+  else
+    # The branch is the deliverable: a recovery commit that fails (hook, signing, lock) means the
+    # branch lacks the child's work, so the run fails even if the child completed (review round 2: F-01).
+    LAUNCHER_COMMIT=failed; echo "$(elapsed)s launcher could not commit $LEFT uncommitted path(s); the run is FAILED" >> "$PREFIX.progress"
+    [ "$OUTCOME" != COMPLETED ] || OUTCOME=FAILED
+  fi
 fi
-git -C "$WT" diff "$BASE_SHA"..HEAD > "$PREFIX.diff" 2>>"$PREFIX.stderr" || true
+# .diff shows the branch against the base INCLUDING anything still uncommitted (intent-to-add makes
+# untracked files visible), so the work is inspectable whether or not the commit succeeded.
+git -C "$WT" add -N -A >>"$PREFIX.stderr" 2>&1 || true
+git -C "$WT" diff "$BASE_SHA" > "$PREFIX.diff" 2>>"$PREFIX.stderr" || true
+git -C "$WT" reset -q >>"$PREFIX.stderr" 2>&1 || true
 COMMITS=$(git -C "$WT" rev-list --count "$BASE_SHA"..HEAD 2>/dev/null || echo 0)
 DIRTY=$(git -C "$WT" --no-optional-locks status --porcelain=v1 --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')
 {
   echo "outcome=$OUTCOME"; echo "backend=ccr"; echo "mode=implement"; echo "alias=$ALIAS"; echo "provider=$PROVIDER"; echo "provider_model=$PROVIDER_MODEL"; echo "ccr_version=$CCR_VER"
   echo "pid=$CHILD"; echo "pgid=$PGID"; echo "child_exit=$CHILD_RC"; echo "thread=${SESSION_ID:-unknown}"
-  echo "repo=$REPO"; echo "base=$BASE_SHA"; echo "branch=$BRANCH"; echo "worktree=$WT"; echo "commits=$COMMITS"; echo "launcher_committed_paths=$LEFT"; echo "uncommitted_paths=$DIRTY"; echo "result_event=$(stream_field "$PREFIX.joblog" result-subtype)"
+  echo "repo=$REPO"; echo "base=$BASE_SHA"; echo "branch=$BRANCH"; echo "worktree=$WT"; echo "commits=$COMMITS"; echo "launcher_commit=$LAUNCHER_COMMIT"; echo "launcher_committed_paths=$LAUNCHER_COMMITTED"; echo "uncommitted_paths=$DIRTY"; echo "result_event=$(stream_field "$PREFIX.joblog" result-subtype)"
   echo "plan_sha256=$(cat "$PREFIX.plan.sha256")"; echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "max_turns=$MAX_TURNS"
   echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
   LASTERR=$(grep -E 'error|Error|exit status' "$PREFIX.stderr" | tail -1 | cut -c1-300); echo "last_error=${LASTERR:-none}"

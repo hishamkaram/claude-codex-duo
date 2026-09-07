@@ -194,9 +194,12 @@ case "${1:-}" in
   launch)
     shift
     [ -z "${FAKE_CCR_ARGV_OUT:-}" ] || printf '%s\n' "$@" > "$FAKE_CCR_ARGV_OUT"
-    if [ -n "${FAKE_CCR_STDIN_OUT:-}" ]; then cat > "$FAKE_CCR_STDIN_OUT"; else cat > /dev/null; fi
+    if [ "${FAKE_CCR_MODE:-}" = outside ]; then  # review round 2 F-06: write exactly where the smoke's step 3 points
+      OUTF=$(sed -n 's/.*echo hello > \(.*smoke-outside\.txt\).*/\1/p' | head -1); mkdir -p "$(dirname "$OUTF")"; echo hello > "$OUTF"
+    elif [ -n "${FAKE_CCR_STDIN_OUT:-}" ]; then cat > "$FAKE_CCR_STDIN_OUT"; else cat > /dev/null; fi
     SID="${FAKE_CCR_SESSION:-sess-fake-0001}"; RES=""
     PREV=""; for a in "$@"; do [ "$PREV" = "--resume" ] && RES="resume:$a"; PREV="$a"; done
+    case "$RES" in resume:*) [ -n "${FAKE_CCR_SESSION:-}" ] || SID="${RES#resume:}";; esac   # a resumed session keeps its session_id (verified live 2026-09-07)
     printf '{"type":"system","subtype":"init","session_id":"%s","model":"anthropic.ccr.fake","tools":["Read","Grep","Glob","Bash"]}\n' "$SID"
     case "${FAKE_CCR_MODE:-ok}" in
       write) echo hello > smoke-write.txt;;
@@ -274,8 +277,17 @@ chmod 700 "$CCRD/ro"
 chk "F-05: --record-dir that is not a directory" 1 "is not a directory" env PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/nonexistent"
 # review round 1 F-04: a smoke that never returns is killed as a group and reported UNAVAILABLE within the bound
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=grandchild CODEX_RUN_SMOKE_MAX_SEC=3 bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
-[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'smoke timed out after 3s (process group [0-9]* terminated)' && ! pgrep -f 'sleep 600' >/dev/null && printf '  ok    %-42s\n' "F-04: hung smoke → UNAVAILABLE, group killed" || { printf '  FAIL  F-04: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; pkill -f 'sleep 600' 2>/dev/null; FAIL=1; }
+SPG=$(printf '%s' "$out" | sed -n 's/.*smoke timed out after 3s (process group \([0-9][0-9]*\) terminated).*/\1/p' | head -1)
+[ "$rc" = 1 ] && [ -n "$SPG" ] && ! kill -0 -- "-$SPG" 2>/dev/null && [ -z "$(pgrep -g "$SPG" 2>/dev/null)" ] && printf '  ok    %-42s\n' "F-04: hung smoke → UNAVAILABLE, group killed" || { printf '  FAIL  F-04: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; pkill -f 'sleep 600' 2>/dev/null; FAIL=1; }
 grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" && printf '  ok    %-42s\n' "F-04: the earlier record survives a failed re-probe" || { printf '  FAIL  F-04: record clobbered\n'; FAIL=1; }
+# review round 2 F-03: the smoke bound must be a positive whole number, or the probe refuses before launching anything
+chk "F-03: CODEX_RUN_SMOKE_MAX_SEC=abc → UNAVAILABLE" 1 "positive whole number" env PATH="$CCRBIN:$PATH" CODEX_RUN_SMOKE_MAX_SEC=abc bash "$R" --probe --via ccr:x --record-dir "$CCRD"
+chk "F-03: CODEX_RUN_SMOKE_MAX_SEC=0 → UNAVAILABLE" 1 "positive whole number" env PATH="$CCRBIN:$PATH" CODEX_RUN_SMOKE_MAX_SEC=0 bash "$R" --probe --via ccr:x --record-dir "$CCRD"
+grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" || { printf '  FAIL  F-03: record clobbered\n'; FAIL=1; }
+# review round 2 F-06: a session that writes OUTSIDE the smoke repository (step 3 of the prompt) is readonly=violated, no record
+mkdir -p "$CCRD/outside"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=outside bash "$R" --probe --via ccr:x --record-dir "$CCRD/outside" 2>&1); rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'readonly=violated' && printf '%s' "$out" | grep -q 'smoke-outside.txt' && [ ! -e "$CCRD/outside/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "F-06: write outside the smoke repo → violated" || { printf '  FAIL  F-06: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | tail -1)"; FAIL=1; }
 # F-10 (probe): a smoke whose result event is an error is not readonly=verified
 out=$(PATH="$TMP/ccrerr:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/dp" 2>&1); rc=$?
 [ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'smoke result is an error event (error_max_turns' && [ ! -e "$CCRD/dp/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "F-10: error result in the smoke → UNAVAILABLE" || { printf '  FAIL  F-10(probe): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
@@ -291,9 +303,15 @@ out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8" bash "$R" "$CP" --via 
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8b" bash "$R" "$CP" --via ccr:x --resume-session s2 --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
 [ "$rc" = 0 ] && grep -qx 's2' "$TMP/argv8b" && grep -q 'resume:s2' "$CP.stdout" && printf '  ok    %-42s\n' "T-8: --resume-session passes --resume <id>" || { printf '  FAIL  T-8(resume-session): rc=%s\n' "$rc"; FAIL=1; }
 # review round 1 F-01: an explicit resume is its own mode, recorded for the gates
-grep -qx 'mode=--resume-session' "$CP.meta" && grep -qx 'resume_session=s2' "$CP.meta" && printf '  ok    %-42s\n' "F-01: --resume-session recorded as mode" || { printf '  FAIL  F-01: mode line %s\n' "$(grep '^mode=' "$CP.meta")"; FAIL=1; }
+grep -qx 'mode=--resume-session' "$CP.meta" && grep -qx 'resume_session=s2' "$CP.meta" && grep -qx 'thread=s2' "$CP.meta" && printf '  ok    %-42s\n' "F-01: --resume-session recorded as mode" || { printf '  FAIL  F-01: mode line %s\n' "$(grep '^mode=' "$CP.meta")"; FAIL=1; }
 chk "F-01: --resume-session with --resume-last refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-session s2 --resume-last --prompt-file "$CCRD/prompt.md"
 chk "F-01: --resume-last then --resume-session refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-last --resume-session s2 --prompt-file "$CCRD/prompt.md"
+# review round 2 F-09: --fresh is exclusive with either resume mode, whichever comes first
+chk "F-09: --fresh then --resume-session refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --fresh --resume-session s2 --prompt-file "$CCRD/prompt.md"
+chk "F-09: --resume-session then --fresh refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-session s2 --fresh --prompt-file "$CCRD/prompt.md"
+chk "F-09: --fresh then --resume-last refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --fresh --resume-last --prompt-file "$CCRD/prompt.md"
+chk "F-09: --resume-last then --fresh refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-last --fresh --prompt-file "$CCRD/prompt.md"
+[ ! -e "$CCRD/02-px.meta" ] && printf '  ok    %-42s\n' "F-09: refused launches write no sidecar" || { printf '  FAIL  F-09: sidecar written\n'; FAIL=1; }
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8c" bash "$R" "$CP" --via ccr:x --fresh --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
 [ "$rc" = 0 ] && ! grep -qx -- '--resume' "$TMP/argv8c" && printf '  ok    %-42s\n' "T-8: --fresh passes no --resume" || { printf '  FAIL  T-8(fresh): rc=%s\n' "$rc"; FAIL=1; }
 mkdir -p "$CCRD/nolast"; cp "$CCRD/.ccr-smoke.x" "$CCRD/nolast/"
@@ -423,11 +441,28 @@ HOOK
 IPU="$IMD/uncommitted/implement"
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=implement FAKE_CCR_ARGV_OUT="$TMP/argv17" FAKE_CCR_RESULT="edited, could not commit" bash "$IM" "$IPU" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/left --plan "$IMD/PLAN.md" --test-cmd "bash scripts/test.sh" --test-cmd "python3 -m pytest" --poll-sec 1 2>&1); rc=$?
 WTU=$(cat "$IPU.worktree" 2>/dev/null)
-[ "$rc" = 0 ] && grep -qxF 'Bash(bash:*)' "$TMP/argv17" && grep -qxF 'Bash(python3:*)' "$TMP/argv17" && grep -q '^commits=1' "$IPU.meta" && grep -q '^launcher_committed_paths=1' "$IPU.meta" && grep -q '^uncommitted_paths=0' "$IPU.meta" && grep -q 'left.txt' "$IPU.diff" && git -C "$WTU" log -1 --format=%s | grep -q 'implement: uncommitted work' && printf '  ok    %-42s\n' "F-17: launcher commits uncommitted work; test cmds allowed" || { printf '  FAIL  F-17: rc=%s meta=%s\n' "$rc" "$(grep -E '^(commits|launcher_committed_paths|uncommitted_paths)=' "$IPU.meta" | tr '\n' ' ')"; FAIL=1; }
+[ "$rc" = 0 ] && grep -qxF 'Bash(bash scripts/test.sh)' "$TMP/argv17" && grep -qxF 'Bash(bash scripts/test.sh:*)' "$TMP/argv17" && grep -qxF 'Bash(python3 -m pytest:*)' "$TMP/argv17" && ! grep -qxF 'Bash(bash:*)' "$TMP/argv17" && ! grep -qxF 'Bash(python3:*)' "$TMP/argv17" && grep -q '^commits=1' "$IPU.meta" && grep -q '^launcher_committed_paths=1' "$IPU.meta" && grep -q '^uncommitted_paths=0' "$IPU.meta" && grep -q 'left.txt' "$IPU.diff" && git -C "$WTU" log -1 --format=%s | grep -q 'implement: uncommitted work' && printf '  ok    %-42s\n' "F-17: launcher commits uncommitted work; test cmds allowed" || { printf '  FAIL  F-17: rc=%s meta=%s\n' "$rc" "$(grep -E '^(commits|launcher_committed_paths|uncommitted_paths)=' "$IPU.meta" | tr '\n' ' ')"; FAIL=1; }
+# review round 2 F-01: when the repository's hook rejects the launcher's recovery commit, the run is FAILED
+# (exit 1, launcher_commit=failed) and the diff still shows the work the branch lacks
+mkdir -p "$G2/.git/hooks"; printf '#!/bin/sh\necho "pre-commit: rejected" >&2\nexit 1\n' > "$G2/.git/hooks/pre-commit"; chmod +x "$G2/.git/hooks/pre-commit"
+IPH="$IMD/hooked/implement"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=implement FAKE_CCR_RESULT="edited, could not commit" bash "$IM" "$IPH" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/hooked --plan "$IMD/PLAN.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 1 ] && [ "$(cat "$IPH.exit")" = 1 ] && grep -qx 'outcome=FAILED' "$IPH.meta" && grep -qx 'launcher_commit=failed' "$IPH.meta" && grep -qx 'launcher_committed_paths=0' "$IPH.meta" && grep -qx 'uncommitted_paths=1' "$IPH.meta" && grep -qx 'commits=0' "$IPH.meta" && grep -q 'left.txt' "$IPH.diff" && grep -q 'could not commit 1 uncommitted path' "$IPH.progress" && printf '  ok    %-42s\n' "F-01: hook-rejected recovery commit → FAILED, diff kept" || { printf '  FAIL  F-01(hook): rc=%s meta=%s\n' "$rc" "$(grep -E '^(outcome|launcher_commit|commits|uncommitted_paths)=' "$IPH.meta" 2>/dev/null | tr '\n' ' ')"; FAIL=1; }
+rm -f "$G2/.git/hooks/pre-commit"
+grep -qx 'launcher_commit=ok' "$IPU.meta" && printf '  ok    %-42s\n' "F-01: a successful recovery commit records launcher_commit=ok" || { printf '  FAIL  F-01(ok): %s\n' "$(grep '^launcher_commit=' "$IPU.meta")"; FAIL=1; }
 cat > "$CCRBIN/ccr-impl-hook.sh" <<'HOOK'
 # executed by the fake ccr in "implement" mode: behave like an implementer inside cwd
 printf 'hello\n' > hello.txt; git add hello.txt >/dev/null 2>&1; git -c user.email=t@t -c user.name=t commit -qm "add hello" >/dev/null 2>&1
 HOOK
+# review round 2 F-02: a --test-cmd is pre-allowed as the whole command (leading NAME=value words dropped),
+# never as its interpreter; one with shell metacharacters is refused with a warning and no rule
+IPT="$IMD/testcmds/implement"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=implement FAKE_CCR_ARGV_OUT="$TMP/argv2f" bash "$IM" "$IPT" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/testcmds --plan "$IMD/PLAN.md" --test-cmd "CI=1 npm test" --test-cmd "npm test && echo ok" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 0 ] && grep -qxF 'Bash(npm test)' "$TMP/argv2f" && grep -qxF 'Bash(npm test:*)' "$TMP/argv2f" && ! grep -qF 'CI=1' "$TMP/argv2f" && ! grep -qF 'echo ok' "$TMP/argv2f" && ! grep -qxF 'Bash(npm:*)' "$TMP/argv2f" && printf '%s' "$out" | grep -q "npm test && echo ok' cannot be pre-allowed" && printf '  ok    %-42s\n' "F-02: whole-command rules; metacharacters refused" || { printf '  FAIL  F-02: rc=%s argv=%s\n' "$rc" "$(grep 'Bash(' "$TMP/argv2f" 2>/dev/null | tr '\n' ' ')"; FAIL=1; }
+# review round 2 F-05: the implementer's own result parser treats an error result event (child exit 0) as FAILED
+IPE="$IMD/errresult/implement"
+out=$(PATH="$TMP/ccrerr:$PATH" bash "$IM" "$IPE" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/errresult --plan "$IMD/PLAN.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 1 ] && [ "$(cat "$IPE.exit")" = 1 ] && grep -qx 'outcome=FAILED' "$IPE.meta" && grep -qx 'child_exit=0' "$IPE.meta" && grep -q '^result_event=error_max_turns is_error=True' "$IPE.meta" && printf '  ok    %-42s\n' "F-05: implementer error result event → FAILED" || { printf '  FAIL  F-05: rc=%s meta=%s\n' "$rc" "$(grep -E '^(outcome|result_event)=' "$IPE.meta" 2>/dev/null | tr '\n' ' ')"; FAIL=1; }
 chk "T-14: existing worktree refused"      4 "worktree path already exists" bash "$IM" "$IP" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/other --plan "$IMD/PLAN.md"
 IP2="$IMD/second/implement"
 chk "T-14: existing branch refused"        4 "branch already exists"  env PATH="$CCRBIN:$PATH" bash "$IM" "$IP2" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/hello --plan "$IMD/PLAN.md"
@@ -1124,6 +1159,11 @@ mkdir -p "$PA/04-consultation.claim/runner"; printf 'c\nSTATUS: PHASE 4 COMPLETE
 printf 'outcome=COMPLETED\nbackend=ccr\nthread=sess-p1\nmode=--resume-last\n' > "$PA/04-consultation.meta"
 printf '```json\n{"phase":"consultation","dispositions":[{"id":"F-01","action":"MAINTAIN","claim":"c","severity":"P2","locations":["a:1"],"trigger":"t","impact":"i","observations":["a:1 \\"x\\""],"falsifier":"f","proposed_checks":["c"],"open_factual_questions":[]},{"id":"F-02","action":"MAINTAIN","claim":"c","severity":"P1","locations":["a:1"],"trigger":"t","impact":"i","observations":["a:1 \\"x\\""],"falsifier":"f","proposed_checks":["c"],"open_factual_questions":[]}]}\n```\n' > "$PA/04-consultation.stdout"
 chk "T-21: consultation on the wrong participant's session" 1 "resumed unexpected Codex thread (wanted sess-p2" pgw pre-verification "$PA"
+# review round 2 F-04: an explicit --resume-session is anchored exactly like --resume-last
+printf 'outcome=COMPLETED\nbackend=ccr\nthread=sess-p1\nmode=--resume-session\nresume_session=sess-p1\n' > "$PA/04-consultation.meta"
+chk "F-04: --resume-session on the wrong participant's session" 1 "resumed unexpected Codex thread (wanted sess-p2" pgw pre-verification "$PA"
+printf 'outcome=COMPLETED\nbackend=ccr\nthread=sess-p2\nmode=--resume-session\nresume_session=sess-p2\n' > "$PA/04-consultation.meta"
+chk "F-04: --resume-session on the exchange participant's session" 0 "VERIFICATION-OK" pgw pre-verification "$PA"
 printf 'outcome=COMPLETED\nbackend=ccr\nthread=sess-p2\nmode=--resume-last\n' > "$PA/04-consultation.meta"
 chk "T-21: consultation on the exchange participant's session" 0 "VERIFICATION-OK" pgw pre-verification "$PA"
 # T-22: the exchange budget is unchanged with N participants (4 launches / 2 responses over 04/06)
@@ -1456,6 +1496,11 @@ printf 'thread=unknown\noutcome=COMPLETED\nmode=--fresh\ncommand=task --fresh --
 chk "CX-03r18: fresh retry passes with unknown prior thread" 0 "REPORT-OK" pgw pre-report "$CS"
 printf 'thread=unknown\noutcome=COMPLETED\nmode=--resume-last\ncommand=task --resume-last --background --prompt-file p\n' > "$CS/04-consultation.meta"
 chk "CX-03r18: resume-last must match the accepted thread anchor" 1 "resumed unexpected Codex thread" pgw pre-report "$CS"
+# review round 2 F-04: pre-report anchors an explicit --resume-session the same way
+printf 'thread=unknown\noutcome=COMPLETED\nmode=--resume-session\nresume_session=unknown\ncommand=task --resume-session unknown --background --prompt-file p\n' > "$CS/04-consultation.meta"
+chk "F-04: pre-report rejects --resume-session off the anchor" 1 "resumed unexpected Codex thread" pgw pre-report "$CS"
+printf 'thread=thread-2\noutcome=COMPLETED\nmode=--resume-session\nresume_session=thread-2\ncommand=task --resume-session thread-2 --background --prompt-file p\n' > "$CS/04-consultation.meta"
+chk "F-04: pre-report accepts --resume-session on the anchor" 0 "REPORT-OK" pgw pre-report "$CS"
 chmod u+w "$CS/04-consultation.thread"; rm -f "$CS/04-consultation.thread"
 chk "ledger: deleted thread anchor caught" 1 "04-consultation.thread was accepted by pre-verification but is missing" pgw pre-report "$CS"
 cp "$TMP/cs-anchor.bak" "$CS/04-consultation.thread"; chmod 400 "$CS/04-consultation.thread"
