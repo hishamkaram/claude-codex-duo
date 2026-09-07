@@ -278,11 +278,12 @@ chk "F-05: --record-dir that is not a directory" 1 "is not a directory" env PATH
 # review round 1 F-04: a smoke that never returns is killed as a group and reported UNAVAILABLE within the bound
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=grandchild CODEX_RUN_SMOKE_MAX_SEC=3 bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
 SPG=$(printf '%s' "$out" | sed -n 's/.*smoke timed out after 3s (process group \([0-9][0-9]*\) terminated).*/\1/p' | head -1)
-[ "$rc" = 1 ] && [ -n "$SPG" ] && ! kill -0 -- "-$SPG" 2>/dev/null && [ -z "$(pgrep -g "$SPG" 2>/dev/null)" ] && printf '  ok    %-42s\n' "F-04: hung smoke → UNAVAILABLE, group killed" || { printf '  FAIL  F-04: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; pkill -f 'sleep 600' 2>/dev/null; FAIL=1; }
+[ "$rc" = 1 ] && [ -n "$SPG" ] && ! kill -0 -- "-$SPG" 2>/dev/null && [ -z "$(pgrep -g "$SPG" 2>/dev/null)" ] && printf '  ok    %-42s\n' "F-04: hung smoke → UNAVAILABLE, group killed" || { printf '  FAIL  F-04: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; [ -n "$SPG" ] && pkill -g "$SPG" 2>/dev/null; FAIL=1; }
 grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" && printf '  ok    %-42s\n' "F-04: the earlier record survives a failed re-probe" || { printf '  FAIL  F-04: record clobbered\n'; FAIL=1; }
 # review round 2 F-03: the smoke bound must be a positive whole number, or the probe refuses before launching anything
 chk "F-03: CODEX_RUN_SMOKE_MAX_SEC=abc → UNAVAILABLE" 1 "positive whole number" env PATH="$CCRBIN:$PATH" CODEX_RUN_SMOKE_MAX_SEC=abc bash "$R" --probe --via ccr:x --record-dir "$CCRD"
 chk "F-03: CODEX_RUN_SMOKE_MAX_SEC=0 → UNAVAILABLE" 1 "positive whole number" env PATH="$CCRBIN:$PATH" CODEX_RUN_SMOKE_MAX_SEC=0 bash "$R" --probe --via ccr:x --record-dir "$CCRD"
+chk "F-02: CODEX_RUN_SMOKE_MAX_SEC oversized → UNAVAILABLE" 1 "at most 9 digits" env PATH="$CCRBIN:$PATH" CODEX_RUN_SMOKE_MAX_SEC=999999999999 bash "$R" --probe --via ccr:x --record-dir "$CCRD"
 grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" || { printf '  FAIL  F-03: record clobbered\n'; FAIL=1; }
 # review round 2 F-06: a session that writes OUTSIDE the smoke repository (step 3 of the prompt) is readonly=violated, no record
 mkdir -p "$CCRD/outside"

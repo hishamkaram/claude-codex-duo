@@ -203,7 +203,7 @@ raise SystemExit(0 if ok else 1)'
         "If a step is refused, say so and continue." > "$SMOKE/prompt.md"
       ARGV=(); while IFS= read -r a; do ARGV+=("$a"); done < <(ccr_launch_argv "$ALIAS" 6)
       SMOKE_MAX_SEC="${CODEX_RUN_SMOKE_MAX_SEC:-300}"
-      case "$SMOKE_MAX_SEC" in ''|*[!0-9]*|0*) echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS CODEX_RUN_SMOKE_MAX_SEC must be a positive whole number (got '$SMOKE_MAX_SEC')"; exit 1;; esac   # review round 2: F-03
+      case "$SMOKE_MAX_SEC" in ''|*[!0-9]*|0*|??????????*) echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS CODEX_RUN_SMOKE_MAX_SEC must be a positive whole number of at most 9 digits (got '$SMOKE_MAX_SEC')"; exit 1;; esac   # review round 2: F-03; round 3: F-02 oversized integers fail-open
       ( cd "$SMOKE/repo" && start_in_own_group "${ARGV[@]}" ) < "$SMOKE/prompt.md" > "$SMOKE/stream.jsonl" 2> "$SMOKE/stderr" &
       SCHILD=$!; sleep 1; SPGID=$(pgid_of "$SCHILD")
       # Same guard as the launch path: signal only a group the child created (pgid == pid); a group id

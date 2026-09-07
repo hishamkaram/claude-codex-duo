@@ -23,7 +23,7 @@
 #   <out-prefix>.brief.md      the brief the model executed (fixed header + the plan verbatim)
 #   <out-prefix>.plan.sha256   sha256 of that brief (what was implemented, exactly)
 #   <out-prefix>.worktree      absolute worktree path
-#   <out-prefix>.diff          `git diff <base>..HEAD` of the worktree at the end (commits made)
+#   <out-prefix>.diff          working tree against the base (committed and uncommitted; intent-to-add makes untracked files visible)
 #
 # Exit 4 for every argument error and every launch precondition (ccr missing, version, alias,
 # branch or worktree already present); 1 child failed; 2 stalled; 3 timeout; 5 cancel unconfirmed.
@@ -230,9 +230,15 @@ if [ "$LEFT" != 0 ]; then
 fi
 # .diff shows the branch against the base INCLUDING anything still uncommitted (intent-to-add makes
 # untracked files visible), so the work is inspectable whether or not the commit succeeded.
-git -C "$WT" add -N -A >>"$PREFIX.stderr" 2>&1 || true
-git -C "$WT" diff "$BASE_SHA" > "$PREFIX.diff" 2>>"$PREFIX.stderr" || true
-git -C "$WT" reset -q >>"$PREFIX.stderr" 2>&1 || true
+# If intent-to-add fails (index lock), untracked files would be omitted — fail the run (review round 3: F-03).
+if git -C "$WT" add -N -A >>"$PREFIX.stderr" 2>&1; then
+  git -C "$WT" diff "$BASE_SHA" > "$PREFIX.diff" 2>>"$PREFIX.stderr" || true
+  git -C "$WT" reset -q >>"$PREFIX.stderr" 2>&1 || true
+else
+  echo "$(elapsed)s intent-to-add for .diff failed; untracked work would be omitted — the run is FAILED" >> "$PREFIX.progress"
+  git -C "$WT" --no-optional-locks status --porcelain=v1 --untracked-files=all > "$PREFIX.diff" 2>>"$PREFIX.stderr" || true
+  [ "$OUTCOME" != COMPLETED ] || OUTCOME=FAILED
+fi
 COMMITS=$(git -C "$WT" rev-list --count "$BASE_SHA"..HEAD 2>/dev/null || echo 0)
 DIRTY=$(git -C "$WT" --no-optional-locks status --porcelain=v1 --untracked-files=all 2>/dev/null | wc -l | tr -d ' ')
 {
