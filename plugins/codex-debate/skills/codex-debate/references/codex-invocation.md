@@ -76,8 +76,21 @@ engine: every write is blocked, read-only Bash still runs), then the empty stric
 MCP config, then the disallowed edit tools; a disallow-list alone does not stop
 Bash from writing. The probe runs a read-only smoke for the alias and records
 `readonly=verified` in `<dir>/.ccr-smoke.<alias>`; a ccr launch in that
-directory refuses to start (exit 4) without a matching record (same ccr version,
-model and launch line). `thread=` in `.meta` is the child's `session_id`;
+directory refuses to start (exit 4) without a matching record (same alias,
+provider model, CCR-generated child model ID, observed child init model, ccr
+version and launch-line digest).
+
+Three identities, never interchangeable: the configured alias is the only value
+passed to `ccr launch --model`, always before `--`; `provider_model` is
+descriptive metadata and never a child CLI argument; `claude_model_id` is the
+child model ID CCR generates for the alias. A completed launch is accepted only
+when the child's `init` model (`routed_model=`) equals `claude_model_id`. A
+mismatch is `UNAVAILABLE` with `route_identity=no` and exit 4 — do not retry
+with another alias and never fall back to Claude; the registration belongs to
+ccr. `.meta` records `alias=`, `provider=`, `provider_model=`,
+`claude_model_id=`, `routed_model=`, `route_identity=` alongside `prompt_file=`.
+
+`thread=` in `.meta` is the child's `session_id`;
 `--resume-last` resumes `<dir>/.ccr-last-session`, `--resume-session <id>`
 names a session, `--fresh` starts one. `--max-turns <N>` (default 100) is
 ccr-only. `.progress` opens with `launched backend=ccr pid=<pid> pgid=<pgid>
