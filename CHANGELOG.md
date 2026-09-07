@@ -2,6 +2,12 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [codex-debate 1.2.1, codex-deep-plan 2.3.1] - 2026-09-07
+
+### Fixed
+- **The shared runner fix reaches both plugins.** `scripts/codex-run.sh` is shipped byte-identically in all three plugins (`validate.sh` check 4b), so `codex-debate` and `codex-deep-plan` already carried the 4.0.1 CCR hardening — the configured alias as the only `ccr launch --model` value before `--`, a preflight that requires both `provider_model` and `claude_model_id`, the `routed_model == claude_model_id` route assertion with `UNAVAILABLE` (exit 4) and no alias or Claude fallback, `prompt_file=` in `.meta`, and a cleared `.stdout` on an unconfirmed exit-5 cancellation. Neither plugin was version-bumped at the time, so `claude plugin update` reported them as already current and never delivered it. These patch releases exist to ship it.
+- **codex-debate `references/codex-invocation.md`** now uses the same three-identity vocabulary as the other two plugins: alias vs `provider_model` vs `claude_model_id`, the smoke record bound to all of them, and what `routed_model=` / `route_identity=no` mean when a launch is refused.
+
 ## [4.0.1] - 2026-09-07
 
 ### Fixed
