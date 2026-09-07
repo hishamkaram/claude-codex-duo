@@ -190,17 +190,18 @@ case "${1:-}" in
   model)
     [ "${2:-}" = show ] || { echo "fake ccr: unsupported model subcommand" >&2; exit 2; }
     [ -z "${FAKE_CCR_SHOW_FAIL:-}" ] || { echo "model alias not found: $3" >&2; exit 1; }
-    printf '{"alias":"%s","provider":"litellm","provider_model":"%s","claude_model_id":"anthropic.ccr.%s","compatibility":"degraded","schema_version":9,"effective_capabilities":{"values":{"supports_tools":%s,"supports_streaming":true}}}\n' "$3" "${FAKE_CCR_MODEL:-claude-haiku-4-5}" "$3" "${FAKE_CCR_TOOLS:-true}"; exit 0;;
+    printf '{"alias":"%s","provider":"litellm","provider_model":"%s","claude_model_id":"%s","compatibility":"degraded","schema_version":9,"effective_capabilities":{"values":{"supports_tools":%s,"supports_streaming":true}}}\n' "$3" "${FAKE_CCR_MODEL-claude-haiku-4-5}" "${FAKE_CCR_CHILD_ID-anthropic.ccr.$3}" "${FAKE_CCR_TOOLS:-true}"; exit 0;;
   launch)
     shift
     [ -z "${FAKE_CCR_ARGV_OUT:-}" ] || printf '%s\n' "$@" > "$FAKE_CCR_ARGV_OUT"
     if [ "${FAKE_CCR_MODE:-}" = outside ]; then  # review round 2 F-06: write exactly where the smoke's step 3 points
       OUTF=$(sed -n 's/.*echo hello > \(.*smoke-outside\.txt\).*/\1/p' | head -1); mkdir -p "$(dirname "$OUTF")"; echo hello > "$OUTF"
     elif [ -n "${FAKE_CCR_STDIN_OUT:-}" ]; then cat > "$FAKE_CCR_STDIN_OUT"; else cat > /dev/null; fi
-    SID="${FAKE_CCR_SESSION:-sess-fake-0001}"; RES=""
-    PREV=""; for a in "$@"; do [ "$PREV" = "--resume" ] && RES="resume:$a"; PREV="$a"; done
+    SID="${FAKE_CCR_SESSION:-sess-fake-0001}"; RES=""; ALIAS=""
+    PREV=""; for a in "$@"; do [ "$PREV" = "--resume" ] && RES="resume:$a"; [ "$PREV" = "--model" ] && ALIAS="$a"; PREV="$a"; done
     case "$RES" in resume:*) [ -n "${FAKE_CCR_SESSION:-}" ] || SID="${RES#resume:}";; esac   # a resumed session keeps its session_id (verified live 2026-09-07)
-    printf '{"type":"system","subtype":"init","session_id":"%s","model":"anthropic.ccr.fake","tools":["Read","Grep","Glob","Bash"]}\n' "$SID"
+    CHILD_MODEL="${FAKE_CCR_CHILD_MODEL:-anthropic.ccr.${FAKE_CCR_ALIAS:-$ALIAS}}"
+    printf '{"type":"system","subtype":"init","session_id":"%s","model":"%s","tools":["Read","Grep","Glob","Bash"]}\n' "$SID" "$CHILD_MODEL"
     case "${FAKE_CCR_MODE:-ok}" in
       write) echo hello > smoke-write.txt;;
       fail) printf '{"type":"assistant","message":{"content":[{"type":"text","text":"boom"}]}}\n'; echo "waiting for Claude Code: exit status 1" >&2; exit 1;;
@@ -240,6 +241,8 @@ chk "T-4: ccr below minimum refused"      4 "requires ccr >= 0.4.11" env PATH="$
 chk "T-4: probe below minimum"            1 "PROBE UNAVAILABLE"     env PATH="$CCRBIN:$PATH" FAKE_CCR_VERSION=0.4.10 bash "$R" --probe --via ccr:x
 chk "T-5: model show failing"             1 "PROBE UNAVAILABLE"     env PATH="$CCRBIN:$PATH" FAKE_CCR_SHOW_FAIL=1 bash "$R" --probe --via ccr:x
 chk "T-5: supports_tools false"           1 "supports_tools=false"  env PATH="$CCRBIN:$PATH" FAKE_CCR_TOOLS=false bash "$R" --probe --via ccr:x
+chk "T-5: missing generated child ID"       1 "claude_model_id"      env PATH="$CCRBIN:$PATH" FAKE_CCR_CHILD_ID='' bash "$R" --probe --via ccr:x
+chk "T-5: missing provider model"           1 "provider_model"       env PATH="$CCRBIN:$PATH" FAKE_CCR_MODEL='' bash "$R" --probe --via ccr:x
 chk "T-5: launch with supports_tools false" 4 "supports_tools=false" env PATH="$CCRBIN:$PATH" FAKE_CCR_TOOLS=false bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT"
 chk "probe: codex label carries backend"  1 "backend=codex\|PROBE"  env HOME="$TMP/nohome" bash "$R" --probe
 chk "probe: bad --via"                    1 "must be codex or ccr"  bash "$R" --probe --via bogus
@@ -255,11 +258,11 @@ out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv-none" bash "$R" "$CP" --
 rm -f "$CP".*
 # T-6: probe happy path records the smoke and prints the JSON
 out=$(PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
-[ "$rc" = 0 ] && printf '%s' "$out" | grep -q '^PROBE SUCCEEDED backend=ccr alias=x provider=litellm model=claude-haiku-4-5 compatibility=degraded tools=true readonly=verified ccr=0.4.11' && printf '%s' "$out" | grep -q '"schema_version"' && grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" && grep -qx 'ccr=0.4.11' "$CCRD/.ccr-smoke.x" && grep -q '^launch_sha256=' "$CCRD/.ccr-smoke.x" && printf '  ok    %-42s\n' "T-6: probe SUCCEEDED + JSON + smoke record" || { printf '  FAIL  T-6: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q '^PROBE SUCCEEDED backend=ccr alias=x provider=litellm model=claude-haiku-4-5 compatibility=degraded tools=true readonly=verified ccr=0.4.11' && printf '%s' "$out" | grep -q '"schema_version"' && grep -qx 'alias=x' "$CCRD/.ccr-smoke.x" && grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" && grep -qx 'ccr=0.4.11' "$CCRD/.ccr-smoke.x" && grep -qx 'claude_model_id=anthropic.ccr.x' "$CCRD/.ccr-smoke.x" && grep -qx 'child_model=anthropic.ccr.x' "$CCRD/.ccr-smoke.x" && grep -q '^launch_sha256=' "$CCRD/.ccr-smoke.x" && printf '  ok    %-42s\n' "T-6: probe SUCCEEDED + JSON + smoke record" || { printf '  FAIL  T-6: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
 # T-5c (continued): a record for another version or a violated record refuses the launch
-printf 'alias=x\nccr=0.4.10\nmodel=claude-haiku-4-5\nreadonly=verified\nlaunch_sha256=%s\n' "$(grep '^launch_sha256=' "$CCRD/.ccr-smoke.x" | cut -d= -f2)" > "$CCRD/.ccr-smoke.y"
+sed 's/^ccr=0.4.11$/ccr=0.4.10/; s/^alias=x$/alias=y/; s/^claude_model_id=anthropic.ccr.x$/claude_model_id=anthropic.ccr.y/; s/^child_model=anthropic.ccr.x$/child_model=anthropic.ccr.y/' "$CCRD/.ccr-smoke.x" > "$CCRD/.ccr-smoke.y"
 chk "T-5c: record from another ccr version" 4 "another ccr version" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-py" --via ccr:y --prompt-file "$PROMPT"
-sed 's/^readonly=verified/readonly=violated/' "$CCRD/.ccr-smoke.x" > "$CCRD/.ccr-smoke.z"
+sed 's/^readonly=verified/readonly=violated/; s/^alias=x$/alias=z/; s/^claude_model_id=anthropic.ccr.x$/claude_model_id=anthropic.ccr.z/; s/^child_model=anthropic.ccr.x$/child_model=anthropic.ccr.z/' "$CCRD/.ccr-smoke.x" > "$CCRD/.ccr-smoke.z"
 chk "T-5c: violated record"               4 "not 'readonly=verified'" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-pz" --via ccr:z --prompt-file "$PROMPT"
 # review round 1 F-02: the deep-plan layout — record beside the round prefixes ($ART/debate) and launch there
 mkdir -p "$CCRD/dp/debate"; PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/dp/debate" >/dev/null 2>&1
@@ -297,7 +300,11 @@ rm -f "$CCRD/02-py".* "$CCRD/02-pz".* "$CCRD/.ccr-smoke.y" "$CCRD/.ccr-smoke.z"
 printf 'review this\n' > "$CCRD/prompt.md"
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv7" FAKE_CCR_STDIN_OUT="$TMP/stdin7" FAKE_CCR_SESSION=sess-7 bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
 WANT_ARGV="$(printf '%s\n' --model x --permission-mode plan -p --no-lifecycle --no-statusline -- --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --disallowedTools Write,Edit,MultiEdit,NotebookEdit,Agent --max-turns 100)"
-[ "$rc" = 0 ] && [ "$(cat "$TMP/argv7")" = "$WANT_ARGV" ] && cmp -s "$TMP/stdin7" "$CCRD/prompt.md" && [ "$(cat "$CP.exit")" = 0 ] && grep -q '^outcome=COMPLETED' "$CP.meta" && grep -q '^backend=ccr' "$CP.meta" && grep -q '^thread=sess-7' "$CP.meta" && grep -q '^alias=x' "$CP.meta" && grep -q '^provider=litellm' "$CP.meta" && grep -q '^pgid=[0-9]' "$CP.meta" && grep -q '"type":"result"' "$CP.joblog" && grep -q '^DONE ' "$CP.stdout" && [ "$(cat "$CCRD/.ccr-last-session")" = sess-7 ] && grep -q 'launched backend=ccr pid=[0-9]* pgid=[0-9]* alias=x' "$CP.progress" && printf '  ok    %-42s\n' "T-7: ccr happy path, exact argv, sidecars" || { printf '  FAIL  T-7: rc=%s out=%s argv=%s\n' "$rc" "$(printf '%s' "$out" | head -1)" "$(tr '\n' ' ' < "$TMP/argv7" 2>/dev/null)"; FAIL=1; }
+[ "$rc" = 0 ] && [ "$(cat "$TMP/argv7")" = "$WANT_ARGV" ] && cmp -s "$TMP/stdin7" "$CCRD/prompt.md" && [ "$(cat "$CP.exit")" = 0 ] && grep -q '^outcome=COMPLETED' "$CP.meta" && grep -q '^backend=ccr' "$CP.meta" && grep -q '^thread=sess-7' "$CP.meta" && grep -q '^alias=x' "$CP.meta" && grep -q '^provider=litellm' "$CP.meta" && grep -q '^claude_model_id=anthropic.ccr.x' "$CP.meta" && grep -q '^routed_model=anthropic.ccr.x' "$CP.meta" && grep -q '^route_identity=yes' "$CP.meta" && grep -q '^pgid=[0-9]' "$CP.meta" && grep -q '"type":"result"' "$CP.joblog" && grep -q '^DONE ' "$CP.stdout" && [ "$(cat "$CCRD/.ccr-last-session")" = sess-7 ] && grep -q 'launched backend=ccr pid=[0-9]* pgid=[0-9]* alias=x' "$CP.progress" && printf '  ok    %-42s\n' "T-7: ccr happy path, exact argv, sidecars" || { printf '  FAIL  T-7: rc=%s out=%s argv=%s\n' "$rc" "$(printf '%s' "$out" | head -1)" "$(tr '\n' ' ' < "$TMP/argv7" 2>/dev/null)"; FAIL=1; }
+# A generated child ID belongs to CCR's route contract. A mismatch is unavailable,
+# never an excuse to select the provider model or a different alias.
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_CHILD_MODEL=anthropic.ccr.wrong FAKE_CCR_ARGV_OUT="$TMP/argv-route-bad" bash "$R" "$CCRD/02-route-bad" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 4 ] && grep -q '^outcome=UNAVAILABLE' "$CCRD/02-route-bad.meta" && grep -q '^route_identity=no' "$CCRD/02-route-bad.meta" && grep -q 'CCR route identity mismatch' "$CCRD/02-route-bad.stderr" && [ "$(grep -c '^--model$' "$TMP/argv-route-bad")" = 1 ] && grep -qx 'x' "$TMP/argv-route-bad" && printf '  ok    %-42s\n' "T-7: child route mismatch → UNAVAILABLE, no fallback" || { printf '  FAIL  T-7(route mismatch): rc=%s meta=%s\n' "$rc" "$(grep -E '^(outcome|route_identity)=' "$CCRD/02-route-bad.meta" 2>/dev/null | tr '\n' ' ')"; FAIL=1; }
 # T-8: resume semantics
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8" bash "$R" "$CP" --via ccr:x --resume-last --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
 [ "$rc" = 0 ] && grep -qx -- '--resume' "$TMP/argv8" && grep -qx 'sess-7' "$TMP/argv8" && grep -q 'resume:sess-7' "$CP.stdout" && [ -e "$CP.attempt1.meta" ] && printf '  ok    %-42s\n' "T-8: --resume-last passes --resume <last session>" || { printf '  FAIL  T-8(resume-last): rc=%s\n' "$rc"; FAIL=1; }
@@ -992,9 +999,9 @@ chk "gate: post-join, hash mismatch"   1 "changed since"        pgw post-join "$
 # Phase-2 sidecar even when no seal (and no 02-p1.md) exists.
 PC5="$TMP/cx01r22"; mkdir -p "$PC5"; printf 'scope\n' > "$PC5/00-scope.md"; mkbrief "$PC5"
 printf '5\n' > "$PC5/02-p1.exit"
-chk "CX-01r22: pre-codex rejects exit-5 sidecar without seal" 1 "02-p1 recorded exit 5" pgw pre-codex "$PC5" "$G2"
+chk "CX-01r22: pre-codex rejects exit-5 sidecar without seal" 1 "unconfirmed cancellation" pgw pre-codex "$PC5" "$G2"
 rm -f "$PC5/02-p1.exit"; printf 'outcome=STALLED\ncancel_confirmed=no\n' > "$PC5/02-p1.attempt1.meta"
-chk "CX-01r22: pre-codex rejects rotated cancel_confirmed=no" 1 "cancel_confirmed=no" pgw pre-codex "$PC5" "$G2"
+chk "CX-01r22: pre-codex rejects rotated cancel_confirmed=no" 1 "unconfirmed cancellation" pgw pre-codex "$PC5" "$G2"
 rm -f "$PC5/02-p1.attempt1.meta"
 chk "CX-01r22: pre-codex passes once sidecars are gone" 0 "PREFLIGHT-OK" pgw pre-codex "$PC5" "$G2"
 # CX-02r25 / CX-01r26, as simplified by the round-27 debate: a claim is in flight
@@ -1189,6 +1196,19 @@ chk "T-19b: launch line without pgid refused" 1 "has no pgid=" env HOME="$TMP/no
 : > "$PR/02-p2.progress"
 chk "T-19b: ccr attempt with no launch line, nothing running → released" 0 "RELEASED 02-p2" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
 rm -rf "$PR"/02-p2.claim.spent* "$PR/02-p2.progress"
+# A finished exit-5 remains fail-closed until the operator asks the separate recovery command
+# to prove the recorded CCR process group has gone. The original sidecars are never rewritten.
+CT="$TMP/cancel-resolved"; mkdir -p "$CT"; printf 'scope\n' > "$CT/00-scope.md"; mkbrief "$CT"
+printf 'p1\tccr\tx\n' > "$CT/00-participants.tsv"
+printf '5\n' > "$CT/02-p1.exit"
+printf 'backend=ccr\npid=2147483646\npgid=2147483646\ncancel_confirmed=no\n' > "$CT/02-p1.meta"
+chk "T-19c: exit-5 blocks before terminal proof" 1 "unconfirmed cancellation" pgw pre-codex "$CT" "$G2"
+chk "T-19c: terminal proof writes immutable receipt" 0 "TERMINATION-CONFIRMED 02-p1 backend=ccr" bash "$PG" confirm-terminated "$CT" 02-p1
+[ "$(fmode "$CT/02-p1.cancel-resolved")" = 400 ] && grep -q '^exit_sha256=' "$CT/02-p1.cancel-resolved" && grep -q '^meta_sha256=' "$CT/02-p1.cancel-resolved" && grep -q ' 02-p1.cancel-resolved  confirm-terminated  final$' "$CT/00-accepted.sha256" && printf '  ok    %-42s\n' "T-19c: cancellation receipt binds raw sidecars" || { printf '  FAIL  T-19c: cancellation receipt missing, unledgered or writable\n'; FAIL=1; }
+chk "T-19c: resolved exit-5 permits fresh claim" 0 "PREFLIGHT-OK" pgw pre-codex "$CT" "$G2"
+rm -f "$CT/02-p1.cancel-resolved"
+printf 'backend=ccr\npid=2147483646\npgid=unknown\ncancel_confirmed=no\n' > "$CT/02-p1.meta"
+chk "T-19c: unreadable process group remains blocked" 1 "has no numeric pgid" bash "$PG" confirm-terminated "$CT" 02-p1
 # T-16 (re-entry): a SKIPPED participant may be relaunched alone while a COMPLETE one is kept
 printf 'lead\n' > "$PR/01-lead.md"; chmod 000 "$PR/01-lead.md"
 printf 'x\nSTATUS: PHASE 2 COMPLETE\n' > "$PR/02-p1.md"; echo 0 > "$PR/02-p1.exit"; printf 'body\n' > "$PR/02-p1.stdout"; mkdir -p "$PR/02-p1.claim/runner"
@@ -1201,14 +1221,18 @@ chk "T-16: every participant complete → run pre-phase3" 1 "already records a c
 echo "review: consultation validator and state gates"
 CV=plugins/codex-pr-review/skills/two-model-pr-review/scripts/validate-consultation.py
 [ -x "$CV" ] && printf '  ok    %-42s\n' "consultation validator is executable" || { printf '  FAIL  consultation validator is not executable\n'; FAIL=1; }
-# review round 1 F-18: a citation quoting the runner's own option value "--via codex" is not an attribution
-python3 - <<'PY' && printf '  ok    %-42s\n' "F-18: '--via codex' passes, 'via codex' is caught" || { printf '  FAIL  F-18: provenance filter on the --via flag\n'; FAIL=1; }
+# review round 1 F-18: a citation quoting the runner's own option value "--via codex" is not an attribution.
+# A quote is repository evidence, so a source line containing the plugin's CL-/CX- ticket syntax
+# must not be rejected as if the reviewer had claimed that provenance.
+python3 - <<'PY' && printf '  ok    %-42s\n' "F-18: provenance checks preserve verified source quotes" || { printf '  FAIL  F-18: provenance filter scope\n'; FAIL=1; }
 import sys; sys.path.insert(0, "plugins/codex-pr-review/skills/two-model-pr-review/scripts"); import review_common as rc
 assert rc.PROVENANCE_RE.search('argument-hint: [--via codex|ccr:<alias>[,...]]') is None
 assert rc.PROVENANCE_RE.search('default --via codex; at most one') is None
 assert rc.PROVENANCE_RE.search('reviewed via codex') is not None
 assert rc.PROVENANCE_RE.search('checked by Codex') is not None
 assert rc.PROVENANCE_RE.search('according to the lead') is not None
+assert rc.citation_has_provenance('scripts/x.sh:9 "round-42 CX-03 keeps the claim"') is False
+assert rc.citation_has_provenance('repro/sidecar:9 "source"') is True
 PY
 CS="$TMP/consult"; mkdir -p "$CS"
 printf 'scope\n' > "$CS/00-scope.md"; mkbrief "$CS"
@@ -1511,13 +1535,13 @@ printf 'thread=thread-2\noutcome=COMPLETED\nmode=--fresh\ncommand=task --fresh -
 # pre-report even when the consultation phase was recorded as SKIPPED.
 cp "$CS/04-consultation.md" "$TMP/cs-04.bak"; cp "$CS/04-consultation.exit" "$TMP/cs-04exit.bak"
 printf 'consultation stalled\nSTATUS: PHASE 4 COMPLETE (SKIPPED — stalled)\n' > "$CS/04-consultation.md"; printf '5\n' > "$CS/04-consultation.exit"
-chk "CX-03r16: pre-report rejects exit-5 consultation when SKIPPED" 1 "recorded exit 5" pgw pre-report "$CS"
+chk "CX-03r16: pre-report rejects exit-5 consultation when SKIPPED" 1 "unconfirmed cancellation" pgw pre-report "$CS"
 cp "$TMP/cs-04.bak" "$CS/04-consultation.md"; cp "$TMP/cs-04exit.bak" "$CS/04-consultation.exit"
 chk "CX-03r16: pre-report passes once sidecar restored" 0 "REPORT-OK" pgw pre-report "$CS"
 # L-01r17: a rotated exit-5 consultation attempt blocks pre-verification even
 # when the current attempt completed.
 printf '5\n' > "$CS/04-consultation.attempt9.exit"
-chk "L-01r17: rotated exit-5 attempt blocks pre-verification" 1 "recorded exit 5" pgw pre-verification "$CS"
+chk "L-01r17: rotated exit-5 attempt blocks pre-verification" 1 "unconfirmed cancellation" pgw pre-verification "$CS"
 rm -f "$CS/04-consultation.attempt9.exit"
 # L-02r15: the UNVERIFIABLE-skip check reads the verdict column, so a comment
 # line ending in that word does not block a legitimate skipped resolution.
@@ -1684,7 +1708,7 @@ chk "L-01r25: rotated accepted attempt refused" 1 "with no 04-consultation.md ye
 rm -f "$SK8/04-consultation.attempt1.exit" "$SK8/04-consultation.attempt1.stdout" "$SK8/04-consultation.attempt1.meta"
 # CX-01r21: pre-consultation must refuse to authorize a launch over an exit-5 attempt.
 printf '5\n' > "$SK8/04-consultation.attempt1.exit"
-chk "CX-01r21: pre-consultation rejects exit-5 attempt" 1 "recorded exit 5" pgw pre-consultation "$SK8"
+chk "CX-01r21: pre-consultation rejects exit-5 attempt" 1 "unconfirmed cancellation" pgw pre-consultation "$SK8"
 rm -f "$SK8/04-consultation.attempt1.exit"
 printf 'verification\nSTATUS: PHASE 5 COMPLETE\n' > "$SK8/05-verification.md"
 printf 'F-01\tCONFIRMED\ttrace\tf.txt:1@'"$SHA2"' "line one"\n' > "$SK8/05-verdicts.tsv"
@@ -1743,16 +1767,54 @@ printf 'F-01\tUNVERIFIABLE \tnone\n' > "$SK8/05-verdicts.tsv"
 chk "CL-03r42: padded verdict column accepted by the residual selector check" 0 "RESOLUTION-OK codex=COMPLETE residual=1" pgw pre-resolution "$SK8"
 printf 'F-01\tUNVERIFIABLE\n' > "$SK8/05-verdicts.tsv"; rm -rf "$SK8"/06-resolution.claim*; pgw pre-resolution "$SK8" >/dev/null  # re-accept the restored draft (test-only claim reset)
 grep -q ' 06-resolution-selection.ids  pre-resolution  draft$' "$SK8/00-accepted.sha256" && printf '  ok    %-42s\n' "CX-02r24: residual selector accepted at pre-resolution" || { printf '  FAIL  CX-02r24: selector not accepted\n'; FAIL=1; }
+# CX-02r30: residual schema failures follow the same one-shot correction path.
+# Use a fresh Phase-6 fixture: SK8 has already progressed through prior
+# residual tests, whereas the repair transition must run before Phase 7.
+SK8R30="$TMP/cx02r30-resolution"; mkdir -p "$SK8R30"
+printf 'scope\n' > "$SK8R30/00-scope.md"; mkbrief "$SK8R30"
+pgw pre-codex "$SK8R30" "$G2" >/dev/null
+printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$SK8R30/01-lead.md"; chmod 000 "$SK8R30/01-lead.md"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK8R30/02-p1.md"; printf '0\n' > "$SK8R30/02-p1.exit"; printf 'blind codex body\n' > "$SK8R30/02-p1.stdout"
+pgw pre-phase3 "$SK8R30" >/dev/null
+chmod 600 "$SK8R30/01-lead.md"
+printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$SK8R30/03-matrix.md"
+printf 'F-01\tCLAUDE-ONLY\tP1\n' > "$SK8R30/03-matrix.tsv"
+base_packets "$SK8R30"
+printf 'F-01\tCLAUDE-ONLY\tP1\tINCLUDE\tprovisional-P1\n' > "$SK8R30/03-debate-selection.tsv"
+pgw pre-consultation "$SK8R30" >/dev/null
+printf 'consultation\nSTATUS: PHASE 4 COMPLETE (SKIPPED — runner failed)\n' > "$SK8R30/04-consultation.md"
+printf '1\n' > "$SK8R30/04-consultation.exit"
+printf 'outcome=FAILED\nmode=--fresh\nthread=x\n' > "$SK8R30/04-consultation.meta"
+pgw pre-verification "$SK8R30" >/dev/null
+rm -f "$SK8R30/04-consultation.exit" "$SK8R30/04-consultation.meta"
+printf 'verification\nSTATUS: PHASE 5 COMPLETE\n' > "$SK8R30/05-verification.md"
+printf 'F-01\tUNVERIFIABLE\n' > "$SK8R30/05-verdicts.tsv"
+printf 'F-01\n' > "$SK8R30/06-resolution-selection.ids"
+pgw pre-resolution "$SK8R30" >/dev/null
+rm -rf "$SK8R30"/06-resolution.claim*; printf '0\n' > "$SK8R30/06-resolution.attempt1.exit"; printf 'no json here\n' > "$SK8R30/06-resolution.attempt1.stdout"
+printf 'resolution exchange\n' > "$SK8R30/06-resolution.prompt.md"
+out=$(pgw pre-resolution "$SK8R30" 2>&1); rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'schema_invalid=1' && printf '%s' "$out" | grep -q 'schema-repair=authorized' && printf '%s' "$out" | grep -q 'prompt=06-resolution.prompt.retry.md' && printf '%s' "$out" | grep -q 'claim=' && [ "$(fmode "$SK8R30/06-resolution.prompt.retry.md")" = 400 ] && grep -q 'VALIDATION_CLASS=envelope' "$SK8R30/06-resolution.prompt.retry.md" && printf '  ok    %-42s\n' "CX-02r30: malformed resolution gets repair claim" || { printf '  FAIL  CX-02r30(resolution repair): rc=%s out=%s\n' "$rc" "$out"; FAIL=1; }
+printf '0\n' > "$SK8R30/06-resolution.attempt2.exit"; printf 'still no json\n' > "$SK8R30/06-resolution.attempt2.stdout"; printf 'prompt_file=%s\n' "$SK8R30/06-resolution.prompt.md" > "$SK8R30/06-resolution.attempt2.meta"
+chk "CX-02r30: resolution repair requires diagnostic prompt" 1 "did not use the required" pgw pre-resolution "$SK8R30"
+printf 'prompt_file=%s\ncommand=task --resume-last --background --prompt-file %s\n' "$SK8R30/06-resolution.prompt.retry.md" "$SK8R30/06-resolution.prompt.retry.md" > "$SK8R30/06-resolution.attempt2.meta"
+out=$(pgw pre-resolution "$SK8R30" 2>&1); rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'schema_invalid=2' && printf '%s' "$out" | grep -q 'schema-repair=exhausted' && ! printf '%s' "$out" | grep -q 'claim=' && printf '  ok    %-42s\n' "CX-02r30: second resolution reply exhausts repair" || { printf '  FAIL  CX-02r30(resolution exhaust): rc=%s out=%s\n' "$rc" "$out"; FAIL=1; }
+printf 'resolution\nSTATUS: PHASE 6 COMPLETE (SKIPPED — malformed replies)\n' > "$SK8R30/06-resolution.md"
+chk "CX-02r30: resolution skip after exhausted repair accepted" 0 "REPORT-OK codex=COMPLETE resolution=SKIPPED" pgw pre-report "$SK8R30"
+
 printf '0\n' > "$SK8/06-resolution.exit"; printf '```json\n{"phase":"resolution","dispositions":[{"id":"F-01","action":"MAINTAIN","claim":"first","severity":"P1","locations":["a:1"],"trigger":"t","impact":"i","observations":["a:1 \\"x\\""],"falsifier":"f","proposed_checks":["c"],"open_factual_questions":[]}]}\n```\n' > "$SK8/06-resolution.stdout"
 printf 'mode=--fresh\n' > "$SK8/06-resolution.meta"
 chk "CX-01r24: pre-resolution refuses relaunch over accepted attempt" 1 "with no 06-resolution.md yet" pgw pre-resolution "$SK8"
 # CX-05r38: validator arguments are passed as an array, so a run directory with spaces still recognizes a usable response.
 SP="$TMP/with space"; rm -rf "$SP"; mkdir -p "$SP"; cp -R "$SK8" "$SP/art"
 chk "CX-05r38: usable response recognized under a path with spaces" 1 "with no 06-resolution.md yet" bash "$PG" pre-resolution "$SP/art"
-rm -f "$SK8/06-resolution.exit" "$SK8/06-resolution.stdout" "$SK8/06-resolution.meta"; rm -rf "$SK8"/06-resolution.claim.spent*  # test-only reset: the fixture models no launch below
+rm -f "$SK8/06-resolution.exit" "$SK8/06-resolution.stdout" "$SK8/06-resolution.meta" "$SK8"/06-resolution.attempt*.exit "$SK8"/06-resolution.attempt*.stdout "$SK8"/06-resolution.attempt*.meta; rm -rf "$SK8"/06-resolution.claim.spent*  # test-only reset: the fixture models no launch below
 # CX-02r17: a skipped Phase 6 with residuals is rejected only when nothing was
 # attempted and budget remains; an attempted (failed) exchange or an exhausted
 # budget is the documented fallback and must reach REPORT-OK.
+rm -f "$SK8"/04-consultation.attempt*.exit "$SK8"/04-consultation.attempt*.stdout "$SK8"/04-consultation.attempt*.meta
+rm -rf "$SK8"/04-consultation.claim.spent*
 printf 'consultation skipped\nSTATUS: PHASE 4 COMPLETE (SKIPPED — no candidates)\n' > "$SK8/04-consultation.md"
 printf 'resolution failed\nSTATUS: PHASE 6 COMPLETE (SKIPPED — validation failed)\n' > "$SK8/06-resolution.md"
 chk "CX-02r17: skip with residuals and no attempt rejected" 1 "no residual exchange was attempted" pgw pre-report "$SK8"
@@ -1794,9 +1856,9 @@ printf 'PROBE UNAVAILABLE\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > 
 # CX-01r19: an exit-5 / unconfirmed-cancel sidecar on the initial review blocks
 # the join even when the phase was recorded SKIPPED, and a rotated one too.
 printf '5\n' > "$SK6/02-p1.exit"
-chk "CX-01r19: pre-phase3 rejects exit-5 initial review (SKIPPED)" 1 "02-p1 recorded exit 5" pgw pre-phase3 "$SK6"
+chk "CX-01r19: pre-phase3 rejects exit-5 initial review (SKIPPED)" 1 "unconfirmed cancellation" pgw pre-phase3 "$SK6"
 rm -f "$SK6/02-p1.exit"; printf 'outcome=STALLED\ncancel_confirmed=no\n' > "$SK6/02-p1.attempt1.meta"
-chk "CX-01r19: rotated cancel_confirmed=no blocks the join" 1 "cancel_confirmed=no" pgw pre-phase3 "$SK6"
+chk "CX-01r19: rotated cancel_confirmed=no blocks the join" 1 "unconfirmed cancellation" pgw pre-phase3 "$SK6"
 rm -f "$SK6/02-p1.attempt1.meta"
 pgw pre-phase3 "$SK6" >/dev/null
 chmod 600 "$SK6/01-lead.md"
@@ -1943,7 +2005,7 @@ pgw pre-consultation "$SK2R6" >/dev/null
 printf 'consultation\nSTATUS: PHASE 4 COMPLETE (SKIPPED — exit 5)\n' > "$SK2R6/04-consultation.md"
 printf '5\n' > "$SK2R6/04-consultation.exit"
 printf 'thread=bad\noutcome=STALLED\ncancel_confirmed=no\n' > "$SK2R6/04-consultation.meta"
-chk "F-02r6: exit-5 consultation rejected" 1 "exit 5" pgw pre-verification "$SK2R6"
+chk "F-02r6: exit-5 consultation rejected" 1 "unconfirmed cancellation" pgw pre-verification "$SK2R6"
 
 # F-04r6: pre-codex must reject a sealed run whose status was tampered with.
 SK4R6="$TMP/f04r6"; mkdir -p "$SK4R6"
@@ -2051,10 +2113,36 @@ chk "CX-02r21: eligible consultation skipped with no attempt rejected" 1 "no con
 printf 'outcome=FAILED\nthread=x\nmode=--fresh\ncommand=task --fresh --background --prompt-file p\n' > "$SK1R10/04-consultation.meta"; printf '1\n' > "$SK1R10/04-consultation.exit"
 printf 'consultation\nSTATUS: PHASE 4 COMPLETE (SKIPPED — runner failed)\n' > "$SK1R10/04-consultation.md"
 chk "CX-02r21: skip after a failed attempt accepted" 0 "VERIFICATION-OK consultation=SKIPPED" pgw pre-verification "$SK1R10"
-# CX-02r30: a SKIPPED consultation over an exit-0 attempt is allowed only if that response fails validation.
-printf '0\n' > "$SK1R10/04-consultation.attempt1.exit"; printf 'no json here\n' > "$SK1R10/04-consultation.attempt1.stdout"
-chk "CX-02r30: skip over a malformed exit-0 response accepted" 0 "VERIFICATION-OK consultation=SKIPPED" pgw pre-verification "$SK1R10"
+# CX-02r30: a schema-invalid exit-0 reply gets exactly one gate-authorized correction.
+# Use a fresh Phase-4 fixture: the earlier SK1R10 path already intentionally
+# exercised the SKIPPED fallback and entered Phase 5, where repair is forbidden.
+SK1R30="$TMP/cx02r30-consult"; mkdir -p "$SK1R30"
+printf 'scope\n' > "$SK1R30/00-scope.md"; mkbrief "$SK1R30"
+pgw pre-codex "$SK1R30" "$G2" >/dev/null
+printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$SK1R30/01-lead.md"; chmod 000 "$SK1R30/01-lead.md"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK1R30/02-p1.md"; printf '0\n' > "$SK1R30/02-p1.exit"; printf 'blind codex body\n' > "$SK1R30/02-p1.stdout"
+pgw pre-phase3 "$SK1R30" >/dev/null
+chmod 600 "$SK1R30/01-lead.md"
+printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$SK1R30/03-matrix.md"
+printf 'F-01\tCLAUDE-ONLY\tP1\n' > "$SK1R30/03-matrix.tsv"
+base_packets "$SK1R30"
+printf 'F-01\tCLAUDE-ONLY\tP1\tINCLUDE\tprovisional-P1\n' > "$SK1R30/03-debate-selection.tsv"
+pgw pre-consultation "$SK1R30" >/dev/null
+printf 'consultation exchange\n' > "$SK1R30/04-consultation.prompt.md"
+printf '0\n' > "$SK1R30/04-consultation.attempt1.exit"; printf 'no json here\n' > "$SK1R30/04-consultation.attempt1.stdout"
+out=$(pgw pre-consultation "$SK1R30" 2>&1); rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'schema_invalid=1' && printf '%s' "$out" | grep -q 'schema-repair=authorized' && printf '%s' "$out" | grep -q 'prompt=04-consultation.prompt.retry.md' && printf '%s' "$out" | grep -q 'claim=' && [ "$(fmode "$SK1R30/04-consultation.prompt.retry.md")" = 400 ] && grep -q 'VALIDATION_CLASS=envelope' "$SK1R30/04-consultation.prompt.retry.md" && printf '  ok    %-42s\n' "CX-02r30: malformed exit-0 gets one repair claim" || { printf '  FAIL  CX-02r30(repair): rc=%s out=%s\n' "$rc" "$out"; FAIL=1; }
+printf '0\n' > "$SK1R30/04-consultation.attempt2.exit"; printf 'still no json\n' > "$SK1R30/04-consultation.attempt2.stdout"; printf 'prompt_file=%s\n' "$SK1R30/04-consultation.prompt.md" > "$SK1R30/04-consultation.attempt2.meta"
+chk "CX-02r30: repair requires diagnostic prompt" 1 "did not use the required" pgw pre-consultation "$SK1R30"
+printf 'prompt_file=%s\ncommand=task --resume-last --background --prompt-file %s\n' "$SK1R30/04-consultation.prompt.retry.md" "$SK1R30/04-consultation.prompt.retry.md" > "$SK1R30/04-consultation.attempt2.meta"
+out=$(pgw pre-consultation "$SK1R30" 2>&1); rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'schema_invalid=2' && printf '%s' "$out" | grep -q 'schema-repair=exhausted' && ! printf '%s' "$out" | grep -q 'claim=' && printf '  ok    %-42s\n' "CX-02r30: second malformed reply exhausts repair" || { printf '  FAIL  CX-02r30(exhaust): rc=%s out=%s\n' "$rc" "$out"; FAIL=1; }
+printf 'consultation\nSTATUS: PHASE 4 COMPLETE (SKIPPED — malformed replies)\n' > "$SK1R30/04-consultation.md"
+chk "CX-02r30: skip over malformed responses accepted" 0 "VERIFICATION-OK consultation=SKIPPED" pgw pre-verification "$SK1R30"
+
 printf 'thread=t-sk1\noutcome=COMPLETED\n' > "$SK1R10/02-p1.meta"
+rm -f "$SK1R10"/04-consultation.attempt2.exit "$SK1R10"/04-consultation.attempt2.stdout "$SK1R10"/04-consultation.attempt2.meta
+printf '0\n' > "$SK1R10/04-consultation.attempt1.exit"
 printf '```json\n{"phase":"consultation","dispositions":[{"id":"F-01","action":"MAINTAIN","claim":"first","severity":"P1","locations":["a:1"],"trigger":"t","impact":"i","observations":["a:1 \\"x\\""],"falsifier":"f","proposed_checks":["c"],"open_factual_questions":[]}]}\n```\n' > "$SK1R10/04-consultation.attempt1.stdout"
 printf 'mode=--resume-last\nthread=t-other\n' > "$SK1R10/04-consultation.attempt1.meta"
 chk "CX-04r37: valid response on the wrong thread is skippable" 0 "VERIFICATION-OK consultation=SKIPPED" pgw pre-verification "$SK1R10"
@@ -2086,7 +2174,7 @@ pgw pre-resolution "$SK1R10" >/dev/null || { printf '  FAIL  SK1R10 pre-resoluti
 printf 'resolution\nSTATUS: PHASE 6 COMPLETE (SKIPPED — exit 5)\n' > "$SK1R10/06-resolution.md"
 printf '5\n' > "$SK1R10/06-resolution.exit"
 printf 'thread=bad\noutcome=STALLED\ncancel_confirmed=no\n' > "$SK1R10/06-resolution.meta"
-chk "F-01r10: pre-report rejects exit-5 resolution" 1 "exit 5" pgw pre-report "$SK1R10"
+chk "F-01r10: pre-report rejects exit-5 resolution" 1 "unconfirmed cancellation" pgw pre-report "$SK1R10"
 
 echo "review: round-11 findings F-01r11/F-02r11/F-03r11 regressions"
 # F-01r11: the provenance filter must catch backtick-quoted /tmp/ paths.
@@ -2222,7 +2310,8 @@ if [ -x /usr/bin/python3 ]; then
   /usr/bin/python3 -c "import sys; sys.path.insert(0, '$(dirname "$PV")'); import review_common" >/dev/null 2>&1 && printf '  ok    %-42s\n' "CX-01r16: review_common imports on /usr/bin/python3 ($(/usr/bin/python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])'))" || { printf '  FAIL  CX-01r16: review_common does not import on /usr/bin/python3\n'; FAIL=1; }
   chk "CX-01r16: packet validator runs on /usr/bin/python3" 0 "OK packets=1" /usr/bin/python3 "$PV" --matrix "$TMP/f01r9.tsv" --packets "$TMP/cx05r15-space.ndjson"
 fi
-# CX-01r37: a repository path that merely contains an agent name is citable; the quote still gets the full filter.
+# CX-01r37: a repository path that merely contains an agent name is citable;
+# a verified source quote is data rather than reviewer-authored prose.
 python3 - "$TMP/f01r9.tsv" <<'PY2'
 import json,sys
 tsv=sys.argv[1]; d={"id":"F-01","severity":"P1","claim":"x","locations":["plugins/codex-pr-review/agents/finding-verifier.md:12"],"trigger":"t","impact":"i","observations":["plugins/codex-pr-review/agents/finding-verifier.md:12@abc \"quoted\""],"falsifier":"f","proposed_checks":["c"],"open_factual_questions":["q"]}
@@ -2233,7 +2322,7 @@ d["observations"]=["00-notes.md:1 \"x\""]
 open(tsv.rsplit("/",1)[0]+"/cx01r37-art.ndjson","w").write(json.dumps(d)+"\n")
 PY2
 chk "CX-01r37: path naming an agent file accepted" 0 "OK packets=1" python3 "$PV" --matrix "$TMP/f01r9.tsv" --packets "$TMP/cx01r37-ok.ndjson"
-chk "CX-01r37: provenance in the quote still rejected" 1 "provenance" python3 "$PV" --matrix "$TMP/f01r9.tsv" --packets "$TMP/cx01r37-bad.ndjson"
+chk "CX-01r37: provenance-like source quote accepted" 0 "OK packets=1" python3 "$PV" --matrix "$TMP/f01r9.tsv" --packets "$TMP/cx01r37-bad.ndjson"
 chk "CX-01r37: artifact-shaped root path still rejected" 1 "provenance or artifact" python3 "$PV" --matrix "$TMP/f01r9.tsv" --packets "$TMP/cx01r37-art.ndjson"
 # CX-02r16: table-driven — every shipped artifact name is rejected in free text
 # and in structured fields; ordinary repo paths that merely start with digits are not.
@@ -2349,7 +2438,7 @@ const mk = ev => async () => ({ verdict: "CONFIRMED", method: "(b) trace", evide
   v = await run({ stage: "verify", art: "/a", repo: "/r", findings: [base] }, mk(['plugins/codex-pr-review/agents/finding-verifier.md:12@abc "quoted"']));
   if (v.verdicts[0].verdict !== "CONFIRMED") throw new Error("CX-01r37: agent-file path rejected as provenance: " + JSON.stringify(v.verdicts[0]));
   v = await run({ stage: "verify", art: "/a", repo: "/r", findings: [base] }, mk(['src/a.py:1@abc "as codex noted"']));
-  if (v.verdicts[0].verdict !== "UNVERIFIABLE") throw new Error("CX-01r37: provenance in quote confirmed: " + JSON.stringify(v.verdicts[0]));
+  if (v.verdicts[0].verdict !== "CONFIRMED") throw new Error("CX-01r37: source quote rejected as provenance: " + JSON.stringify(v.verdicts[0]));
   const fvBase = { ...base, locations: ["plugins/codex-pr-review/agents/finding-verifier.md:1"] };
   v = await run({ stage: "verify", art: "/a", repo: "/r", findings: [fvBase] }, mk(['src/a.py:1@abc "ok"']));
   if (v.verdicts[0].verdict !== "CONFIRMED") throw new Error("CX-01r37: agent-file location rejected: " + JSON.stringify(v.verdicts[0]));
@@ -2440,11 +2529,14 @@ const mk = ev => async () => ({ verdict: "CONFIRMED", method: "(b) trace", evide
   const P = eval(fs.readFileSync(process.argv[2], "utf8").match(/const PROVENANCE_RE = (.*)\n/)[1]);
   for (const t of ["Claude Code found the bug","Codex CLI concluded x","The lead agent found this"]) if (!P.test(t)) throw new Error("JS accepted: " + t);
   if (P.test("the codex runner exits 4")) throw new Error("JS rejected runner mention");
-  // CX-01r20: evidence citations must be repository-relative and artifact/provenance-free
-  for (const ev of ['/tmp/two-model-pr-review/r/05-verification.md:1 "not source"', 'run/05-verification.md:1 "x"', '../x.py:1 "x"', 'src/x.py:1 "the codex reviewer said so"', 'cmd: cat /tmp/two-model-pr-review/r/01-lead.md -> text']) {
+  // CX-01r20: evidence citations must be repository-relative and artifact-path-free.
+  // A source quote may contain a phrase that would be unsafe as authored prose.
+  for (const ev of ['/tmp/two-model-pr-review/r/05-verification.md:1 "not source"', 'run/05-verification.md:1 "x"', '../x.py:1 "x"', 'cmd: cat /tmp/two-model-pr-review/r/01-lead.md -> text']) {
     v = await run({ stage: "verify", art: "/a", repo: "/r", findings: [base] }, mk([ev]));
     if (v.verdicts[0].verdict !== "UNVERIFIABLE") throw new Error("unsafe evidence confirmed: " + ev);
   }
+  v = await run({ stage: "verify", art: "/a", repo: "/r", findings: [base] }, mk(['src/x.py:1 "the codex reviewer said so"']));
+  if (v.verdicts[0].verdict !== "CONFIRMED") throw new Error("source quote rejected as provenance");
   v = await run({ stage: "verify", art: "/a", repo: "/r", findings: [base] }, mk(['src/x.py:1-3@abc "ok"', 'cmd: git grep foo -> 3 hits']));
   if (v.verdicts[0].verdict !== "CONFIRMED") throw new Error("safe evidence rejected");
   if (P.test("the second model's weights are never freed")) throw new Error("JS rejected ML vocabulary");

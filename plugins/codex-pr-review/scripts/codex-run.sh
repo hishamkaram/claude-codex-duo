@@ -103,6 +103,8 @@ ccr_preflight() {  # <alias>
   PROVIDER=$(ccr_model_field "$MODEL_JSON" provider); PROVIDER_MODEL=$(ccr_model_field "$MODEL_JSON" provider_model)
   CLAUDE_MODEL=$(ccr_model_field "$MODEL_JSON" claude_model_id); COMPAT=$(ccr_model_field "$MODEL_JSON" compatibility); TOOLS=$(ccr_model_field "$MODEL_JSON" tools)
   [ -n "$PROVIDER" ] || { REASON="ccr model show $1 --json has no provider field"; return 1; }
+  [ -n "$PROVIDER_MODEL" ] || { REASON="ccr model show $1 --json has no provider_model field"; return 1; }
+  [ -n "$CLAUDE_MODEL" ] || { REASON="ccr model show $1 --json has no claude_model_id field"; return 1; }
   [ "$TOOLS" = true ] || { REASON="alias $1 reports supports_tools=$TOOLS; a reviewer needs tool calls"; return 1; }
   return 0
 }
@@ -110,9 +112,12 @@ ccr_preflight() {  # <alias>
 ccr_smoke_check() {  # <dir> <alias>  (needs ccr_preflight first)
   local f="$1/.ccr-smoke.$2"
   [ -r "$f" ] || { REASON="ccr smoke missing for $2: run 'codex-run.sh --probe --via ccr:$2 --record-dir $1' first (smoke record $f)"; return 1; }
+  grep -qxF "alias=$2" "$f" || { REASON="ccr smoke record does not bind alias $2 ($f)"; return 1; }
   grep -qxF "readonly=verified" "$f" || { REASON="ccr smoke for $2 is not 'readonly=verified' ($f)"; return 1; }
   grep -qxF "ccr=$CCR_VER" "$f" || { REASON="ccr smoke for $2 was recorded with another ccr version (now $CCR_VER); re-run the probe"; return 1; }
-  grep -qxF "model=$PROVIDER_MODEL" "$f" || { REASON="ccr smoke for $2 was recorded for another model (now $PROVIDER_MODEL); re-run the probe"; return 1; }
+  grep -qxF "model=$PROVIDER_MODEL" "$f" || { REASON="ccr smoke for $2 was recorded for another provider model (now $PROVIDER_MODEL); re-run the probe"; return 1; }
+  grep -qxF "claude_model_id=$CLAUDE_MODEL" "$f" || { REASON="ccr smoke for $2 was recorded for another generated child model (now $CLAUDE_MODEL); re-run the probe"; return 1; }
+  grep -qxF "child_model=$CLAUDE_MODEL" "$f" || { REASON="ccr smoke for $2 lacks a verified generated child model ($f); re-run the probe"; return 1; }
   grep -qxF "launch_sha256=$(ccr_launch_digest)" "$f" || { REASON="ccr smoke for $2 was recorded for another launch line; re-run the probe"; return 1; }
   return 0
 }
@@ -230,9 +235,11 @@ raise SystemExit(0 if ok else 1)'
       fi
       [ "$(stream_field "$SMOKE/stream.jsonl" has-result)" = yes ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke produced no result event ccr=$CCR_VER"; exit 1; }
       [ "$(stream_field "$SMOKE/stream.jsonl" result-ok)" = yes ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke result is an error event ($(stream_field "$SMOKE/stream.jsonl" result-subtype)) ccr=$CCR_VER"; exit 1; }
+      SMOKE_MODEL=$(stream_field "$SMOKE/stream.jsonl" init-model)
+      [ "$SMOKE_MODEL" = "$CLAUDE_MODEL" ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS route=unverified expected_child_model=${CLAUDE_MODEL:-unknown} got_child_model=${SMOKE_MODEL:-unknown} ccr=$CCR_VER"; exit 1; }
       RECORDED="not recorded (pass --record-dir <run dir> so launches in it can verify the smoke)"
       if [ -n "$RECORD_DIR" ]; then
-        printf 'alias=%s\nccr=%s\nmodel=%s\nprovider=%s\nreadonly=verified\nlaunch_sha256=%s\nrecorded=%s\n' "$ALIAS" "$CCR_VER" "$PROVIDER_MODEL" "$PROVIDER" "$(ccr_launch_digest)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RECORD_DIR/.ccr-smoke.$ALIAS" \
+        printf 'alias=%s\nccr=%s\nmodel=%s\nprovider=%s\nclaude_model_id=%s\nchild_model=%s\nreadonly=verified\nlaunch_sha256=%s\nrecorded=%s\n' "$ALIAS" "$CCR_VER" "$PROVIDER_MODEL" "$PROVIDER" "$CLAUDE_MODEL" "$SMOKE_MODEL" "$(ccr_launch_digest)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RECORD_DIR/.ccr-smoke.$ALIAS" \
           || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS cannot write $RECORD_DIR/.ccr-smoke.$ALIAS"; exit 1; }
         RECORDED="recorded=$RECORD_DIR/.ccr-smoke.$ALIAS"
       fi
@@ -363,7 +370,7 @@ unlock_claim() { [ -z "$HELD_LOCK" ] || rmdir "$HELD_LOCK" 2>/dev/null; HELD_LOC
 launch_error() {  # <message> <command>
   stamp_claim; rotate_previous_attempt; unlock_claim
   echo "codex-run.sh: $1" >&2; printf 'LAUNCH-ERROR\n%s\n' "$1" > "$PREFIX.stderr"; printf '0s LAUNCH-ERROR: %s\n' "$1" > "$PREFIX.progress"
-  printf 'outcome=LAUNCH-ERROR\nbackend=%s\nlast_error=%s\nmode=%s\ncommand=%s\n' "$BACKEND" "$1" "$MODE" "$2" > "$PREFIX.meta"; echo 4 > "$PREFIX.exit"; exit 4
+  printf 'outcome=LAUNCH-ERROR\nbackend=%s\nlast_error=%s\nmode=%s\nprompt_file=%s\ncommand=%s\n' "$BACKEND" "$1" "$MODE" "$PROMPT_FILE" "$2" > "$PREFIX.meta"; echo 4 > "$PREFIX.exit"; exit 4
 }
 START=$(date +%s); now() { date +%s; }; elapsed() { echo $(( $(now) - START )); }
 
@@ -372,7 +379,7 @@ START=$(date +%s); now() { date +%s; }; elapsed() { echo $(( $(now) - START )); 
 # =============================================================================================
 if [ "$BACKEND" = ccr ]; then
   DIR=$(dirname "$PREFIX")
-  CMD="ccr launch --model $ALIAS --permission-mode plan -p ... --max-turns $MAX_TURNS $MODE${RESUME_SESSION:+ $RESUME_SESSION}"
+  CMD="ccr launch --model $ALIAS --permission-mode plan -p ... --max-turns $MAX_TURNS $MODE${RESUME_SESSION:+ $RESUME_SESSION} --prompt-file $PROMPT_FILE"
   ccr_preflight "$ALIAS" || launch_error "$REASON" "$CMD"
   ccr_smoke_check "$DIR" "$ALIAS" || launch_error "$REASON" "$CMD"
   SESSION=""
@@ -395,7 +402,7 @@ if [ "$BACKEND" = ccr ]; then
       # child the fake/gateway forked must not outlive this branch (a stray `sleep` was observed).
       kill -KILL -- "-$CHILD" 2>/dev/null; kill -KILL "$CHILD" 2>/dev/null; wait "$CHILD" 2>/dev/null
       echo "$(elapsed)s LAUNCH: process group of pid $CHILD could not be read (got '$PGID'); child killed" >> "$PREFIX.progress"
-      printf 'outcome=UNCONFIRMED-CANCEL\nbackend=ccr\nalias=%s\npid=%s\npgid=unknown\nlast_error=process group unreadable\nmode=%s\ncommand=%s\ncancel_confirmed=no\n' "$ALIAS" "$CHILD" "$MODE" "$CMD" > "$PREFIX.meta"
+      printf 'outcome=UNCONFIRMED-CANCEL\nbackend=ccr\nalias=%s\npid=%s\npgid=unknown\nlast_error=process group unreadable\nmode=%s\nprompt_file=%s\ncommand=%s\ncancel_confirmed=no\n' "$ALIAS" "$CHILD" "$MODE" "$PROMPT_FILE" "$CMD" > "$PREFIX.meta"
       : > "$PREFIX.stdout"; echo 5 > "$PREFIX.exit"; echo "codex-run.sh: process group unreadable; child killed (exit 5)" >&2; exit 5
     fi
     PGID="$CHILD"
@@ -428,23 +435,38 @@ if [ "$BACKEND" = ccr ]; then
   SESSION_ID=$(stream_field "$PREFIX.joblog" init-session); ROUTED_MODEL=$(stream_field "$PREFIX.joblog" init-model)
   HAS_RESULT=$(stream_field "$PREFIX.joblog" has-result)
   stream_field "$PREFIX.joblog" result-text > "$PREFIX.stdout"
+  if [ "$UNCONFIRMED_CANCEL" = 1 ]; then : > "$PREFIX.stdout"; fi
   if [ "$OUTCOME" = EXITED ]; then
     # A result event that is an error (is_error, or a non-success subtype such as error_max_turns) is a
     # failed attempt even if the child exited 0 (review round 1: F-10).
     if [ "$CHILD_RC" = 0 ] && [ "$HAS_RESULT" = yes ] && [ "$(stream_field "$PREFIX.joblog" result-ok)" = yes ]; then OUTCOME=COMPLETED; else OUTCOME=FAILED; fi
   fi
+  # The configured alias is CCR input. `CLAUDE_MODEL` is the generated model ID
+  # CCR promised for it; the child independently reports `ROUTED_MODEL` at init.
+  # A mismatch is a route/configuration failure, never a reason to try Claude or
+  # another alias. This comparison is local metadata only — no extra ccr call.
+  ROUTE_OK=unknown
+  if [ "$OUTCOME" = COMPLETED ]; then
+    if [ -z "$CLAUDE_MODEL" ] || [ -z "$ROUTED_MODEL" ] || [ "$ROUTED_MODEL" != "$CLAUDE_MODEL" ]; then
+      OUTCOME=UNAVAILABLE; ROUTE_OK=no
+      echo "$(elapsed)s ROUTE-UNAVAILABLE alias=$ALIAS expected_child_model=${CLAUDE_MODEL:-unknown} got_child_model=${ROUTED_MODEL:-unknown}" >> "$PREFIX.progress"
+      printf 'codex-run.sh: CCR route identity mismatch for alias %s (expected generated child model %s, got %s); do not retry with another alias or Claude\n' "$ALIAS" "${CLAUDE_MODEL:-unknown}" "${ROUTED_MODEL:-unknown}" >> "$PREFIX.stderr"
+    else
+      ROUTE_OK=yes
+    fi
+  fi
   [ "$OUTCOME" != COMPLETED ] || [ -z "$SESSION_ID" ] || printf '%s\n' "$SESSION_ID" > "$DIR/.ccr-last-session"
   {
     echo "outcome=$OUTCOME"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "provider=$PROVIDER"; echo "provider_model=$PROVIDER_MODEL"
-    echo "claude_model_id=$CLAUDE_MODEL"; echo "routed_model=${ROUTED_MODEL:-unknown}"; echo "compatibility=$COMPAT"; echo "ccr_version=$CCR_VER"
+    echo "claude_model_id=$CLAUDE_MODEL"; echo "routed_model=${ROUTED_MODEL:-unknown}"; echo "route_identity=$ROUTE_OK"; echo "compatibility=$COMPAT"; echo "ccr_version=$CCR_VER"
     echo "pid=$CHILD"; echo "pgid=$PGID"; echo "child_exit=$CHILD_RC"; echo "thread=${SESSION_ID:-unknown}"
     echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "max_turns=$MAX_TURNS"
-    echo "mode=$MODE"; [ "$MODE" != "--resume-session" ] || echo "resume_session=$RESUME_SESSION"; echo "result_event=$(stream_field "$PREFIX.joblog" result-subtype)"
+    echo "mode=$MODE"; [ "$MODE" != "--resume-session" ] || echo "resume_session=$RESUME_SESSION"; echo "prompt_file=$PROMPT_FILE"; echo "result_event=$(stream_field "$PREFIX.joblog" result-subtype)"
     echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
     LASTERR=$(grep -E 'error|Error|exit status' "$PREFIX.stderr" | tail -1 | cut -c1-300)
     echo "last_error=${LASTERR:-none}"; echo "cancel_confirmed=$([ "$UNCONFIRMED_CANCEL" = 1 ] && echo no || echo "$([ "$OUTCOME" = STALLED ] || [ "$OUTCOME" = TIMEOUT ] && echo yes || echo n/a)")"
   } > "$PREFIX.meta"
-  case "$OUTCOME" in COMPLETED) RC=0;; FAILED) RC=1;; STALLED) RC=2;; TIMEOUT) RC=3;; *) RC=1;; esac
+  case "$OUTCOME" in COMPLETED) RC=0;; FAILED) RC=1;; STALLED) RC=2;; TIMEOUT) RC=3;; UNAVAILABLE) RC=4;; *) RC=1;; esac
   [ "$UNCONFIRMED_CANCEL" = 1 ] && RC=5
   echo "$RC" > "$PREFIX.exit"
   echo "codex-run.sh: $OUTCOME backend=ccr alias=$ALIAS session=${SESSION_ID:-unknown} elapsed=$(elapsed)s stdout=$(wc -c < "$PREFIX.stdout" | tr -d ' ')B → $PREFIX.{stdout,progress,meta}"
@@ -528,14 +550,17 @@ if [ "$OUTCOME" = "STALLED" ] || [ "$OUTCOME" = "TIMEOUT" ] || { [ "$OUTCOME" = 
     echo "$(elapsed)s $OUTCOME → cancelled $JOB (confirmed: no running job, no worker process)" >> "$PREFIX.progress"
   fi
 fi
-# always try to collect whatever final message exists
-cc result "$JOB" > "$PREFIX.stdout" 2>>"$PREFIX.stderr" || true
+# An unconfirmed cancel has no final result eligible for a downstream gate. The
+# raw job log is still preserved; do not let a late `result` look completed.
+if [ "${UNCONFIRMED_CANCEL:-0}" = "1" ]; then : > "$PREFIX.stdout"
+else cc result "$JOB" > "$PREFIX.stdout" 2>>"$PREFIX.stderr" || true
+fi
 [ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && cp "$LOGFILE" "$PREFIX.joblog" 2>/dev/null
 THREAD=$(grep -oE 'Codex session ID: [0-9a-f-]+' "$PREFIX.stdout" | head -1 | awk '{print $4}')
 {
   echo "outcome=$OUTCOME"; echo "backend=codex"; echo "job=$JOB"; echo "thread=${THREAD:-unknown}"
   echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"
-  echo "mode=$MODE"; echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
+  echo "mode=$MODE"; echo "prompt_file=$PROMPT_FILE"; echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
   LASTERR=""; [ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && LASTERR=$(grep -E "Codex error:|Turn failed" "$LOGFILE" | tail -1 | cut -c1-300)
   echo "last_error=${LASTERR:-none}"; echo "cancel_confirmed=$([ "${UNCONFIRMED_CANCEL:-0}" = "1" ] && echo no || echo "$([ "$OUTCOME" = "STALLED" ] || [ "$OUTCOME" = "TIMEOUT" ] && echo yes || echo n/a)")"
 } > "$PREFIX.meta"

@@ -79,10 +79,16 @@ the `result` event's text verbatim (no helper trailer lines), `.progress` lines
 `launched backend=ccr pid=<pid> pgid=<pgid> alias=<alias>` — the child runs in its
 own process group, stall or timeout signals the whole group, and exit 5 means a
 member survived. `.meta` adds `backend=ccr`, `alias=`, `provider=`,
-`provider_model=`, `claude_model_id=`, `compatibility=`, `ccr_version=`, `pid=`,
-`pgid=`, `child_exit=`. The exit table below is identical. `phase-gate.sh release`
-of a ccr attempt requires the recorded pid dead, the process group empty and no
-descendant alive, and never consults the Codex companion.
+`provider_model=`, `claude_model_id=`, `routed_model=`, `route_identity=`,
+`compatibility=`, `ccr_version=`, `pid=`, `pgid=`, `child_exit=`. The configured
+alias belongs only to `ccr launch --model`; `provider_model` is descriptive and
+is never passed as a model argument. A completed route is usable only when the
+child `system/init.model` (`routed_model`) equals CCR's generated
+`claude_model_id`; a mismatch is `UNAVAILABLE`, preserved for diagnosis, and is
+never retried with another alias or Claude. The exit table below is identical.
+`phase-gate.sh release` of a ccr attempt requires the recorded pid dead, the
+process group empty and no descendant alive, and never consults the Codex
+companion.
 
 ## Building the brief (Phase 0)
 
@@ -240,9 +246,13 @@ for a ccr participant `--resume-session` names its Phase-2 `thread=`. Then
 compare `04-consultation.meta`'s `thread=` to `02-p<k>.meta`'s `thread=` before
 accepting the response (the gate does the same). If the session cannot be
 resumed, retry once with `--fresh`; record that continuity is unavailable and
-treat the call as a self-contained consultation. A launch, stall, or validation
-failure becomes a skipped consultation and never reruns an initial review. The
-other participants are not consulted in this version.
+treat the call as a self-contained consultation. A launch or stall failure becomes a skipped consultation and never reruns an
+initial review. An exit-0 non-empty response that fails canonical validation
+gets exactly one correction: run `pre-consultation` again, use its new `claim=`
+token and `prompt=04-consultation.prompt.retry.md`, and invoke the same command
+with that retry prompt. The sealed retry prompt appends only fixed correction
+wording and the validator's stable diagnostic; a second malformed response is
+SKIPPED. The other participants are not consulted in this version.
 
 ## Phase 6 — residual-resolution exchange
 
@@ -268,11 +278,16 @@ response. A retry counts as a launch. Before accepting a resumed resolution, com
 `06-resolution.meta`'s `thread=` to the accepted consultation thread when one
 exists, otherwise the exchange participant's `02-p<k>.meta` `thread=`; a fresh
 retry records unavailable continuity but remains self-contained. The residual-ID list and response use the
-same fenced JSON/disposition contract as consultation. A failed exchange is
-recorded as skipped; unresolved findings follow the adjudication default.
-`pre-report` accepts that skip only when a `06-resolution` sidecar shows the
-exchange was attempted, or the shared budget is exhausted — a skip with
-residuals and no attempt is rejected as unhandled work.
+same fenced JSON/disposition contract as consultation. An exit-0 non-empty
+response that fails canonical validation gets exactly one correction: run
+`pre-resolution` again, use its new `claim=` token and
+`prompt=06-resolution.prompt.retry.md`, and invoke the same command with that
+retry prompt. The sealed prompt contains the stable validator diagnostic; a
+second malformed response is SKIPPED. Other failed exchanges are recorded as
+skipped; unresolved findings follow the adjudication default. `pre-report`
+accepts that skip only when a `06-resolution` sidecar shows the exchange was
+attempted, or the shared budget is exhausted — a skip with residuals and no
+attempt is rejected as unhandled work.
 
 ## Blindness rules
 

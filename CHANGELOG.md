@@ -2,6 +2,14 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [4.0.1] - 2026-09-07
+
+### Fixed
+- **Provider-agnostic review reliability.** The shared runner now binds a CCR smoke receipt to the configured alias, provider model, CCR-generated child model ID, observed child `system/init.model`, CCR version, and launch digest. It passes the configured alias only as `ccr launch --model <alias>` before `--`; a generated-child-ID mismatch is recorded as `UNAVAILABLE` (exit 4), never silently retried with another alias or Claude. The smoke remains fail-closed for broad permission configurations.
+- **Canonical exchange recovery.** An exit-0, non-empty consultation or residual-resolution response that fails the unchanged canonical validator now gets exactly one corrective resubmission. Its gate creates a sealed `*.prompt.retry.md` containing fixed correction wording plus the stable validation class/diagnostic; the existing launch and response caps still apply, and a second malformed response follows the existing SKIPPED fallback.
+- **Cancellation recovery.** `phase-gate.sh confirm-terminated` can add an immutable SHA-bound receipt only after the same backend liveness checks prove an exit-5 attempt is dead. Original sidecars remain intact, and absent or invalid proof continues to block relaunch.
+- **Citation provenance.** Repository source quotes can contain project identifiers or provenance-like wording without being treated as reviewer authorship; authored fields and citation paths remain filtered and quotes remain independently source-validated.
+
 ## [3.0.0] - 2026-09-07
 
 Planned with `/codex-deep-plan:plan --deep` (deep-plan run `ccr-backend-20260907-003456`), debated with Codex over a blind round 0 plus three rounds (termination T1, converged; APPROVE_WITH_CONDITIONS — the conditions are the T-5b/T-5c, T-10b/T-19b and T-27/T-27b tests, which ship here). One PR, four commit groups.

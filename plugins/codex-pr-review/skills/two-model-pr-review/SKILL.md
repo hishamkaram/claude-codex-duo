@@ -178,6 +178,9 @@ window an unstarted claim is reclaimed; a started claim whose runner died
 without writing `.exit` is recovered only by
 `phase-gate.sh release "$ART" <prefix>` (prefix `02-p<k>`, `04-consultation` or
 `06-resolution`), which refuses while the runner pid or any descendant is alive; for a
+finished exit-5 attempt, `phase-gate.sh confirm-terminated "$ART" <prefix>` is the separate
+operator action: it appends a read-only resolution receipt only after the same liveness proof
+succeeds, never removes the exit-5 sidecars, and refuses an unreadable process group. For a
 codex attempt, while `.progress` names a job the codex plugin reports running
 (failing closed if the plugin cannot be found); for a ccr attempt, while the
 recorded process group (`pgid=` on the launch line) has any member — a launch
@@ -232,10 +235,16 @@ consultation status, exact selected/returned ID equality after a completed
 consultation, and the shared response/attempt budget. A phase may be recorded
 SKIPPED only when no attempt of it succeeded with a usable response: any
 exit-0 blind review with a non-empty response makes Phase 2 un-skippable
-(an empty response is a failed attempt, and never a COMPLETE review), an exchange phase may be
-skipped over an exit-0 attempt only if that attempt's response fails the
-validator (the malformed-response fallback), and a response the ledger already
-holds can never be skipped afterwards; the gates enforce all three. A
+(an empty response is a failed attempt, and never a COMPLETE review). An
+exchange phase whose exit-0 non-empty response fails canonical validation gets
+exactly one corrective resubmission first: the launch gate writes a sealed
+`<phase>.prompt.retry.md` with fixed correction wording and its stable validator
+diagnostic, prints `schema-repair=authorized` and `prompt=…`, and the
+orchestrator launches that prompt using the new claim. A second malformed
+response prints `schema-repair=exhausted` and follows the malformed-response
+fallback. Route/policy failures, empty responses, thread mismatch, and exit 5
+are not schema repairs. A response the ledger already holds can never be skipped
+afterwards; the gates enforce all of this. A
 "usable" response is exit 0, a non-empty body that passes the validator, and —
 for a `--resume-last` launch — the expected Codex thread; a valid answer on the
 wrong thread is a failed attempt, so the documented `--fresh` retry (or a skip)
@@ -393,9 +402,13 @@ self-contained exchange containing every selected canonical finding to the
 exchange participant, on its session (the gate prints `exchange=p<k> via=…`). It records
 one MAINTAIN, RETRACT, REFINE, or VERIFY disposition per ID and never changes
 `01-lead.md`. The dispositions are applied mechanically by `pre-verification`
-(see Phase 5), never by hand. A runner or validation failure is recorded as skipped; it does
-not rerun either blind review. The initial review bodies are hash-sealed at this
-boundary. Follow `references/adjudication.md` and `references/codex-protocol.md`.
+(see Phase 5), never by hand. A runner failure is recorded as skipped and
+never reruns either blind review. An exit-0 non-empty reply that fails canonical
+validation gets exactly one corrective exchange through the gate-generated
+`04-consultation.prompt.retry.md`; use the replacement `claim=` token and that
+prompt, then record SKIPPED if it remains malformed. The initial review bodies
+are hash-sealed at this boundary. Follow `references/adjudication.md` and
+`references/codex-protocol.md`.
 
 **Phase 5 — Verification** → `05-verification.md`, `05-verdicts.tsv`
 This phase decides truth. Run `phase-gate.sh pre-verification`: it generates
@@ -438,10 +451,14 @@ If any Phase-5 verdict is UNVERIFIABLE and Phase 2 succeeded, first write
 that non-empty, validated list. Only items still UNVERIFIABLE
 after Phase 5 may be sent to Codex, only if Phase 2 succeeded, and only if the
 unified cap of two successful responses/four launches across Phases 4 and 6
-allows it. A consultation that was eligible (candidates > 0) may be recorded
-SKIPPED only after an attempt left a runner sidecar; the gates reject a skip
-with no attempt. The single set-level exchange includes executed verification evidence.
-If skipped, record why and end with `STATUS: PHASE 6 COMPLETE (SKIPPED — <reason>)`.
+allows it. An exit-0 non-empty residual response that fails canonical
+validation gets exactly one corrective exchange through the gate-generated
+`06-resolution.prompt.retry.md`; use its replacement `claim=` token and that
+prompt, then record SKIPPED if it remains malformed. A consultation that was
+eligible (candidates > 0) may be recorded SKIPPED only after an attempt left a
+runner sidecar; the gates reject a skip with no attempt. The single set-level
+exchange includes executed verification evidence. If skipped, record why and
+end with `STATUS: PHASE 6 COMPLETE (SKIPPED — <reason>)`.
 
 **Phase 7 — Final report** → `07-review.md`, then print it.
 Run `phase-gate.sh pre-report`, then fill `templates/REVIEW.md` completely. All
