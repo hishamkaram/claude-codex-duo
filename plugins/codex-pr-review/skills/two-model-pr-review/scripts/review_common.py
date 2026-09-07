@@ -78,8 +78,10 @@ PROVENANCE_RE = re.compile(
 
 # For a citation (`path:lines[@sha] "quote"`) the repository path is checked
 # only for artifact/run-directory/scratch shapes — a legitimate file such as
-# agents/finding-verifier.md must stay citable (round-37 CX-01) — while the
-# quote is checked with the full provenance filter.
+# agents/finding-verifier.md must stay citable (round-37 CX-01). The trailing
+# quote is verified independently against source bytes by the citation checker,
+# so it is evidence rather than reviewer-authored prose: applying PROVENANCE_RE
+# to it rejects truthful quotes of this repository's own CL-/CX- identifiers.
 PATH_PROVENANCE_RE = re.compile(
     r"(?:^|[\s\"'=`()\[\]{}<>,;])repro/|"
     r"\b[A-Za-z0-9_.-]+-[0-9]{8}-[0-9]{6}/|"
@@ -89,12 +91,11 @@ PATH_PROVENANCE_RE = re.compile(
 )
 
 def citation_has_provenance(value: str) -> bool:
-    """Provenance check for a citation-shaped string: path arms on the path, full filter on the rest."""
+    """Provenance check for citation paths; source quotes are verified separately."""
     m = LOCATION_RE.match(value)
     if not m:
         return PROVENANCE_RE.search(value) is not None
-    path_end = m.end("path")
-    return PATH_PROVENANCE_RE.search(value[:path_end]) is not None or PROVENANCE_RE.search(value[path_end:]) is not None
+    return PATH_PROVENANCE_RE.search(value[:m.end("path")]) is not None
 
 # A verifier may write the citation in backticks (`path:line@sha` "quote"), as
 # Markdown habit suggests; the machine form is the same citation without them.

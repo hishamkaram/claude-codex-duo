@@ -9,6 +9,7 @@
 #   phase-gate.sh pre-report      <ART>
 #   phase-gate.sh post-join       <ART>       # legacy initial-packet consistency check
 #   phase-gate.sh release         <ART> <prefix>
+#   phase-gate.sh confirm-terminated <ART> <prefix>
 #
 # Every gate rechecks the frozen scope, blind brief and participants file, the schema
 # marker (00-schema = codex-pr-review/4: a 3.0.0 directory is never reinterpreted), then
@@ -17,13 +18,13 @@
 # atomic claim as their last step — pre-codex one per participant of 00-participants.tsv
 # (prefixes 02-p1..02-pN). See SKILL.md §Phase gate and §Participants.
 set -u
-USAGE='usage: phase-gate.sh pre-codex <ART> <REPO> | phase-gate.sh pre-phase3|pre-consultation|pre-verification|pre-resolution|pre-report|post-join <ART> | phase-gate.sh release <ART> <prefix>'
+USAGE='usage: phase-gate.sh pre-codex <ART> <REPO> | phase-gate.sh pre-phase3|pre-consultation|pre-verification|pre-resolution|pre-report|post-join <ART> | phase-gate.sh release|confirm-terminated <ART> <prefix>'
 die2() { echo "phase-gate.sh: $1" >&2; echo "$USAGE" >&2; exit 2; }
 CMD="${1:-}"; ART="${2:-}"; REPO="${3:-}"
 case "$CMD" in
   pre-codex) [ $# -eq 3 ] || die2 "pre-codex takes <ART> <REPO>";;
   pre-phase3|pre-consultation|pre-verification|pre-resolution|pre-report|post-join) [ $# -eq 2 ] || die2 "$CMD takes <ART>";;
-  release) [ $# -eq 3 ] || die2 "release takes <ART> <prefix>";;
+  release|confirm-terminated) [ $# -eq 3 ] || die2 "$CMD takes <ART> <prefix>";;
   *) die2 "unknown or missing subcommand '${CMD}'";;
 esac
 [ -d "$ART" ] || die2 "run directory not found: $ART"
@@ -91,7 +92,7 @@ phase_status() {
 reject_skip_over_success() {  # reject_skip_over_success <prefix> [validator args...]
   local prefix="$1" f stem stdout tmp; shift
   shopt -s nullglob
-  for f in "$ART/$prefix.exit" "$ART/$prefix".attempt*.exit; do
+  for f in "$ART/$prefix".attempt*.exit "$ART/$prefix.exit"; do
     [ -s "$f" ] && [ "$(cat "$f")" = 0 ] || continue
     stem="${f%.exit}"; stdout="$stem.stdout"
     # exit 0 with an empty response is a failed attempt (round-31 L-01).
@@ -229,7 +230,7 @@ review_seal() {
 # Generated artifacts (review seal, consultation/resolution JSON, verifier
 # packets) are regenerated and compared by the gate that owns them, then their
 # digests are accepted like any other artifact.
-KNOWN_GATES=" pre-phase3 pre-consultation pre-verification pre-resolution pre-report "
+KNOWN_GATES=" pre-phase3 pre-consultation pre-verification pre-resolution pre-report confirm-terminated "
 later_artifacts() {  # glob prefixes of artifacts that only exist once a later phase began
   case "$1" in
     pre-phase3) echo "03- 04- 05- 06- 07-";;  # the seal and 02-exchange-participant are minted before the ledger exists (round-40 CX-01)
@@ -247,6 +248,25 @@ later_artifact_exists() {  # later_artifact_exists <gate> [artifact being accept
     for f in "$ART/$p"*; do [ -e "$f" ] && [ "$f" != "$ART/${2:-}" ] && { shopt -u nullglob; return 0; }; done
   done
   shopt -u nullglob; return 1
+}
+# A repair prompt is minted after its phase's malformed response, so current
+# phase sidecars must not look like post-phase artifacts. It is still refused
+# once the next phase has started, preserving the normal draft-finalization bar.
+repair_prompt_may_be_accepted() {  # <gate> <artifact>
+  local gate="$1" name="$2" p f
+  case "$gate:$name" in
+    pre-consultation:04-consultation.prompt.retry.md) p='05- 06- 07-';;
+    pre-resolution:06-resolution.prompt.retry.md) p='07-';;
+    *) return 1;;
+  esac
+  shopt -s nullglob
+  for p in $p; do
+    for f in "$ART/$p"*; do
+      [ -e "$f" ] && { shopt -u nullglob; return 1; }
+    done
+  done
+  shopt -u nullglob
+  return 0
 }
 write_review_seal() {  # pre-phase3: mint the seal once; on re-entry regenerate and compare
   local seal="$ART/02-review-seal.sha256" tmp
@@ -292,7 +312,7 @@ accepted_check() {
     [ -n "$digest" ] || continue
     case "$digest" in *[!0-9a-f]*) fail "00-accepted.sha256 has a malformed row ($digest $name)";; esac
     [ "${#digest}" -eq 64 ] || fail "00-accepted.sha256 has a malformed row ($digest $name)"
-    case "$name" in [0-9][0-9]-*) ;; *) fail "00-accepted.sha256 has a malformed row ($digest $name)";; esac
+    case "$name" in [0-9][0-9]-*|02-p*.cancel-resolved|04-consultation.cancel-resolved|06-resolution.cancel-resolved) ;; *) fail "00-accepted.sha256 has a malformed row ($digest $name)";; esac
     case "$name" in */*) fail "00-accepted.sha256 has a malformed row ($digest $name)";; esac
     case "$KNOWN_GATES" in *" $gate "*) ;; *) fail "00-accepted.sha256 names an unknown gate for $name (${gate:-missing})";; esac
     case "$kind" in final|draft) ;; *) fail "00-accepted.sha256 has a malformed row for $name (kind ${kind:-missing})";; esac
@@ -316,7 +336,7 @@ accept() {  # accept <artifact> final|draft   (gate = $CMD)
     set -- $row
     [ "$1" != "$digest" ] || return 0
     [ "$4" = draft ] && [ "$3" = "$CMD" ] && ! later_artifact_exists "$CMD" "$name" || fail "$name changed after it was accepted by $3"
-  elif later_artifact_exists "$CMD" "$name"; then
+  elif later_artifact_exists "$CMD" "$name" && ! repair_prompt_may_be_accepted "$CMD" "$name"; then
     fail "$name was never accepted by $CMD but later-phase artifacts exist (start a fresh run directory)"
   fi
   tmp=$(mktemp "$ART/.accepted.XXXXXX") || fail "could not allocate ledger scratch file"
@@ -425,12 +445,112 @@ attempt_usable() {
     *) return 1;;
   esac
 }
+# An exit-0, non-empty exchange reply that the canonical validator rejects is a
+# completed transport attempt, not a usable response. One such reply gets one
+# corrective resubmission; a second falls back to the existing SKIPPED path.
+attempt_schema_invalid() {  # <stem> <validator args...>
+  local stem="$1"; shift
+  [ -s "$stem.exit" ] && [ "$(cat "$stem.exit")" = 0 ] || return 1
+  [ -s "$stem.stdout" ] || return 1
+  [ $# -gt 0 ] || return 1
+  python3 "$VALIDATOR" "$@" --extract "$stem.stdout" --out "$SCRATCH" >/dev/null 2>&1 && return 1
+  return 0
+}
+schema_invalid_count() {  # <prefix>; validator args are derived from present phase inputs
+  local prefix="$1" n=0 f line
+  local -a args=()
+  while IFS= read -r line; do args+=("$line"); done < <(validator_args "$prefix")
+  [ ${#args[@]} -gt 0 ] || { printf '0\n'; return; }
+  shopt -s nullglob
+  for f in "$ART/$prefix".attempt*.exit "$ART/$prefix.exit"; do
+    attempt_schema_invalid "${f%.exit}" "${args[@]}" && n=$((n+1))
+  done
+  shopt -u nullglob
+  printf '%s\n' "$n"
+}
+write_schema_repair_prompt() {  # <prefix>; write retry instructions plus validator diagnostics
+  local prefix="$1" f stem line latest="" diagnostic="" prompt tmp status=0
+  prompt="$ART/$prefix.prompt.retry.md"
+  tmp="$ART/.$prefix.prompt.retry.XXXXXX"
+  local -a args=()
+  while IFS= read -r line; do args+=("$line"); done < <(validator_args "$prefix")
+  [ ${#args[@]} -gt 0 ] || fail "could not derive validator inputs for $prefix repair"
+  shopt -s nullglob
+  for f in "$ART/$prefix".attempt*.exit "$ART/$prefix.exit"; do
+    stem="${f%.exit}"
+    if attempt_schema_invalid "$stem" "${args[@]}"; then latest="$stem"; fi
+  done
+  shopt -u nullglob
+  [ -n "$latest" ] || fail "could not locate malformed $prefix response for repair"
+  diagnostic=$(python3 "$VALIDATOR" "${args[@]}" --extract "$latest.stdout" --out "$SCRATCH" 2>&1 >/dev/null); status=$?
+  [ "$status" -ne 0 ] || fail "malformed $prefix response unexpectedly passed validation during repair"
+  diagnostic=$(printf '%s\n' "$diagnostic" | grep -E '^VALIDATION_CLASS=(envelope|schema|citation|content)$' | head -n 1)
+  [ -n "$diagnostic" ] || fail "validator returned no stable diagnostic class for $prefix repair"
+  [ -s "$ART/$prefix.prompt.md" ] || fail "$prefix.prompt.md missing: cannot construct repair prompt"
+  # A prior invocation may have finished sealing the prompt but been interrupted
+  # before its ledger row. Never replace that immutable artifact; complete the
+  # ledger transition instead.
+  if [ -e "$prompt" ]; then
+    [ -s "$prompt" ] && [ "$(mode "$prompt")" = 400 ] || fail "$prefix.prompt.retry.md exists but is not a sealed repair prompt"
+    accept "$(basename "$prompt")" final
+    return
+  fi
+  tmp=$(mktemp "$tmp") || fail "could not allocate $prefix repair prompt"
+  { cat "$ART/$prefix.prompt.md"; printf '\n\n## Canonical response repair\nYour prior response completed but was rejected by the local canonical validator. Reply again with exactly one corrected fenced `json` object and nothing else. Preserve the requested phase and exact IDs; do not discuss this notice or the diagnostic.\n\nValidator diagnostic:\n```text\n%s\n```\n' "$diagnostic"; } > "$tmp" || { rm -f "$tmp"; fail "could not write $prefix.prompt.retry.md"; }
+  chmod 400 "$tmp" 2>/dev/null || { rm -f "$tmp"; fail "could not seal $prefix.prompt.retry.md"; }
+  mv -f "$tmp" "$prompt" || { rm -f "$tmp"; fail "could not install $prefix.prompt.retry.md"; }
+  accept "$(basename "$prompt")" final
+}
+# Once a malformed completed response triggers a repair, every subsequent
+# attempt for that phase must use the sealed, gate-generated retry prompt.
+# This checks runner control metadata only; it never parses model output.
+schema_repair_prompt_check() {  # <prefix>
+  local prefix="$1" f stem saw_invalid=0 prompt_file prompt line
+  prompt="$ART/$prefix.prompt.retry.md"
+  local -a args=()
+  while IFS= read -r line; do args+=("$line"); done < <(validator_args "$prefix")
+  [ ${#args[@]} -gt 0 ] || return 0
+  # A normal gate-created repair always leaves this final receipt. Older
+  # interrupted/legacy fixtures with malformed output but no receipt retain
+  # their existing SKIPPED fallback rather than being reinterpreted.
+  [ -e "$prompt" ] || return 0
+  shopt -s nullglob
+  for f in "$ART/$prefix".attempt*.exit "$ART/$prefix.exit"; do
+    stem="${f%.exit}"
+    if [ "$saw_invalid" = 1 ] && [ -e "$stem.exit" ]; then
+      [ -s "$stem.meta" ] || { shopt -u nullglob; fail "$prefix repair attempt $(basename "$stem") has no .meta to prove it used $(basename "$prompt")"; }
+      prompt_file=$(awk -F= '$1 == "prompt_file" {sub(/^[^=]*=/, ""); print; exit}' "$stem.meta" 2>/dev/null)
+      [ -n "$prompt_file" ] && [ "$prompt_file" -ef "$prompt" ] || { shopt -u nullglob; fail "$prefix repair attempt $(basename "$stem") did not use the required $(basename "$prompt")"; }
+    fi
+    attempt_schema_invalid "$stem" "${args[@]}" && saw_invalid=1
+  done
+  shopt -u nullglob
+}
+# A terminal SKIPPED exchange cannot bypass the one corrective launch after a
+# malformed completed response. A present retry prompt proves the gate already
+# authorized it; legacy/interrupted runs without that artifact retain SKIPPED.
+schema_repair_pending() {  # <prefix>; returns 0 only when one repair launch remains required
+  local prefix="$1" f stem saw_invalid=0 line prompt="$ART/$1.prompt.retry.md"
+  local -a args=()
+  [ -e "$prompt" ] || return 1
+  while IFS= read -r line; do args+=("$line"); done < <(validator_args "$prefix")
+  [ ${#args[@]} -gt 0 ] || return 1
+  shopt -s nullglob
+  for f in "$ART/$prefix".attempt*.exit "$ART/$prefix.exit"; do
+    stem="${f%.exit}"
+    [ -e "$stem.exit" ] || continue
+    if [ "$saw_invalid" = 1 ]; then shopt -u nullglob; return 1; fi
+    attempt_schema_invalid "$stem" "${args[@]}" && saw_invalid=1
+  done
+  shopt -u nullglob
+  [ "$saw_invalid" = 1 ]
+}
 usable_count() {  # usable_count <prefix>; runs the validator once per attempt per gate call — bounded (at most 5 attempts per phase, milliseconds each)
   local prefix="$1" n=0 f line
   local -a args=()
   while IFS= read -r line; do args+=("$line"); done < <(validator_args "$prefix")  # one argument per line: paths may contain spaces (round-38 CX-05)
   shopt -s nullglob
-  for f in "$ART/$prefix.exit" "$ART/$prefix".attempt*.exit; do
+  for f in "$ART/$prefix".attempt*.exit "$ART/$prefix.exit"; do
     attempt_usable "$prefix" "${f%.exit}" ${args[@]+"${args[@]}"} && n=$((n+1))
   done
   shopt -u nullglob
@@ -741,22 +861,79 @@ validate_verdicts() {
   python3 "$VERDICT_VALIDATOR" "$@" >/dev/null || return 1
 }
 # Exit 5 means "DO NOT retry: a Codex worker may still be running" per the
-# runner's exit table. Reject any sidecar (current or rotated) that records
-# exit 5 or an unconfirmed cancel before allowing a downstream Codex launch.
+# runner's exit table. A later explicit confirmation may resolve that uncertainty,
+# but it never removes or rewrites the original sidecars.
+cancel_resolution_ok() {  # <attempt stem>, e.g. $ART/04-consultation.attempt1
+  local stem="$1" receipt exit_sha meta_sha
+  receipt="$stem.cancel-resolved"
+  [ -s "$receipt" ] && [ "$(mode "$receipt")" = 400 ] || return 1
+  exit_sha=$(sha "$stem.exit") || return 1
+  meta_sha=$(sha "$stem.meta") || return 1
+  grep -qxF "exit_sha256=$exit_sha" "$receipt" && grep -qxF "meta_sha256=$meta_sha" "$receipt"
+}
 reject_unconfirmed_cancel() {
-  local prefix="$1" f exit_val cancel_val
+  local prefix="$1" f stem exit_val cancel_val unresolved=""
   shopt -s nullglob
-  for f in "$ART/$prefix.exit" "$ART/$prefix".attempt*.exit; do
+  for f in "$ART/$prefix".attempt*.exit "$ART/$prefix.exit"; do
     [ -s "$f" ] || continue
-    exit_val=$(cat "$f" 2>/dev/null)
-    [ "$exit_val" = 5 ] && fail "$prefix recorded exit 5 (unconfirmed cancel: a Codex worker may still be running; do not launch another)"
+    stem="${f%.exit}"; exit_val=$(cat "$f" 2>/dev/null)
+    [ "$exit_val" != 5 ] || cancel_resolution_ok "$stem" || unresolved="${unresolved:+$unresolved, }$(basename "$stem") exit 5"
   done
   for f in "$ART/$prefix.meta" "$ART/$prefix".attempt*.meta; do
     [ -s "$f" ] || continue
-    cancel_val=$(awk -F= '$1 == "cancel_confirmed" {print $2; exit}' "$f" 2>/dev/null)
-    [ "$cancel_val" = "no" ] && fail "$prefix recorded cancel_confirmed=no (a Codex worker may still be running; do not launch another)"
+    stem="${f%.meta}"; cancel_val=$(awk -F= '$1 == "cancel_confirmed" {print $2; exit}' "$f" 2>/dev/null)
+    [ "$cancel_val" != no ] || cancel_resolution_ok "$stem" || unresolved="${unresolved:+$unresolved, }$(basename "$stem") cancel_confirmed=no"
   done
   shopt -u nullglob
+  [ -z "$unresolved" ] || fail "$prefix records unconfirmed cancellation ($unresolved; a worker may still be running; run phase-gate.sh confirm-terminated $ART $prefix only after it is dead)"
+}
+
+# The liveness bar is intentionally the same one release uses. Unlike release,
+# this operates on a finished exit-5 attempt and produces only an additive receipt.
+confirm_terminated() {  # <prefix>; only a current exit-5/cancel-confirmed=no attempt
+  local prefix="$1" stem="$ART/$1" backend pid pgid job root st tmp
+  case "$prefix" in 04-consultation|06-resolution) ;; *)
+    participant_ids | sed 's/^/02-/' | grep -qx -- "$prefix" || fail "confirm-terminated: unknown phase prefix '$prefix'";;
+  esac
+  [ -s "$stem.exit" ] && [ -s "$stem.meta" ] || fail "confirm-terminated: $prefix needs current .exit and .meta sidecars"
+  [ "$(cat "$stem.exit")" = 5 ] || [ "$(awk -F= '$1 == "cancel_confirmed" {print $2; exit}' "$stem.meta")" = no ] || fail "confirm-terminated: $prefix has no unconfirmed cancellation"
+  [ ! -e "$stem.cancel-resolved" ] || fail "confirm-terminated: $prefix already has a cancellation-resolution receipt"
+  backend=$(awk -F= '$1 == "backend" {print $2; exit}' "$stem.meta")
+  case "$backend" in
+    ccr)
+      pid=$(awk -F= '$1 == "pid" {print $2; exit}' "$stem.meta"); pgid=$(awk -F= '$1 == "pgid" {print $2; exit}' "$stem.meta")
+      # An unreadable pgid caused the runner to kill the child directly. It is
+      # already a terminal safety failure, but cannot be proven dead later by a
+      # fabricated group id; require a real recorded group for recovery.
+      case "$pid" in ''|*[!0-9]*) fail "confirm-terminated: $prefix ccr attempt has no numeric pid";; esac
+      case "$pgid" in ''|unknown|*[!0-9]*) fail "confirm-terminated: $prefix ccr attempt has no numeric pgid";; esac
+      kill -0 "$pid" 2>/dev/null && fail "confirm-terminated: runner pid $pid is still alive"
+      ccr_release_check "$prefix" "0s launched backend=ccr pid=$pid pgid=$pgid"
+      ;;
+    codex)
+      job=$(awk -F= '$1 == "job" {print $2; exit}' "$stem.meta")
+      [ -n "$job" ] || fail "confirm-terminated: $prefix codex attempt has no job id"
+      root=$(python3 -c 'import json,os,glob
+p=os.path.expanduser("~/.claude/plugins/installed_plugins.json")
+try: print(json.load(open(p))["plugins"]["codex@openai-codex"][0]["installPath"]); raise SystemExit
+except Exception: pass
+c=sorted(glob.glob(os.path.expanduser("~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs")))
+print(os.path.dirname(os.path.dirname(c[-1])) if c else "")' 2>/dev/null)
+      [ -n "$root" ] && [ -f "$root/scripts/codex-companion.mjs" ] || fail "confirm-terminated: cannot locate the codex plugin to check $job"
+      st=$(node "$root/scripts/codex-companion.mjs" status "$job" --json 2>/dev/null | python3 -c 'import sys,json
+try: d=json.load(sys.stdin); print((d.get("job") or {}).get("status") or "")
+except Exception: print("")')
+      case "$st" in completed|failed|cancelled|canceled) ;; *) fail "confirm-terminated: job $job status is '${st:-unknown}', not provably finished";; esac
+      ! pgrep -f "task-worker.*--job-id $job" >/dev/null 2>&1 || fail "confirm-terminated: a worker process for job $job is still alive"
+      ;;
+    *) fail "confirm-terminated: $prefix meta has unknown backend '${backend:-missing}'";;
+  esac
+  tmp=$(mktemp "$ART/.cancel-resolved.XXXXXX") || fail "confirm-terminated: could not allocate receipt"
+  printf 'confirmed=%s\nconfirmed_by=phase-gate.sh confirm-terminated\nbackend=%s\nexit_sha256=%s\nmeta_sha256=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$backend" "$(sha "$stem.exit")" "$(sha "$stem.meta")" > "$tmp" || { rm -f "$tmp"; fail "confirm-terminated: could not write receipt"; }
+  chmod 400 "$tmp" || { rm -f "$tmp"; fail "confirm-terminated: could not seal receipt"; }
+  mv "$tmp" "$stem.cancel-resolved" || { rm -f "$tmp"; fail "confirm-terminated: could not install receipt"; }
+  accept "$(basename "$stem.cancel-resolved")" final
+  echo "TERMINATION-CONFIRMED $prefix backend=$backend receipt=$(basename "$stem.cancel-resolved")"
 }
 # Every post-join gate: the review seal is a generated artifact — regenerate it
 # from the CURRENT status and bodies and compare, so a status edit on
@@ -796,12 +973,14 @@ codex_skip_check() {  # a SKIPPED participant over its own successful attempt is
 reject_skipped_after_accept() {  # uses $consultation
   if [ "$consultation" = SKIPPED ]; then
     [ -z "$(ledger_row 04-consultation.stdout)" ] || fail "04-consultation.md is SKIPPED but the consultation response was already accepted (see 00-accepted.sha256); an accepted consultation cannot be skipped"
+    schema_repair_pending 04-consultation && fail "04-consultation.md is SKIPPED but its malformed completed response still requires the one canonical repair launch"
     reject_skip_over_success 04-consultation --manifest "$ART/03-matrix.tsv" --selection "$ART/03-debate-selection.tsv" --phase consultation
   fi
 }
 reject_resolution_skip_over_success() {  # uses $resolution; pre-report only
   if [ "$resolution" = SKIPPED ]; then
     [ -z "$(ledger_row 06-resolution.stdout)" ] || fail "06-resolution.md is SKIPPED but the resolution response was already accepted (see 00-accepted.sha256); an accepted resolution cannot be skipped"
+    schema_repair_pending 06-resolution && fail "06-resolution.md is SKIPPED but its malformed completed response still requires the one canonical repair launch"
     if [ -s "$ART/06-resolution-selection.ids" ]; then
       reject_skip_over_success 06-resolution --manifest "$ART/03-matrix.tsv" --verdicts "$ART/05-verdicts.tsv" --ids "$ART/06-resolution-selection.ids" --phase resolution
     else
@@ -813,6 +992,10 @@ case "$CMD" in
 release)
   [ -n "$REPO" ] || die2 "release takes <ART> <prefix>"
   release_claim "$REPO"
+  ;;
+confirm-terminated)
+  [ -n "$REPO" ] || die2 "confirm-terminated takes <ART> <prefix>"
+  confirm_terminated "$REPO"
   ;;
 pre-codex)
   [ -s "$ART/00-brief.md" ] || fail "00-brief.md missing or empty: build the brief before launching Codex"
@@ -933,8 +1116,19 @@ pre-consultation)
   if [ "$ST" = COMPLETE ]; then
     check_budget
     BUDGET=""
-    if [ "$candidates" -gt 0 ]; then if budget_left; then claim_phase 04-consultation 04-consultation.md; else BUDGET=" budget=exhausted"; fi; fi
-    echo "CONSULTATION-OK codex=COMPLETE exchange=$EXCH via=$(participant_field "$EXCH" backend)$([ "$(participant_field "$EXCH" backend)" = ccr ] && printf ':%s' "$(participant_field "$EXCH" alias)") candidates=$candidates seal=$(sha "$ART/02-review-seal.sha256" | cut -c1-12)${CLAIM_TOKEN:+ claim=$CLAIM_TOKEN}$BUDGET"
+    schema_repair_prompt_check 04-consultation
+    SCHEMA_INVALID=$(schema_invalid_count 04-consultation)
+    if [ "$candidates" -gt 0 ]; then
+      if [ "$SCHEMA_INVALID" -ge 2 ]; then BUDGET=" schema-repair=exhausted"
+      elif budget_left; then
+        if [ "$SCHEMA_INVALID" != 0 ]; then
+          write_schema_repair_prompt 04-consultation
+          BUDGET=" schema-repair=authorized prompt=04-consultation.prompt.retry.md"
+        fi
+        claim_phase 04-consultation 04-consultation.md
+      else BUDGET=" budget=exhausted"; fi
+    fi
+    echo "CONSULTATION-OK codex=COMPLETE exchange=$EXCH via=$(participant_field "$EXCH" backend)$([ "$(participant_field "$EXCH" backend)" = ccr ] && printf ':%s' "$(participant_field "$EXCH" alias)") candidates=$candidates schema_invalid=$SCHEMA_INVALID seal=$(sha "$ART/02-review-seal.sha256" | cut -c1-12)${CLAIM_TOKEN:+ claim=$CLAIM_TOKEN}$BUDGET"
   else
     echo "CONSULTATION-OK codex=SKIPPED candidates=$candidates seal=$(sha "$ART/02-review-seal.sha256" | cut -c1-12)"
   fi
@@ -945,6 +1139,7 @@ pre-verification)
   phase_status 04-consultation.md 4
   consultation=$PST
   reject_unconfirmed_cancel 04-consultation  # any attempt, current or rotated (round-17 L-01)
+  schema_repair_prompt_check 04-consultation
   reject_skipped_after_accept
   if [ "$ST" = COMPLETE ]; then
     candidates=$(selection_count) || fail "could not count selected findings"
@@ -1016,7 +1211,17 @@ pre-resolution)
       validate_residual_ids || fail "06-resolution-selection.ids is invalid (empty, duplicate, non-residual or non-manifest IDs)"
       accept 06-resolution-selection.ids draft
       refuse_relaunch 06-resolution 06-resolution.md pre-report
-      if budget_left; then claim_phase 06-resolution 06-resolution.md; else BUDGET=" budget=exhausted"; fi
+      schema_repair_prompt_check 06-resolution
+      SCHEMA_INVALID=$(schema_invalid_count 06-resolution)
+      if [ "$SCHEMA_INVALID" -ge 2 ]; then
+        BUDGET=" schema-repair=exhausted"
+      elif budget_left; then
+        if [ "$SCHEMA_INVALID" != 0 ]; then
+          write_schema_repair_prompt 06-resolution
+          BUDGET=" schema-repair=authorized prompt=06-resolution.prompt.retry.md"
+        fi
+        claim_phase 06-resolution 06-resolution.md
+      else BUDGET=" budget=exhausted"; fi
     fi
   fi
   # A residual selector present in the no-Codex or no-residual path must still
@@ -1028,7 +1233,8 @@ pre-resolution)
   else
     retire 06-resolution-selection.ids
   fi
-  echo "RESOLUTION-OK codex=$ST residual=$residual attempts=$(( $(runner_count 04-consultation) + $(runner_count 06-resolution) )) responses=$(response_count)${CLAIM_TOKEN:+ claim=$CLAIM_TOKEN}${BUDGET:-}"
+  SCHEMA_INVALID=${SCHEMA_INVALID:-$(schema_invalid_count 06-resolution)}
+  echo "RESOLUTION-OK codex=$ST residual=$residual attempts=$(( $(runner_count 04-consultation) + $(runner_count 06-resolution) )) responses=$(response_count) schema_invalid=$SCHEMA_INVALID${CLAIM_TOKEN:+ claim=$CLAIM_TOKEN}${BUDGET:-}"
   ;;
 pre-report)
   schema_check; initial_packets; codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
@@ -1039,6 +1245,8 @@ pre-report)
   # worker outranks every other inconsistency.
   reject_unconfirmed_cancel 04-consultation
   reject_unconfirmed_cancel 06-resolution
+  schema_repair_prompt_check 04-consultation
+  schema_repair_prompt_check 06-resolution
   [ -n "$(ledger_row 05-verdicts.tsv)" ] || fail "05-verdicts.tsv is not accepted; run pre-resolution first"
   reject_skipped_after_accept
   phase_status 05-verification.md 5

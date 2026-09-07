@@ -83,4 +83,4 @@ the reason.
 
 When you are invoked with a structured-output schema (the workflow mode), return the same fields
 as an object instead of the line: `status` ("LEAD SEALED" or "LEAD FAILED"), `file`, `findings`,
-`questions`, `mode`, and `reason` on failure.
+`questions`, `mode`, and `reason` (the empty string on success).

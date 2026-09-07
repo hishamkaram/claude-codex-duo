@@ -33,8 +33,22 @@ LIST_FIELDS = {"locations", "observations", "proposed_checks", "open_factual_que
 
 
 def fail(message: str) -> None:
+    # Callers use this prefix to distinguish a completed-but-noncanonical reply
+    # from a launch failure. The validator still rejects every bad response.
+    print(f"VALIDATION_CLASS={failure_class(message)}", file=sys.stderr)
     print(f"validate-consultation.py: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+def failure_class(message: str) -> str:
+    """Return a stable class for a rejected response without weakening validation."""
+    if "fenced json object" in message or "invalid JSON" in message or "response must be an object" in message:
+        return "envelope"
+    if "response must have only" in message or "must contain only normalized" in message or "disposition IDs differ" in message:
+        return "schema"
+    if "citation" in message or "provenance" in message or "artifact path" in message:
+        return "citation"
+    return "content"
 
 
 def rows(path: Path, columns: int) -> list[list[str]]:

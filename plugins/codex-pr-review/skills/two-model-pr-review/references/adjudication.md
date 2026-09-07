@@ -108,9 +108,12 @@ strict normalized disposition contains only `id`, `action`, `claim`, `severity`,
 `proposed_checks`, and `open_factual_questions`; required factual fields are
 non-empty. It must not contain identity, origin, selection reason, review count,
 consensus, concession, rhetoric, transcript reference, debate verdict, or an
-artifact path. A malformed response, missing/extra ID, or failed runner produces
-`STATUS: PHASE 4 COMPLETE (SKIPPED — <reason>)`; Phase 5 then verifies the
-original normalized finding data.
+artifact path. An exit-0 non-empty response that fails canonical validation
+gets exactly one correction with the gate-generated sealed retry prompt and its
+stable validation diagnostic. A second malformed response, any missing/extra ID
+that remains after that correction, or a failed runner produces `STATUS: PHASE 4
+COMPLETE (SKIPPED — <reason>)`; Phase 5 then verifies the original normalized
+finding data.
 
 Accepted dispositions reach the verifiers only through
 `build-verifier-packets.py`, which `pre-verification` runs over the frozen

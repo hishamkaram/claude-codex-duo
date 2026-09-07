@@ -99,7 +99,7 @@ permission settings, and Bash writes were observed with only `--disallowedTools`
 therefore runs a read-only smoke for the alias (a disposable repository, this launch line, a
 prompt that asks for a write by the Write tool and by Bash) and records `readonly=verified` in
 `<dir>/.ccr-smoke.<alias>`; every ccr launch in that directory refuses to start (exit 4) unless a
-matching record exists (same ccr version, model and launch line). One smoke per alias per run.
+matching record exists (same alias, provider model, CCR-generated child model ID, observed child init model, ccr version and launch-line digest). One smoke per alias per run. The configured alias is the only value passed to `ccr launch --model` before `--`; `provider_model` is descriptive, never a child CLI argument. The runner accepts a completed launch only when the child init model equals `claude_model_id`; a mismatch is `UNAVAILABLE` without an alias or Claude fallback.
 
 Thread semantics: `thread=` in `.meta` is the child's `session_id` from the stream's `init`
 event. `--resume-last` resumes the session recorded in `<dir>/.ccr-last-session` (written by
@@ -112,7 +112,8 @@ event's text verbatim, `.progress` lines `elapsed status=running|exited idle=Ns 
 first line `launched backend=ccr pid=<pid> pgid=<pgid> alias=<alias>` (the child runs in its own
 process group; stall or timeout signals the whole group and exit 5 means a member survived).
 `.meta` adds `backend=ccr`, `alias=`, `provider=`, `provider_model=`, `claude_model_id=`,
-`compatibility=`, `ccr_version=`, `pid=`, `pgid=`, `child_exit=`. The exit table is identical.
+`routed_model=`, `route_identity=`, `compatibility=`, `ccr_version=`, `pid=`, `pgid=`,
+`child_exit=`. The exit table is identical.
 The `--model`/`--effort` prohibition below applies to the codex backend; for ccr the alias IS the
 model choice and is the user's.
 

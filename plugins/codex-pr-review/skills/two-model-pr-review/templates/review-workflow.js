@@ -52,7 +52,9 @@ if (a.stage === 'lead') {
   log(`${names.length} shard(s) over ${files.length} changed file(s); every file has exactly one owner`)
   const LEAD_SCHEMA = {
     type: 'object', additionalProperties: false,
-    required: ['status', 'file', 'findings', 'questions', 'mode'],
+    // Strict structured-output backends require every declared property to be
+    // required. Success returns reason=""; failure returns its short reason.
+    required: ['status', 'file', 'findings', 'questions', 'mode', 'reason'],
     properties: {
       status: { type: 'string', enum: ['LEAD SEALED', 'LEAD FAILED'] },
       file: { type: 'string' }, findings: { type: 'integer' }, questions: { type: 'integer' },
@@ -78,7 +80,9 @@ if (a.stage === 'verify') {
   if (!findings.length) { log('no findings to verify'); return { stage: 'verify', verdicts: [], nulls: [] } }
   const VERDICT_SCHEMA = {
     type: 'object', additionalProperties: false,
-    required: ['verdict', 'method', 'evidence', 'trigger', 'severity_note', 'refutation_searched'],
+    // finding is echoed by strict output adapters; the caller keeps the
+    // canonical packet ID as authority when it merges this verdict.
+    required: ['finding', 'verdict', 'method', 'evidence', 'trigger', 'severity_note', 'refutation_searched'],
     properties: {
       finding: { type: 'string' },
       verdict: { type: 'string', enum: ['CONFIRMED', 'REFUTED', 'UNVERIFIABLE'] },
@@ -115,12 +119,13 @@ if (a.stage === 'verify') {
   // not a scratch directory under the run's artifact directory.
   // Mirror of review_common.py EVIDENCE_RE: a quoted citation or a recorded command.
   // Mirror of review_common.PATH_PROVENANCE_RE / citation_has_provenance: a citation's path is
-  // checked only for artifact, run-directory and scratch shapes; its quote gets the full filter.
+  // checked for artifact, run-directory and scratch shapes. Its quote is source evidence and is
+  // verified by the citation checker, not treated as reviewer-authored provenance.
   const citationHasProvenance = s => {
     const m = LOCATION_RE.exec(s)
     if (!m) return PROVENANCE_RE.test(s)
     const pathEnd = m[1].length
-    return PATH_PROVENANCE_RE.test(s.slice(0, pathEnd)) || PROVENANCE_RE.test(s.slice(pathEnd))
+    return PATH_PROVENANCE_RE.test(s.slice(0, pathEnd))
   }
   const proveCitations = (arr, id, field) => { if (Array.isArray(arr)) for (const s of arr) { if (typeof s === 'string' && citationHasProvenance(s)) throw new Error(`verifier finding ${id} ${field} contains review provenance or artifact path`) } }
   const locationError = s => {

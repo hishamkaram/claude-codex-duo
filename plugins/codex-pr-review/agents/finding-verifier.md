@@ -63,5 +63,6 @@ Output only this, nothing else:
     REFUTATION_SEARCHED: <what you looked for that would have refuted it>
 
 When you are invoked with a structured-output schema (the workflow mode), return the same fields
-as an object: `finding`, `verdict`, `method`, `evidence` (array of the citation strings), `trigger`,
-`severity_note`, `refutation_searched`.
+as an object: `finding` (the packet's canonical F-nn ID), `verdict`, `method`, `evidence` (array of
+citation strings), `trigger`, `severity_note`, `refutation_searched`. Every field is required by the
+transport schema; use `""` or `[]` only where the contract allows an empty value.
