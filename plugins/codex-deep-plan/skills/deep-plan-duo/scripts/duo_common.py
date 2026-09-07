@@ -17,6 +17,9 @@ CMD_RE = re.compile(r"(^|[\s`(])cmd:\s*\S+")
 # Evidence ids: F- facts, V- verified, I- inferences, U- unknowns, X- Codex objections, RC- root causes.
 ID_RE = re.compile(r"\b(F|V|I|U|X|RC)-(\d+)\b")
 HARD_ID_RE = re.compile(r"\b[FV]-\d+\b")   # ids a decision may rest on
+# Plan-row ids: CH- changes, T- tests, D- disagreements, ER- evidence requests. An objection that
+# says "the plan lacks X" is legitimately withdrawn by naming the plan row that now carries X.
+PLAN_ID_RE = re.compile(r"\b(CH|T|D|ER)-\d+[a-z]?\b")
 
 
 def has_citation(strings):
@@ -25,9 +28,15 @@ def has_citation(strings):
 
 
 def has_evidence_ref(text):
-    """A citation, a cmd:, or an evidence id — what a concession or rationale must carry."""
+    """A citation, a cmd:, or an evidence id — what a rationale must carry."""
     t = str(text)
     return bool(CITE_RE.search(t) or CMD_RE.search(t) or ID_RE.search(t))
+
+
+def has_concession_ref(text):
+    """What a concession must carry: an evidence reference, or the plan row (CH-/T-/D-/ER-) that
+    answered the objection. Praise alone never qualifies."""
+    return has_evidence_ref(text) or bool(PLAN_ID_RE.search(str(text)))
 
 
 def load_rounds(art):

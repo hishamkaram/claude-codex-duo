@@ -1,11 +1,15 @@
-# Codex protocol
+# Second-model protocol (Codex plugin, or ccr aliases)
 
 ## The only permitted invocation path
 
-Use the monitored runner at `${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh`. It launches the
-Codex plugin's `task` in the background (so a foreground shell limit can never
-kill the worker), refuses `--write`, polls the job, detects a dead worker or a
-stalled log, cancels anything it abandons, and writes sidecar files.
+Use the monitored runner at `${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh`. It launches a
+participant in the background (so a foreground shell limit can never kill the
+worker), refuses `--write`, polls it, detects a dead worker or a stalled log,
+cancels anything it abandons, and writes sidecar files. With the default backend
+it drives the Codex plugin's `task`; with `--via ccr:<alias>` it drives a headless
+Claude Code through the claude-code-router gateway (§ccr backend). "Codex" in
+this file means a participant whichever backend runs it, except where a backend
+is named; the participants of a run are the rows of `00-participants.tsv`.
 
 Never call Codex through the `codex:codex-rescue` subagent or `/codex:rescue`
 for this skill: that path may add `--write`, may `--resume-last` an unrelated
@@ -13,18 +17,72 @@ thread, may rewrite the prompt, parses flag-like text inside a raw prompt
 string as options, and returns nothing on failure. Never pass the prompt as a
 single quoted string; always `--prompt-file`.
 
-## Probe (Phase 0, once)
+## Probe (Phase 0, once per participant)
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe                                       # codex
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe --via ccr:<alias> --record-dir "$ART"       # each ccr alias
 ```
 
-Prints `PROBE SUCCEEDED ready=True loggedIn=True codex=…` (exit 0) or
-`PROBE UNAVAILABLE …` / `PROBE FAILED …` (exit 1). Record the line verbatim in
-`00-scope.md`. On failure tell the user `/codex:setup` exists; do not improvise
-auth. If the repo may not be sent to an external service, record DECLINED
-instead. Shell state does not persist between tool calls; re-derive `ART` in
+Prints `PROBE SUCCEEDED backend=codex ready=True loggedIn=True codex=…` or
+`PROBE SUCCEEDED backend=ccr alias=… provider=… model=… compatibility=… tools=true readonly=verified ccr=…`
+followed by the alias's `ccr model show` JSON (exit 0), or `PROBE UNAVAILABLE …` /
+`PROBE FAILED …` (exit 1). Record every line verbatim in `00-scope.md`, and the JSON
+in a fenced block after it. On failure tell the user `/codex:setup` exists (codex)
+or `ccr model list` / `ccr model show <alias>` (ccr); do not improvise auth. If the
+repo may not be sent to a participant's provider, record DECLINED for that
+participant. Shell state does not persist between tool calls; re-derive `ART` in
 every call.
+
+Then write `00-participants.tsv`, one row per `--via` entry in order, tab-separated,
+no header: `p<k>`, `codex` or `ccr`, the alias (or `-` for codex). Every entry is
+listed, including one whose probe failed or was declined (its status lives in
+`00-scope.md`, and `pre-codex` claims it like the others; the orchestrator launches
+only the usable ones and writes `02-p<k>.md` SKIPPED for the rest). The file is
+hashed with the packets by `pre-codex` and never changes afterwards.
+
+## ccr backend (`--via ccr:<alias>`)
+
+The gateway is the user's `ccr` (claude-code-router, >= 0.4.11). Aliases are
+machine-local (`ccr model list`); never write one into a shipped file and never
+default to one. The runner's launch line is fixed and is the only one this plugin
+uses for a review:
+
+```
+ccr launch --model <alias> --permission-mode plan -p --no-lifecycle --no-statusline -- \
+  --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+  --disallowedTools Write,Edit,MultiEdit,NotebookEdit,Agent --max-turns <N> [--resume <session>]
+```
+
+Read-only rests on three controls in order of importance: `--permission-mode plan`
+(Claude Code's own permission engine blocks every write, Bash included, while
+read-only Bash such as `git log` still runs), the empty strict MCP config (removes
+the user's MCP tools), and the disallowed edit tools. A disallow-list alone is NOT
+enough: a nested session inherits the user's permission settings, and Bash writes
+were observed with only `--disallowedTools` set. The probe therefore runs a
+read-only smoke for the alias (disposable repository, this launch line, a prompt
+that asks for a write by the Write tool and by Bash) and records `readonly=verified`
+in `$ART/.ccr-smoke.<alias>`; every ccr launch in the run directory refuses to
+start (exit 4) unless a matching record exists (same ccr version, model and launch
+line) — one smoke per alias per run, checked before every launch.
+
+Thread semantics: `thread=` in `.meta` is the child's `session_id`. `--resume-last`
+resumes `$ART/.ccr-last-session` (the directory's last completed ccr launch);
+`--resume-session <id>` names one explicitly and is what the exchange phases use
+when the exchange participant is a ccr alias (its `thread=` from `02-p<k>.meta`),
+so another ccr participant's launch can never be resumed by mistake. `--max-turns <N>`
+(default 100) bounds the child's agentic turns; both options are ccr-only.
+
+Sidecars keep their names and meaning: `.joblog` is the raw stream-json, `.stdout`
+the `result` event's text verbatim (no helper trailer lines), `.progress` lines
+`elapsed status=running|exited idle=Ns | last event` with the first line
+`launched backend=ccr pid=<pid> pgid=<pgid> alias=<alias>` — the child runs in its
+own process group, stall or timeout signals the whole group, and exit 5 means a
+member survived. `.meta` adds `backend=ccr`, `alias=`, `provider=`,
+`provider_model=`, `claude_model_id=`, `compatibility=`, `ccr_version=`, `pid=`,
+`pgid=`, `child_exit=`. The exit table below is identical. `phase-gate.sh release`
+of a ccr attempt requires the recorded pid dead, the process group empty and no
+descendant alive, and never consults the Codex companion.
 
 ## Building the brief (Phase 0)
 
@@ -77,9 +135,11 @@ Builder exit codes: 0 brief written (`00-brief.md.base` and `00-brief.md.head` r
 `00-brief.md.baseline` the NUL-separated status); 3 nothing to review (tree
 equals base tree); 2 usage error (including `--out` inside the repository).
 
-## Join turn — Phase 2 (blind review) launched beside Phase 1
+## Join turn — Phase 2 (blind reviews) launched beside Phase 1
 
-Pre-flight, must print `PREFLIGHT-OK` or stop (it also records the packet hashes once):
+Pre-flight, must print `PREFLIGHT-OK` or stop (it also records the packet hashes
+once, writes the schema marker `00-schema` = `codex-pr-review/4`, and takes one
+launch claim per participant, printed as `claim.p<k>=<token>`):
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/skills/two-model-pr-review/scripts/phase-gate.sh pre-codex "$ART" "$REPO"
@@ -87,31 +147,45 @@ ${CLAUDE_PLUGIN_ROOT}/skills/two-model-pr-review/scripts/phase-gate.sh pre-codex
 
 The gate passes with `01-lead.md` absent (the normal case: the lead has not
 started) or sealed at mode 000 (a resumed run); it fails on a readable lead
-file, a missing or run-directory-naming brief, a vanished snapshot tree, or a
-packet whose hash changed since it was recorded. Paste its output into
-`00-run.md`, never into `00-scope.md` (that would change the hash).
+file, a missing or run-directory-naming brief, a missing or malformed
+`00-participants.tsv`, a vanished snapshot tree, a packet whose hash changed
+since it was recorded, or a directory written under another contract (no
+`00-schema`, or another marker: legacy run directory, start a fresh run). Paste
+its output into `00-run.md`, never into `00-scope.md` (that would change the hash).
 
 Launch FIRST in the turn, using the caller's background execution (Claude Code:
-`run_in_background: true`) so the turn is not blocked and the worker is not tied
-to a foreground timeout; then, in the same turn, launch the `lead-reviewer` agent:
+`run_in_background: true`) so the turn is not blocked and no worker is tied to a
+foreground timeout: one runner per usable participant, each with its own claim
+token, prefix `02-p<k>` and `--via`; then, in the same turn, launch the
+`lead-reviewer` agent:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/02-codex" --claim "$CLAIM" --fresh --prompt-file "$ART/00-brief.md" --stall-min 12 --max-min 40
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/02-p1" --claim "$CLAIM_P1" --fresh --prompt-file "$ART/00-brief.md" --stall-min 12 --max-min 40                       # p1 codex
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/02-p2" --via ccr:<alias> --claim "$CLAIM_P2" --fresh --prompt-file "$ART/00-brief.md" --stall-min 12 --max-min 40   # p2 ccr
 ```
+
+A participant recorded UNAVAILABLE / FAILED / DECLINED in Phase 0 is not launched;
+write `02-p<k>.md` for it with `STATUS: PHASE 2 COMPLETE (SKIPPED — <reason>)`
+before the join gate (its claim stays untaken, which the gates accept for a
+SKIPPED participant). Phase 2 is COMPLETE when at least one participant
+completed; the join gate reports `participants=p1:COMPLETE,p2:SKIPPED,…` and
+records the **exchange participant** — the lowest-numbered COMPLETE one — in
+`02-exchange-participant` (accepted final): the consultation and residual
+exchanges run on that participant's session, and its `thread=` anchors them.
 
 Expect 15–40 minutes for a few-hundred-line diff (26 min observed for 437
 lines); the stall window is 12 minutes because the job log is silent while
 Codex composes a long final answer (an 8-minute window cancelled one such run).
-While it runs, do NOT open `02-codex.stdout`, `.stderr` or `.joblog` and do NOT
-start Phase 3: the join gate (`phase-gate.sh pre-phase3 "$ART"`) must print
-`JOIN-OK` first, which needs `01-lead.md` sealed and `02-codex.md` written with
-its STATUS line. The runner's completion line carries only outcome, job id,
-elapsed time and byte count — never Codex's text — so a completion notification
-is safe to receive while the lead is still running. `02-codex.exit` and `.meta`
-are control files (no review text) and may be read on completion. Each
-`.progress` line ends with the last job-log line, which can carry Codex text:
-before `JOIN-OK` check liveness only with
-`tail -n 1 "$ART/02-codex.progress" | cut -d'|' -f1`; the full tail is for after
+While any participant runs, do NOT open any `02-p<k>.stdout`, `.stderr` or
+`.joblog` and do NOT start Phase 3: the join gate (`phase-gate.sh pre-phase3 "$ART"`)
+must print `JOIN-OK` first, which needs `01-lead.md` sealed and every
+`02-p<k>.md` written with its STATUS line. The runner's completion line carries
+only outcome, ids, elapsed time and byte count — never the participant's text —
+so a completion notification is safe to receive while the lead is still running.
+`02-p<k>.exit` and `.meta` are control files (no review text) and may be read on
+completion. Each `.progress` line ends with the last log line, which can carry
+review text: before `JOIN-OK` check liveness only with
+`tail -n 1 "$ART/02-p<k>.progress" | cut -d'|' -f1`; the full tail is for after
 the join. The runner exits with:
 
 | exit | outcome | what to do |
@@ -123,20 +197,20 @@ the join. The runner exits with:
 | 4 | LAUNCH-ERROR, or any invalid invocation (missing option value, unknown argument, unreadable prompt file, `--write`) | record UNAVAILABLE with `.stderr`; a usage message means fix the call, not retry |
 | 5 | STALLED or TIMEOUT **and the cancel could not be confirmed** — a Codex worker may still be running | DO NOT retry: a second job would run alongside the first. Report the job id, quote `.progress`, and treat the phase as failed. |
 
-Sidecars written by the runner: `02-codex.stdout` (final message, verbatim;
-the helper appends two trailer lines "Codex session ID …" / "Resume in Codex …"
-— keep them), `02-codex.stderr`, `02-codex.progress`, `02-codex.joblog`,
-`02-codex.meta` (job id, thread id, outcome, timings, exact command, and
-`last_error=` — the last `Codex error:` line from the job log, e.g. an upstream
-"model is at capacity", which is a transient and the normal reason for the one
-retry),
-`02-codex.exit`. Never edit them. Then write `02-codex.md` from `.exit` and
+Sidecars written by the runner, per participant: `02-p<k>.stdout` (final
+message, verbatim; for the codex backend the helper appends two trailer lines
+"Codex session ID …" / "Resume in Codex …" — keep them), `02-p<k>.stderr`,
+`02-p<k>.progress`, `02-p<k>.joblog`, `02-p<k>.meta` (backend, job or session
+id, thread id, outcome, timings, exact command, and `last_error=` — for codex the
+last `Codex error:` line from the job log, e.g. an upstream "model is at
+capacity", which is a transient and the normal reason for the one retry),
+`02-p<k>.exit`. Never edit them. Then write `02-p<k>.md` from `.exit` and
 `.meta` only: outcome line, the exact command, the `.meta` contents, and the
 STATUS line — and, only after `phase-gate.sh pre-phase3` has printed `JOIN-OK`,
 the `.stdout` inside a four-backtick fence verbatim (insert it above the STATUS
-line, which stays last). When Codex was unavailable, declined or the probe
-failed, no runner call was made and no sidecar exists: `02-codex.md` holds the
-verbatim probe line or failure and `STATUS: PHASE 2 COMPLETE (SKIPPED — <reason>)`,
+line, which stays last). When a participant was unavailable, declined or its
+probe failed, no runner call was made and no sidecar exists: `02-p<k>.md` holds
+the verbatim probe line or failure and `STATUS: PHASE 2 COMPLETE (SKIPPED — <reason>)`,
 which the join gate accepts without an `.exit` file.
 
 ## Phase 4 — set-level consultation
@@ -151,19 +225,24 @@ the validator enforces, but never names the artifact directory.
 Run one monitored call for the complete selected set, not one call per finding:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/04-consultation" --claim "$CLAIM" --resume-last --prompt-file "$ART/04-consultation.prompt.md" --stall-min 6 --max-min 20
+# exchange participant = $(cat "$ART/02-exchange-participant"); the CONSULTATION-OK line also prints it as exchange=p<k> via=<backend[:alias]>
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/04-consultation" --claim "$CLAIM" --resume-last --prompt-file "$ART/04-consultation.prompt.md" --stall-min 6 --max-min 20                                                    # codex participant
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/04-consultation" --via ccr:<alias> --claim "$CLAIM" --resume-session "$(awk -F= '$1=="thread"{print $2}' "$ART/02-p<k>.meta")" --prompt-file "$ART/04-consultation.prompt.md" --stall-min 6 --max-min 20   # ccr participant
 ```
 
 The raw sidecars remain immutable. The response is one fenced `json` object
 with `phase: "consultation"` and a disposition for every selected ID. Each
 disposition must contain all normalized fields described in adjudication.md;
-validate it with `validate-consultation.py` before Phase 5. `--resume-last` is
-repository-global: run no other Codex command between Phase 2 and Phase 6, then
-compare `04-consultation.meta`'s `thread=` to `02-codex.meta`'s `thread=` before
-accepting the response. If `--resume-last` cannot find that thread, retry once
-with `--fresh`; record that continuity is unavailable and treat the call as a
-self-contained consultation. A launch, stall, or validation failure becomes a
-skipped consultation and never reruns an initial review.
+validate it with `validate-consultation.py` before Phase 5. The exchange runs on
+the exchange participant's session: for the codex backend `--resume-last` is
+repository-global, so run no other codex command between Phase 2 and Phase 6;
+for a ccr participant `--resume-session` names its Phase-2 `thread=`. Then
+compare `04-consultation.meta`'s `thread=` to `02-p<k>.meta`'s `thread=` before
+accepting the response (the gate does the same). If the session cannot be
+resumed, retry once with `--fresh`; record that continuity is unavailable and
+treat the call as a self-contained consultation. A launch, stall, or validation
+failure becomes a skipped consultation and never reruns an initial review. The
+other participants are not consulted in this version.
 
 ## Phase 6 — residual-resolution exchange
 
@@ -174,15 +253,21 @@ monitored exchange protocol once with executed verification evidence, again from
 `templates/codex-exchange.md`:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/06-resolution" --claim "$CLAIM" --resume-last --prompt-file "$ART/06-resolution.prompt.md" --stall-min 6 --max-min 20
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/06-resolution" --claim "$CLAIM" --resume-last --prompt-file "$ART/06-resolution.prompt.md" --stall-min 6 --max-min 20                                            # codex participant
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/06-resolution" --via ccr:<alias> --claim "$CLAIM" --resume-session "$(cat "$ART/04-consultation.thread")" --prompt-file "$ART/06-resolution.prompt.md" --stall-min 6 --max-min 20   # ccr participant: the accepted anchor
 ```
 
-Across Phases 4 and 6, permit at most two successful Codex responses and four
-runner launches. No phase may have more than one successful response. A retry
-counts as a launch. Before accepting a resumed resolution, compare
+A `--resume-session` launch is recorded as `mode=--resume-session` (plus `resume_session=<id>`)
+and the gates anchor it exactly like `--resume-last`: its `thread=` must equal the exchange
+participant's session, or the attempt is unusable.
+
+Across Phases 4 and 6, permit at most two successful responses and four
+runner launches, whatever the number of participants (only the exchange
+participant is ever launched here). No phase may have more than one successful
+response. A retry counts as a launch. Before accepting a resumed resolution, compare
 `06-resolution.meta`'s `thread=` to the accepted consultation thread when one
-exists, otherwise `02-codex.meta`'s `thread=`; a fresh retry records unavailable
-continuity but remains self-contained. The residual-ID list and response use the
+exists, otherwise the exchange participant's `02-p<k>.meta` `thread=`; a fresh
+retry records unavailable continuity but remains self-contained. The residual-ID list and response use the
 same fenced JSON/disposition contract as consultation. A failed exchange is
 recorded as skipped; unresolved findings follow the adjudication default.
 `pre-report` accepts that skip only when a `06-resolution` sidecar shows the
@@ -202,7 +287,9 @@ exact read-only commands to obtain it, conventions, the review rubric, the
 finding schema, and the review-only constraints.
 
 The brief MUST NOT contain, summarize, hint at, or allude to:
-- the existence of any other reviewer, review, or review artifact;
+- the existence of any other reviewer, review, or review artifact — including
+  the other participants: every participant receives the identical brief and is
+  never told how many reviewers there are;
 - the artifact directory path;
 - any of your findings, at any severity;
 - your risk ranking or which files you found suspicious;
@@ -211,10 +298,10 @@ The brief MUST NOT contain, summarize, hint at, or allude to:
   to…" or reordering files by your suspicion. Files are listed alphabetically.
 
 Build the brief in Phase 0, before any finding exists, and hash it with
-`phase-gate.sh pre-codex`. Invoke with `--fresh`. The same brief is the lead
-agent's packet, so both reviewers read byte-identical inputs; the agent's own
-contract overrides the two sentences that describe Codex's environment (`CX-`
-ids, whole-filesystem read-only).
+`phase-gate.sh pre-codex`. Invoke every participant with `--fresh`. The same
+brief is the lead agent's packet, so every reviewer reads byte-identical inputs;
+the agent's own contract overrides the two sentences that describe the
+participant's environment (`CX-` ids, whole-filesystem read-only).
 
 ## Output handling
 

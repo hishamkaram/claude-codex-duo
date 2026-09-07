@@ -31,9 +31,13 @@ Selection: {{candidate count}} candidates · {{exact selector artifact and predi
 Consultation: {{COMPLETE | SKIPPED — reason}} · dispositions: {{selected/returned ID equality}} · job ids: {{from 04-consultation*.meta}}
 Verification: {{every P0–P3 finding verified from normalized evidence-only packets}}
 Residual resolution: {{COMPLETE | SKIPPED — reason}} · job ids: {{from 06-resolution*.meta}}
-Codex status: {{SUCCEEDED | UNAVAILABLE | FAILED | DECLINED — reason}} · blind job id: {{from 02-codex.meta}} · unified budget: {{successful responses}}/2 responses, {{launches}}/4 launches
+Participants (from 00-participants.tsv and 03-provenance.tsv):
+| id | backend | alias | status | job or session id | findings raised |
+|---|---|---|---|---|---|
+| p1 | {{codex | ccr}} | {{alias | -}} | {{SUCCEEDED | UNAVAILABLE | FAILED | DECLINED — reason}} | {{from 02-p1.meta: job= or thread=}} | {{n}} |
+Exchange participant: {{p<k> from 02-exchange-participant | none}} · unified budget: {{successful responses}}/2 responses, {{launches}}/4 launches
 Lead: {{`codex-pr-review:lead-reviewer` task <id> | general-purpose fallback (reason) | in-context fallback (reason)}} · join: {{JOIN-OK line from 03-matrix.md}} · review seal: {{unchanged | not applicable}}
-Blindness: procedural (neutral packets hashed before any finding + lead sealed before any Codex output was read + lead in its own context + mode-000 defense-in-depth); not structurally guaranteed. {{Concurrency: the two reviews overlapped from <lead start> to <first end> (00-run.md) | single-model run: no cross-review, nothing ran concurrently}}
+Blindness: procedural (neutral packets hashed before any finding + lead sealed before any participant output was read + lead in its own context + mode-000 defense-in-depth + no participant told of another); not structurally guaranteed. {{Concurrency: the lead and {{N}} participant review(s) overlapped from <lead start> to <first end> (00-run.md) | single-model run: no cross-review, nothing ran concurrently}}
 {{every UNRESOLVED item with both positions and strongest evidence for each}}
 
 **Escalate one at a time (optional):** for each UNRESOLVED item, a ready-to-paste line:

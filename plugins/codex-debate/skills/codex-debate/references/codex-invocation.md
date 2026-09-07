@@ -1,17 +1,24 @@
-# Codex invocation
+# Opponent invocation (Codex plugin, or a ccr alias)
 
 ## The only permitted path: the monitored runner
 
-`${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh` launches the Codex plugin's `task` in the
-background, refuses `--write`, polls the job every few seconds, detects a dead
-worker (status "running" but no worker process) or a stalled job log, cancels
-anything it abandons, and writes sidecars. A foreground `task` call is
-forbidden for rounds: a 10-minute shell limit killed one mid-round on
-2026-09-02 and left a phantom "running" job.
+`${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh` launches an opponent in the
+background, refuses `--write`, polls it every few seconds, detects a dead
+worker (status "running" but no worker process) or a stalled log, cancels
+anything it abandons, and writes sidecars. With the default backend it drives
+the Codex plugin's `task`; with `--via ccr:<alias>` it drives a headless Claude
+Code through the claude-code-router gateway (see "ccr backend" below). A
+foreground call is forbidden for rounds: a 10-minute shell limit killed one
+mid-round on 2026-09-02 and left a phantom "running" job.
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/<name>" --fresh|--resume-last --prompt-file "$ART/<name>.prompt.md" [--stall-min 6] [--max-min 25] [--poll-sec 15]
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/<name>" [--via codex|ccr:<alias>] --fresh|--resume-last|--resume-session <id> --prompt-file "$ART/<name>.prompt.md" [--stall-min 6] [--max-min 25] [--poll-sec 15]
 ```
+
+"Codex" in the rest of this file means the opponent whichever backend runs it,
+except where a backend is named. With several participants each has its own
+`--via` (from `00-participants.tsv`) and its own session (see "Per-participant
+sessions").
 
 Always call it with the caller's background execution (Claude Code:
 `run_in_background: true`) so your turn is not blocked; you are notified when
@@ -38,16 +45,46 @@ lines "Codex session ID …" / "Resume in Codex …"), `.stderr`, `.progress`,
 `.joblog`, `.meta` (job id, thread id, outcome, timings, exact command), `.exit`.
 Never edit them; embed `.stdout` verbatim in the round artifact.
 
-## Probe (Phase 0, once)
+## Probe (Phase 0, once per participant)
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe                                    # codex
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe --via ccr:<alias> --record-dir "$ART"    # each ccr alias
 ```
 
 `PROBE SUCCEEDED …` (exit 0) or `PROBE UNAVAILABLE/FAILED …` (exit 1); record
-the line verbatim. On failure tell the user `/codex:setup` exists; do not
-improvise auth. `.meta` files carry `last_error=` with the last `Codex error:`
-line (an upstream "model is at capacity" is transient: retry once).
+the line verbatim in `00-frame.md`, and for a ccr alias also the `ccr model show`
+JSON the probe prints after it. On failure tell the user `/codex:setup` exists
+(codex) or `ccr model list` / `ccr model show <alias>` (ccr); do not improvise
+auth. `.meta` files carry `last_error=` with the last `Codex error:` line (an
+upstream "model is at capacity" is transient: retry once).
+
+## ccr backend (`--via ccr:<alias>`)
+
+The gateway is the user's `ccr` (claude-code-router, >= 0.4.11). Aliases are
+machine-local (`ccr model list`); never write one into a shipped file and never
+default to one. The runner's launch line is fixed:
+
+```
+ccr launch --model <alias> --permission-mode plan -p --no-lifecycle --no-statusline -- \
+  --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
+  --disallowedTools Write,Edit,MultiEdit,NotebookEdit,Agent --max-turns <N> [--resume <session>]
+```
+
+Read-only rests on `--permission-mode plan` first (Claude Code's own permission
+engine: every write is blocked, read-only Bash still runs), then the empty strict
+MCP config, then the disallowed edit tools; a disallow-list alone does not stop
+Bash from writing. The probe runs a read-only smoke for the alias and records
+`readonly=verified` in `<dir>/.ccr-smoke.<alias>`; a ccr launch in that
+directory refuses to start (exit 4) without a matching record (same ccr version,
+model and launch line). `thread=` in `.meta` is the child's `session_id`;
+`--resume-last` resumes `<dir>/.ccr-last-session`, `--resume-session <id>`
+names a session, `--fresh` starts one. `--max-turns <N>` (default 100) is
+ccr-only. `.progress` opens with `launched backend=ccr pid=<pid> pgid=<pgid>
+alias=<alias>`; the child runs in its own process group, which stall or timeout
+signals as a whole. Sidecar names, meaning and the exit table are identical.
+The `--model`/`--effort` prohibition below is about the codex backend; for ccr
+the alias is the model choice and it is the user's.
 
 ## Thread semantics
 
@@ -59,6 +96,22 @@ line (an upstream "model is at capacity" is transient: retry once).
   previous raw reply quoted), so a lost thread degrades to a fresh context, not
   a broken debate.
 - Never pass `--model` or `--effort` unless the user asked.
+
+## Per-participant sessions (N ≥ 2)
+
+Each participant keeps its own session across its rounds, and the sidecars are named per
+participant: `02-blind-p<k>.*` for the blind take, `03-round-<n>-p<k>.*` for a round.
+
+- The single codex participant (at most one) keeps `--resume-last`: the companion resumes the
+  most recent thread in the repository, so no other codex call may run between its rounds.
+- Every ccr participant resumes by explicit id: `--via ccr:<alias> --resume-session <id>`,
+  where `<id>` is the `thread=` line of that participant's previous `.meta` (its blind take, or
+  its last round). Never `--resume-last` for a ccr participant when two ccr participants share
+  the directory: `.ccr-last-session` is the directory's last completed ccr launch, which may be
+  the other participant's.
+- Record `thread=` of every launch in the round file; a round whose `.meta` `thread=` differs
+  from the participant's previous one lost its session — rule on it as a self-contained
+  round and say so.
 
 ## What Codex can see — and what that means for the debate
 

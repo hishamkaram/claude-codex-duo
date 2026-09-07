@@ -6,8 +6,9 @@
 - **Rounds:** {{N}} (cap 5) · **Blind first round:** {{on | off}}
 - **Repo:** {{path}} · **HEAD:** {{sha}} · **git status:** {{clean | quoted}}
 - **Context supplied:** {{paths, docs, failure output — by name}}
-- **Codex:** {{SUCCEEDED | UNAVAILABLE | FAILED | DECLINED — detail}}
-- **Sending repo content to Codex permitted:** {{yes | no — then DECLINED}}
+- **Participants:** {{p1 codex | p<k> ccr:<alias> …, from `--via`; one line each: SUCCEEDED | UNAVAILABLE | FAILED | DECLINED — detail, with the probe line verbatim (and the `ccr model show` JSON for a ccr alias, fenced)}}
+- **Global round budget (N ≥ 2):** {{--total-rounds, default N × rounds}}
+- **Sending repo content to each participant's provider permitted:** {{yes | no — then DECLINED for that participant}}
 - **Artifact dir:** {{path}}
 
 # Claude position (Phase 1)

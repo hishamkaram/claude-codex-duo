@@ -8,11 +8,14 @@
 #   phase-gate.sh pre-resolution  <ART>
 #   phase-gate.sh pre-report      <ART>
 #   phase-gate.sh post-join       <ART>       # legacy initial-packet consistency check
+#   phase-gate.sh release         <ART> <prefix>
 #
-# Every gate rechecks the frozen scope and blind brief, then verifies the accept
-# ledger (00-accepted.sha256): every artifact a gate has accepted or generated is
-# recorded there once and may never change afterwards. Launch gates take an
-# atomic claim as their last step. See SKILL.md §Phase gate.
+# Every gate rechecks the frozen scope, blind brief and participants file, the schema
+# marker (00-schema = codex-pr-review/4: a 3.0.0 directory is never reinterpreted), then
+# verifies the accept ledger (00-accepted.sha256): every artifact a gate has accepted or
+# generated is recorded there once and may never change afterwards. Launch gates take an
+# atomic claim as their last step — pre-codex one per participant of 00-participants.tsv
+# (prefixes 02-p1..02-pN). See SKILL.md §Phase gate and §Participants.
 set -u
 USAGE='usage: phase-gate.sh pre-codex <ART> <REPO> | phase-gate.sh pre-phase3|pre-consultation|pre-verification|pre-resolution|pre-report|post-join <ART> | phase-gate.sh release <ART> <prefix>'
 die2() { echo "phase-gate.sh: $1" >&2; echo "$USAGE" >&2; exit 2; }
@@ -27,6 +30,8 @@ esac
 ART="$(cd "$ART" && pwd -P)"
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 VALIDATOR="$ROOT/scripts/validate-consultation.py"
+PROVENANCE_VALIDATOR="$ROOT/scripts/validate-provenance.py"
+SCHEMA_MARKER="codex-pr-review/4"
 PACKET_VALIDATOR="$ROOT/scripts/validate-verifier-packets.py"
 VERDICT_VALIDATOR="$ROOT/scripts/validate-verdicts.py"
 PACKET_BUILDER="$ROOT/scripts/build-verifier-packets.py"
@@ -101,34 +106,86 @@ reject_skip_over_success() {  # reject_skip_over_success <prefix> [validator arg
   done
   shopt -u nullglob
 }
-codex_status() {
-  phase_status 02-codex.md 2
-  ST=$PST
-  # An exit-5 / unconfirmed-cancel sidecar on the initial review (current or
-  # rotated) means a Codex worker may still be alive, whether the phase was
-  # then recorded COMPLETE by a later attempt or SKIPPED (round-19 CX-01).
-  reject_unconfirmed_cancel 02-codex
-  if [ "$ST" = COMPLETE ]; then
-    [ -s "$ART/02-codex.exit" ] || fail "02-codex.exit missing: the Codex phase has not finished"
-    CX=$(cat "$ART/02-codex.exit")
-    [ "$CX" = 0 ] || fail "02-codex.exit must be 0 for a completed blind review (got $CX)"
-    [ -s "$ART/02-codex.stdout" ] || fail "02-codex.stdout is empty: an empty response is not a completed blind review; record Phase 2 SKIPPED (empty response) or relaunch"
-  else
-    CX=skipped
+# ---- Participants (4.0.0) ------------------------------------------------------------------
+# 00-participants.tsv, written in Phase 0 and frozen with the packets: one row per blind
+# second-model reviewer, `p<k><TAB>codex|ccr<TAB>alias-or-dash`, k = 1..N in order, 1 ≤ N ≤ 8,
+# at most one codex row (the companion resumes only the last thread in a repository). Each
+# participant owns the prefix 02-p<k>: its own claim, sidecars and terminal 02-p<k>.md.
+PARTICIPANTS_FILE="$ART/00-participants.tsv"
+participants_check() {
+  local n=0 k id backend alias codex=0 line
+  [ -s "$PARTICIPANTS_FILE" ] || fail "00-participants.tsv missing or empty: Phase 0 writes one row per participant (p<k><TAB>codex|ccr<TAB>alias-or-dash) before pre-codex"
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    n=$((n+1)); k=$n
+    id=$(printf '%s' "$line" | cut -f1); backend=$(printf '%s' "$line" | cut -f2); alias=$(printf '%s' "$line" | cut -f3)
+    [ "$id" = "p$k" ] || fail "00-participants.tsv line $n: expected id p$k (rows are p1..pN in order), got '$id'"
+    case "$backend" in
+      codex) [ "$alias" = "-" ] || fail "00-participants.tsv line $n: a codex participant has alias '-' (got '$alias')"; codex=$((codex+1));;
+      ccr) case "$alias" in ""|-|*[!A-Za-z0-9._-]*) fail "00-participants.tsv line $n: a ccr participant needs an alias of letters, digits, '.', '_' and '-' (got '$alias')";; esac;;
+      *) fail "00-participants.tsv line $n: backend must be codex or ccr (got '$backend')";;
+    esac
+  done < "$PARTICIPANTS_FILE"
+  [ "$n" -ge 1 ] && [ "$n" -le 8 ] || fail "00-participants.tsv must list 1 to 8 participants (got $n)"
+  [ "$codex" -le 1 ] || fail "00-participants.tsv lists $codex codex participants; at most one (the companion resumes only the last thread in a repository)"
+}
+participant_ids() { cut -f1 "$PARTICIPANTS_FILE" 2>/dev/null | grep -E '^p[1-9][0-9]*$'; }
+participant_field() {  # participant_field <id> backend|alias
+  local col; case "$2" in backend) col=2;; alias) col=3;; *) return 1;; esac
+  awk -F'\t' -v id="$1" -v c="$col" '$1 == id {print $c; exit}' "$PARTICIPANTS_FILE" 2>/dev/null
+}
+phase2_prefixes() { participant_ids | sed 's/^/02-/'; }
+all_prefixes() { phase2_prefixes; printf '%s\n' 04-consultation 06-resolution; }
+# The schema marker names the artifact contract of this directory. It is written once by
+# pre-codex, hashed with the packets, accepted into the ledger after the seal, and checked by
+# every gate: a directory written under another contract (3.0.0's 02-codex prefixes) is
+# refused instead of being reinterpreted (round-1 X-4 of the 4.0.0 plan).
+schema_check() {
+  [ -s "$ART/00-schema" ] || fail "00-schema missing: this is a legacy run directory (or pre-codex never ran here) — start a fresh run directory under codex-pr-review 4.0.0"
+  [ "$(cat "$ART/00-schema")" = "$SCHEMA_MARKER" ] || fail "00-schema is '$(head -1 "$ART/00-schema")', expected '$SCHEMA_MARKER': legacy run directory — start a fresh run"
+}
+# participants_status: every participant's 02-p<k>.md is terminal. ST = COMPLETE when at
+# least one participant completed (SKIPPED when none); EXCH = the lowest-k COMPLETE
+# participant (the one consulted later); CX = its exit; PSTATUS = the per-participant list.
+participants_status() {
+  local id pst
+  ST=SKIPPED; CX=skipped; EXCH=""; PSTATUS=""
+  for id in $(participant_ids); do
+    phase_status "02-$id.md" 2; pst=$PST
+    # An exit-5 / unconfirmed-cancel sidecar on an initial review (current or rotated) means a
+    # worker may still be alive, whether the phase was then recorded COMPLETE by a later
+    # attempt or SKIPPED (round-19 CX-01).
+    reject_unconfirmed_cancel "02-$id"
+    if [ "$pst" = COMPLETE ]; then
+      [ -s "$ART/02-$id.exit" ] || fail "02-$id.exit missing: participant $id has not finished"
+      [ "$(cat "$ART/02-$id.exit")" = 0 ] || fail "02-$id.exit must be 0 for a completed blind review (got $(cat "$ART/02-$id.exit"))"
+      [ -s "$ART/02-$id.stdout" ] || fail "02-$id.stdout is empty: an empty response is not a completed blind review; record Phase 2 SKIPPED (empty response) for $id or relaunch"
+      ST=COMPLETE
+      if [ -z "$EXCH" ]; then EXCH="$id"; CX=$(cat "$ART/02-$id.exit"); fi
+    fi
+    PSTATUS="${PSTATUS:+$PSTATUS,}$id:$pst"
+  done
+}
+codex_status() { participants_status; }
+exchange_drift_check() {  # the exchange participant is recorded at the join and must not drift afterwards; runs after the seal checks so tampering is reported first
+  if [ -s "$ART/02-exchange-participant" ]; then
+    [ "$(cat "$ART/02-exchange-participant")" = "$EXCH" ] || fail "02-exchange-participant records $(cat "$ART/02-exchange-participant") but the lowest completed participant is now ${EXCH:-none}: a participant's status changed after the join (start a fresh run directory)"
   fi
 }
-initial_packets() { hashcheck 00-brief.md; hashcheck 00-scope.md; }
+initial_packets() { hashcheck 00-brief.md; hashcheck 00-scope.md; hashcheck 00-participants.tsv; hashcheck 00-schema; }
 # The seal attests the join for BOTH Phase-2 outcomes: a COMPLETE review hashes
 # the raw Codex body, a SKIPPED one hashes the status file itself, so a later
 # status edit or seal deletion is detectable either way (round-22 CX-02).
-seal_contents() {
-  local destination="$1" codex_file
+seal_contents() {  # lead body, then every participant's body (COMPLETE: raw stdout; SKIPPED: the status file), in order
+  local destination="$1" codex_file id
   printf 'phase2=%s\n' "$ST" > "$destination"
   sha "$ART/01-lead.md" >> "$destination" || return 1
   printf '  01-lead.md\n' >> "$destination"
-  if [ "$ST" = COMPLETE ]; then codex_file=02-codex.stdout; else codex_file=02-codex.md; fi
-  sha "$ART/$codex_file" >> "$destination" || return 1
-  printf '  %s\n' "$codex_file" >> "$destination"
+  for id in $(participant_ids); do
+    case "$PSTATUS" in *"$id:COMPLETE"*) codex_file="02-$id.stdout";; *) codex_file="02-$id.md";; esac
+    sha "$ART/$codex_file" >> "$destination" || return 1
+    printf '  %s\n' "$codex_file" >> "$destination"
+  done
 }
 # 01-lead.md may still be mode-000 sealed (defense-in-depth against Codex
 # reading it before JOIN-OK). Hashing it needs owner-read; these two helpers
@@ -152,7 +209,7 @@ review_seal() {
   case "$(mode "$seal")" in 400|440|444) ;; *) fail "02-review-seal.sha256 must be read-only (mode $(mode "$seal"))";; esac
   sealed_phase=$(awk -F= '$1 == "phase2" {print $2; exit}' "$seal")
   case "$sealed_phase" in COMPLETE|SKIPPED) ;; *) fail "02-review-seal.sha256 does not attest to a terminal blind Codex review (phase2=${sealed_phase:-missing})";; esac
-  [ "$ST" = "$sealed_phase" ] || fail "02-codex.md status changed after JOIN-OK (sealed=$sealed_phase current=$ST)"
+  [ "$ST" = "$sealed_phase" ] || fail "a participant 02-p<k>.md status changed after JOIN-OK (sealed=$sealed_phase current=$ST)"
   unseal_lead_for_hash
   tmp=$(mktemp "$ART/.review-seal.XXXXXX") || { reseal_lead_after_hash; fail "could not allocate review-seal scratch file"; }
   seal_contents "$tmp" || { rm -f "$tmp"; reseal_lead_after_hash; fail "cannot hash initial review bodies"; }
@@ -175,7 +232,7 @@ review_seal() {
 KNOWN_GATES=" pre-phase3 pre-consultation pre-verification pre-resolution pre-report "
 later_artifacts() {  # glob prefixes of artifacts that only exist once a later phase began
   case "$1" in
-    pre-phase3) echo "03- 04- 05- 06- 07-";;  # the seal itself is minted before the ledger exists (round-40 CX-01)
+    pre-phase3) echo "03- 04- 05- 06- 07-";;  # the seal and 02-exchange-participant are minted before the ledger exists (round-40 CX-01)
     pre-consultation) echo "04-consultation.md 04-consultation.progress 04-consultation.stdout 04-consultation.stderr 04-consultation.exit 04-consultation.meta 04-consultation.attempt 04-consultation.thread 04-consultation.json 05- 06- 07-";;
     pre-verification) echo "05-verification.md 05-verdicts.tsv 06- 07-";;
     pre-resolution) echo "06-resolution.md 06-resolution.progress 06-resolution.stdout 06-resolution.stderr 06-resolution.exit 06-resolution.meta 06-resolution.attempt 06-resolution.json 07-";;
@@ -196,7 +253,7 @@ write_review_seal() {  # pre-phase3: mint the seal once; on re-entry regenerate 
   [ ! -e "$seal" ] || { review_seal; return; }
   unseal_lead_for_hash
   [ -s "$ART/01-lead.md" ] || { reseal_lead_after_hash; fail "01-lead.md missing or empty"; }
-  if [ "$ST" = COMPLETE ]; then [ -s "$ART/02-codex.stdout" ] || { reseal_lead_after_hash; fail "02-codex.stdout missing or empty"; }; fi
+  if [ "$ST" = COMPLETE ]; then [ -s "$ART/02-$EXCH.stdout" ] || { reseal_lead_after_hash; fail "02-$EXCH.stdout missing or empty"; }; fi
   tmp=$(mktemp "$ART/.review-seal.XXXXXX") || { reseal_lead_after_hash; fail "could not allocate review-seal scratch file"; }
   seal_contents "$tmp" || { rm -f "$tmp"; reseal_lead_after_hash; fail "cannot hash initial review bodies"; }
   chmod 400 "$tmp" || { rm -f "$tmp"; reseal_lead_after_hash; fail "could not make review seal read-only"; }
@@ -314,7 +371,7 @@ sidecar_slots() {
 # terminal artifact says (round-36 CX-01). Recovery is `release`.
 live_claim_check() {
   local prefix
-  for prefix in 02-codex 04-consultation 06-resolution; do
+  for prefix in $(all_prefixes); do
     if [ -d "$ART/$prefix.claim/runner" ] && [ ! -e "$ART/$prefix.exit" ]; then
       fail "$prefix runner is still in flight ($prefix.claim/runner exists and $prefix.exit does not): wait for it, or if it is dead run phase-gate.sh release $ART $prefix — a phase cannot be recorded or advanced past while its runner may still write"
     fi
@@ -322,7 +379,7 @@ live_claim_check() {
 }
 launch_records_check() {
   local prefix slots taken
-  for prefix in 02-codex 04-consultation 06-resolution; do
+  for prefix in $(all_prefixes); do
     slots=$(sidecar_slots "$prefix"); taken=$(runner_count "$prefix")
     [ "$slots" -le "$taken" ] || fail "$prefix has sidecars for $slots attempt(s) but only $taken claim(s) taken by a runner: a runner was launched without the gate's claim (always pass --claim) or a claim directory was deleted (never remove $prefix.claim*; use phase-gate.sh release); a lone attemptN.exit=4 with no claim is a claim-less argument error — the runner no longer writes one when a claim exists, but an older one can only be resolved by a fresh run directory"
   done
@@ -362,7 +419,7 @@ attempt_usable() {
   fi
   case "$mode_val" in
     --fresh) return 0;;
-    --resume-last)
+    --resume-last|--resume-session)  # a ccr exchange names the session explicitly; it is anchored the same way (review round 1: F-01)
       expected=$(expected_thread 2>/dev/null) || return 1
       [ "$actual" = "$expected" ];;
     *) return 1;;
@@ -383,8 +440,10 @@ response_count() { printf '%s\n' "$(( $(usable_count 04-consultation) + $(usable
 expected_thread() {
   local anchor="$ART/04-consultation.thread" expected
   if [ -s "$anchor" ]; then cat "$anchor"; return; fi
-  expected=$(awk -F= '$1 == "thread" {print $2; exit}' "$ART/02-codex.meta")
-  [ -n "$expected" ] && [ "$expected" != unknown ] || { printf '%s\n' "Phase-2 Codex thread is unavailable" >&2; return 1; }
+  [ -n "${EXCH:-}" ] || EXCH=$(cat "$ART/02-exchange-participant" 2>/dev/null)
+  [ -n "$EXCH" ] || { printf '%s\n' "no exchange participant recorded (02-exchange-participant)" >&2; return 1; }
+  expected=$(awk -F= '$1 == "thread" {print $2; exit}' "$ART/02-$EXCH.meta")
+  [ -n "$expected" ] && [ "$expected" != unknown ] || { printf '%s\n' "Phase-2 thread of participant $EXCH is unavailable" >&2; return 1; }
   printf '%s\n' "$expected"
 }
 check_thread() {
@@ -399,7 +458,7 @@ check_thread() {
   fi
   case "$mode_val" in
     --fresh) return 0;; # A documented self-contained retry cannot preserve thread continuity (and needs no prior thread).
-    --resume-last) ;;
+    --resume-last|--resume-session) ;;  # --resume-session (ccr) must name the exchange participant's session (review round 1: F-01)
     *) fail "$prefix.meta records no recognisable launch mode (mode=${mode_val:-missing})";;
   esac
   expected=$(expected_thread) || fail "cannot determine expected Codex thread"
@@ -453,6 +512,13 @@ validate_base_findings() {
   [ -x "$PACKET_VALIDATOR" ] || fail "verifier packet validator missing or not executable: $PACKET_VALIDATOR"
   [ -f "$ART/03-findings.ndjson" ] || fail "03-findings.ndjson missing: write the normalized base packet for every 03-matrix.tsv ID before pre-consultation"
   python3 "$PACKET_VALIDATOR" --matrix "$ART/03-matrix.tsv" --packets "$ART/03-findings.ndjson" --match-matrix-severity >/dev/null || fail "03-findings.ndjson is invalid (one provenance-free normalized packet per matrix ID, severity equal to the matrix's, is required)"
+}
+# 03-provenance.tsv: who raised each canonical finding (lead|p<k>, original id). Validated
+# against the matrix and the participants file, accepted as a draft; it never reaches a packet.
+validate_provenance() {
+  [ -x "$PROVENANCE_VALIDATOR" ] || fail "provenance validator missing or not executable: $PROVENANCE_VALIDATOR"
+  [ -f "$ART/03-provenance.tsv" ] || fail "03-provenance.tsv missing: write one F-nn<TAB>lead|p<k><TAB>original-id row per raiser of every matrix ID before pre-consultation"
+  python3 "$PROVENANCE_VALIDATOR" --matrix "$ART/03-matrix.tsv" --participants "$PARTICIPANTS_FILE" --provenance "$ART/03-provenance.tsv" >/dev/null || fail "03-provenance.tsv is invalid (every matrix id at least once, raisers lead|p<k> from 00-participants.tsv, origin consistent with the raiser set; run validate-provenance.py for the reasons)"
 }
 # 05-verifier-packets.ndjson is generated, never hand-written: the frozen base
 # packets with the validated consultation dispositions applied by
@@ -543,9 +609,33 @@ rotate_claim() {  # rotate_claim <prefix>: <prefix>.claim -> <prefix>.claim.spen
 # and then died without writing <prefix>.exit. It never deletes: it proves the
 # runner and its Codex job are dead, then rotates the claim to spent, where a
 # runner-taken claim still counts as a launch (round-32 debate, X-10).
+# ccr attempts run in their own process group and record it on the launch line
+# (`launched backend=ccr pid=<pid> pgid=<pgid> alias=<alias>`). A claim is released only when
+# the recorded pid is dead, no process of the group is left, and no descendant of the pid
+# survives; a launch line without pgid= is refused (round-2 X-7 of the 4.0.0 plan).
+descendants_alive() {  # descendants_alive <pid>: 0 when any descendant is alive
+  local kids c
+  kids=$(pgrep -P "$1" 2>/dev/null) || return 1
+  for c in $kids; do kill -0 "$c" 2>/dev/null && return 0; descendants_alive "$c" && return 0; done
+  return 1
+}
+ccr_release_check() {  # ccr_release_check <prefix> <launch line>
+  local prefix="$1" launch="$2" pid pgid left
+  pid=$(printf '%s' "$launch" | grep -oE ' pid=[0-9]+' | head -1 | cut -d= -f2)
+  pgid=$(printf '%s' "$launch" | grep -oE ' pgid=[0-9]+' | head -1 | cut -d= -f2)
+  [ -n "$pgid" ] || fail "release: ccr launch record of $prefix has no pgid= (launch line: ${launch:0:120}); cancel the process tree by hand (ps -o pid,pgid,command | grep 'ccr launch'), then re-run the gate"
+  if kill -0 -- "-$pgid" 2>/dev/null; then
+    fail "release: process group $pgid of $prefix is still alive ($(ps -o pid=,command= -g "$pgid" 2>/dev/null | head -3 | tr '\n' ';')); cancel it first (kill -TERM -- -$pgid)"
+  fi
+  left=$(ps -o pid= -g "$pgid" 2>/dev/null | tr -d ' \n')
+  [ -z "$left" ] || fail "release: process group $pgid of $prefix still has members ($left); cancel them first"
+  if [ -n "$pid" ] && descendants_alive "$pid"; then fail "release: a descendant of pid $pid ($prefix) is still alive; cancel it first"; fi
+}
 release_claim() {
-  local prefix="$1" claim="$ART/$1.claim" pid job st root
-  case "$prefix" in 02-codex|04-consultation|06-resolution) ;; *) fail "release: unknown phase prefix '$prefix'";; esac
+  local prefix="$1" claim="$ART/$1.claim" pid job st root launch backend alias
+  case "$prefix" in 04-consultation|06-resolution) ;; *)
+    participant_ids | sed 's/^/02-/' | grep -qx -- "$prefix" || fail "release: unknown phase prefix '$prefix' (participants: $(participant_ids | tr '\n' ' '))";;
+  esac
   claim_lock "$prefix"
   [ -d "$claim" ] || fail "release: no live claim for $prefix (nothing to release)"
   [ ! -e "$ART/$prefix.exit" ] || fail "release: $prefix.exit exists, so that attempt finished; the next launch gate rotates the claim itself"
@@ -556,8 +646,20 @@ release_claim() {
     [ $(( $(date +%s) - $(mtime "$claim/runner" || date +%s) )) -ge 60 ] || fail "release: a runner is taking the $prefix claim right now (runner/ exists, pid not yet recorded); retry in a minute"
   fi
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then fail "release: runner $pid of $prefix is still alive"; fi
+  if [ -n "$pid" ] && descendants_alive "$pid"; then fail "release: a descendant of runner $pid of $prefix is still alive; cancel it first"; fi
   job=$(grep -oE 'launched job=task-[a-z0-9-]+' "$ART/$prefix.progress" 2>/dev/null | head -1 | cut -d= -f2)
-  if [ -n "$job" ] || [ -e "$ART/$prefix.progress" ]; then
+  launch=$(grep -E '^[0-9]+s launched backend=ccr ' "$ART/$prefix.progress" 2>/dev/null | head -1)
+  # Which backend this attempt used: the launch line when there is one; otherwise the
+  # participant's row (02-p<k>) or the exchange participant's (04-/06-).
+  case "$prefix" in 02-*) backend=$(participant_field "${prefix#02-}" backend); alias=$(participant_field "${prefix#02-}" alias);;
+    *) backend=$(participant_field "$(cat "$ART/02-exchange-participant" 2>/dev/null)" backend); alias=$(participant_field "$(cat "$ART/02-exchange-participant" 2>/dev/null)" alias);; esac
+  if [ -n "$launch" ]; then
+    ccr_release_check "$prefix" "$launch"   # never consults the companion: there is no Codex job
+  elif [ -z "$job" ] && [ -e "$ART/$prefix.progress" ] && [ "$backend" = ccr ]; then
+    # .progress exists with no launch line: a ccr runner killed between creating the file and
+    # recording the launch. Fail closed while any ccr launch for that alias is running.
+    ! pgrep -f "ccr launch --model ${alias:-__none__} " >/dev/null 2>&1 || fail "release: $prefix.progress records no launch line, and a ccr launch for alias ${alias} is still running (ps -o pid,pgid,command | grep 'ccr launch --model ${alias}'); cancel it first"
+  elif [ -n "$job" ] || [ -e "$ART/$prefix.progress" ]; then
     # A job was launched, or may have been (the runner creates .progress just
     # before `task` and records the job id just after it, so a runner killed in
     # between leaves .progress without an id — round-34 CX-01): the job must be
@@ -658,7 +760,7 @@ reject_unconfirmed_cancel() {
 }
 # Every post-join gate: the review seal is a generated artifact — regenerate it
 # from the CURRENT status and bodies and compare, so a status edit on
-# 02-codex.md or a body edit is caught whichever branch the gate would take
+# a participant 02-p<k>.md or a body edit is caught whichever branch the gate would take
 # (round-22 CX-02). Its digest is a final ledger row, so a deleted seal is
 # reported by accepted_check before this runs.
 review_seal_check() {
@@ -685,7 +787,10 @@ review_seal_check() {
   review_seal
 }
 # Runs after the seal/ledger checks so tampering is reported first.
-codex_skip_check() { [ "$ST" = COMPLETE ] || reject_skip_over_success 02-codex; }
+codex_skip_check() {  # a SKIPPED participant over its own successful attempt is not skippable
+  local id
+  for id in $(participant_ids); do case "$PSTATUS" in *"$id:COMPLETE"*) ;; *) reject_skip_over_success "02-$id";; esac; done
+}
 # An accepted consultation response (final ledger rows) cannot later be
 # recorded SKIPPED: that would discard dispositions the ledger holds (round-28 L-01).
 reject_skipped_after_accept() {  # uses $consultation
@@ -726,18 +831,32 @@ pre-codex)
   # seal hasn't been tampered with; on a fresh directory this is a no-op.
   # Any prior Phase-2 attempt with an unconfirmed cancel is a hard stop, seal
   # or no seal (round-22 CX-01).
-  reject_unconfirmed_cancel 02-codex
-  if [ ! -s "$ART/02-codex.md" ] && [ -s "$ART/02-codex.exit" ] && [ "$(cat "$ART/02-codex.exit")" = 0 ] && [ -s "$ART/02-codex.stdout" ]; then
-    fail "02-codex.exit records an accepted attempt with no 02-codex.md yet; write 02-codex.md from the existing sidecars instead of relaunching Codex"
+  participants_check
+  # The schema marker is written once, before the packets are hashed, and hashed with them.
+  if [ ! -e "$ART/00-schema" ]; then
+    ! later_artifact_exists pre-phase3 || fail "00-schema missing but post-join artifacts exist: legacy run directory — start a fresh run"
+    printf '%s\n' "$SCHEMA_MARKER" > "$ART/00-schema" || fail "could not write 00-schema"
   fi
-  if [ -s "$ART/02-codex.md" ]; then
-    # Re-entry with a terminal Phase 2: a joined run must still be consistent;
-    # an unjoined COMPLETE review must not be silently redone (round-23 CX-03).
-    # Only a SKIPPED, unjoined Phase 2 (probe failed, declined) may be retried.
-    codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; codex_skip_check
+  schema_check
+  TO_LAUNCH=""; ANY_TERMINAL=0
+  for id in $(participant_ids); do
+    reject_unconfirmed_cancel "02-$id"
+    if [ ! -s "$ART/02-$id.md" ] && [ -s "$ART/02-$id.exit" ] && [ "$(cat "$ART/02-$id.exit")" = 0 ] && [ -s "$ART/02-$id.stdout" ]; then
+      fail "02-$id.exit records an accepted attempt with no 02-$id.md yet; write 02-$id.md from the existing sidecars instead of relaunching participant $id"
+    fi
+    if [ -s "$ART/02-$id.md" ]; then ANY_TERMINAL=1; else TO_LAUNCH="$TO_LAUNCH $id"; fi
+  done
+  if [ "$ANY_TERMINAL" = 1 ]; then
+    # Re-entry with terminal participants: a joined run must still be consistent; an unjoined
+    # COMPLETE review must not be silently redone (round-23 CX-03). Only SKIPPED, unjoined
+    # participants (probe failed, declined) may be retried — each on its own claim.
+    for id in $(participant_ids); do [ -s "$ART/02-$id.md" ] || fail "02-$id.md missing while other participants are terminal: write every participant's terminal file (SKIPPED for the ones not launched) before re-entering pre-codex"; done
+    codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
     [ ! -e "$ART/02-review-seal.sha256" ] || fail "this run is already joined (02-review-seal.sha256 exists, phase2=$ST); Phase 2 cannot be relaunched — continue from the next gate or start a fresh run directory"
-    if [ "$ST" = COMPLETE ]; then
-      fail "02-codex.md already records a completed blind review; run pre-phase3 (or start a fresh run directory) instead of relaunching Codex"
+    TO_LAUNCH=""
+    for id in $(participant_ids); do case "$PSTATUS" in *"$id:COMPLETE"*) ;; *) TO_LAUNCH="$TO_LAUNCH $id";; esac; done
+    if [ -z "$TO_LAUNCH" ]; then
+      fail "02-$EXCH.md already records a completed blind review (every participant is terminal and complete); run pre-phase3 (or start a fresh run directory) instead of relaunching"
     fi
   fi
   LEAD=absent
@@ -751,33 +870,48 @@ pre-codex)
   # Written only once every check passed, so a refused re-entry never rewrites
   # it (round-36 CX-06); accepted final at the join.
   printf 'repo=%s\nbase=%s\nhead=%s\n' "$REPO_CANON" "$(cat "$ART/00-brief.md.base")" "$(cat "$ART/00-brief.md.head")" > "$ART/00-repo.txt" || fail "could not record the repository"
-  claim_phase 02-codex 02-codex.md  # last: nothing after this can fail and leave a claim (round-27 CX-02)
-  echo "PREFLIGHT-OK lead=$LEAD brief=$(cut -c1-12 "$ART/00-brief.md.sha256") scope=$(cut -c1-12 "$ART/00-scope.md.sha256") claim=$CLAIM_TOKEN"
+  # Last: one claim per participant to launch; nothing after this can fail and leave a claim
+  # (round-27 CX-02). Every launch takes its own token (claim.p<k>=…).
+  CLAIMS=""
+  for id in $TO_LAUNCH; do claim_phase "02-$id" "02-$id.md"; CLAIMS="$CLAIMS claim.$id=$CLAIM_TOKEN"; done
+  echo "PREFLIGHT-OK lead=$LEAD participants=$(participant_ids | wc -l | tr -d ' ') brief=$(cut -c1-12 "$ART/00-brief.md.sha256") scope=$(cut -c1-12 "$ART/00-scope.md.sha256") schema=$SCHEMA_MARKER$CLAIMS"
   ;;
 pre-phase3)
   [ -e "$ART/01-lead.md" ] || fail "01-lead.md missing: run Phase 1 in-context BEFORE opening any Codex output file"
   [ -s "$ART/01-lead.md" ] || fail "01-lead.md is empty"
   [ "$(mode "$ART/01-lead.md")" = 0 ] || fail "01-lead.md is not sealed (mode $(mode "$ART/01-lead.md")): it must stay mode 000 until this gate passes (mode 400 after an interrupted join means the seal hashing was cut short: chmod 000 it and re-run this gate)"
-  codex_status; initial_packets; accepted_check; launch_records_check; live_claim_check; review_seal_check; codex_skip_check
+  schema_check; codex_status; initial_packets; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
   [ -s "$ART/00-repo.txt" ] || fail "00-repo.txt missing: pre-codex was not run in this directory (it records the reviewed repository for citation checks)"
   repo_check file
   # Seal first, ledger rows second: each step is atomic and re-entrant, so a
   # join interrupted anywhere is completed by running this gate again
   # (round-40 CX-01), while a ledger that exists without a seal still means removal.
   write_review_seal
+  # The exchange participant (lowest-numbered COMPLETE) is recorded once at the join; the
+  # consultation and residual exchanges run on its session and its thread anchors them.
+  if [ -n "$EXCH" ] && [ ! -e "$ART/02-exchange-participant" ]; then printf '%s\n' "$EXCH" > "$ART/02-exchange-participant" || fail "could not record the exchange participant"; fi
+  # Completing an interrupted join (seal minted, its row missing) must leave the same ledger a
+  # single pass writes: the rows accepted after the seal are re-accepted after it (round-40 CX-01).
+  if [ -s "$LEDGER" ] && [ -z "$(ledger_row 02-review-seal.sha256)" ]; then
+    tmp=$(mktemp "$ART/.accepted.XXXXXX") || fail "could not allocate ledger scratch file"
+    awk '$2 != "00-schema" && $2 != "02-exchange-participant"' "$LEDGER" > "$tmp"
+    chmod 400 "$tmp" && mv -f "$tmp" "$LEDGER" || { rm -f "$tmp"; fail "could not install the accept ledger"; }
+  fi
   accept 00-repo.txt final
   accept 02-review-seal.sha256 final
+  accept 00-schema final
+  [ -z "$EXCH" ] || accept 02-exchange-participant final
   # seal= is the out-of-band pin of the join: 00-run.md records this line
   # verbatim, so a join re-minted over edited bodies (indistinguishable from a
   # never-joined directory by the files alone — round-41 CX-01/CL-Q1) shows as
   # a changed fingerprint against the run record.
-  echo "JOIN-OK lead=sealed codex=$ST codex_exit=$CX brief=$(cut -c1-12 "$ART/00-brief.md.sha256") scope=$(cut -c1-12 "$ART/00-scope.md.sha256") seal=$(sha "$ART/02-review-seal.sha256" | cut -c1-12)"
+  echo "JOIN-OK lead=sealed codex=$ST codex_exit=$CX participants=$PSTATUS exchange=${EXCH:-none}${EXCH:+ via=$(participant_field "$EXCH" backend)$([ "$(participant_field "$EXCH" backend)" = ccr ] && printf ':%s' "$(participant_field "$EXCH" alias)")} brief=$(cut -c1-12 "$ART/00-brief.md.sha256") scope=$(cut -c1-12 "$ART/00-scope.md.sha256") seal=$(sha "$ART/02-review-seal.sha256" | cut -c1-12)"
   ;;
 pre-consultation)
   phase_status 03-matrix.md 3
   # Phase 3 (reconciliation) has no SKIPPED form — it is always required.
   [ "$PST" = COMPLETE ] || fail "03-matrix.md was skipped; reconciliation is required"
-  codex_status; initial_packets; accepted_check; launch_records_check; live_claim_check; review_seal_check; codex_skip_check
+  schema_check; codex_status; initial_packets; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
   [ -e "$ART/02-review-seal.sha256" ] || fail "02-review-seal.sha256 missing: run pre-phase3 after the join"
   # Never authorize a Phase-4 launch while an earlier attempt may still be
   # alive (round-21 CX-01).
@@ -788,23 +922,25 @@ pre-consultation)
   # (round-39/40 CL-01): check before any draft is (re-)accepted.
   claim_in_flight_check 04-consultation 04-consultation.md
   validate_base_findings
+  validate_provenance
   candidates=$(selection_count) || fail "could not count selected findings"
-  # The selector and base packets are drafts until a Phase-4 artifact exists.
+  # The selector, base packets and provenance are drafts until a Phase-4 artifact exists.
   accept 03-matrix.tsv draft
   accept 03-matrix.md draft
   accept 03-debate-selection.tsv draft
   accept 03-findings.ndjson draft
+  accept 03-provenance.tsv draft
   if [ "$ST" = COMPLETE ]; then
     check_budget
     BUDGET=""
     if [ "$candidates" -gt 0 ]; then if budget_left; then claim_phase 04-consultation 04-consultation.md; else BUDGET=" budget=exhausted"; fi; fi
-    echo "CONSULTATION-OK codex=COMPLETE candidates=$candidates seal=$(sha "$ART/02-review-seal.sha256" | cut -c1-12)${CLAIM_TOKEN:+ claim=$CLAIM_TOKEN}$BUDGET"
+    echo "CONSULTATION-OK codex=COMPLETE exchange=$EXCH via=$(participant_field "$EXCH" backend)$([ "$(participant_field "$EXCH" backend)" = ccr ] && printf ':%s' "$(participant_field "$EXCH" alias)") candidates=$candidates seal=$(sha "$ART/02-review-seal.sha256" | cut -c1-12)${CLAIM_TOKEN:+ claim=$CLAIM_TOKEN}$BUDGET"
   else
     echo "CONSULTATION-OK codex=SKIPPED candidates=$candidates seal=$(sha "$ART/02-review-seal.sha256" | cut -c1-12)"
   fi
   ;;
 pre-verification)
-  codex_status; initial_packets; accepted_check; launch_records_check; live_claim_check; review_seal_check; codex_skip_check
+  schema_check; codex_status; initial_packets; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
   [ -n "$(ledger_row 03-debate-selection.tsv)" ] && [ -n "$(ledger_row 03-findings.ndjson)" ] || fail "03-debate-selection.tsv / 03-findings.ndjson are not accepted; run pre-consultation first"
   phase_status 04-consultation.md 4
   consultation=$PST
@@ -848,7 +984,7 @@ pre-verification)
   echo "VERIFICATION-OK consultation=$consultation codex=$ST attempts=$(( $(runner_count 04-consultation) + $(runner_count 06-resolution) )) responses=$(response_count)"
   ;;
 pre-resolution)
-  initial_packets; codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; codex_skip_check
+  schema_check; initial_packets; codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
   # Phase 4 must have reached a terminal state before Phase 5, and hence before
   # any Phase 6 launch (round-18 CX-04).
   phase_status 04-consultation.md 4
@@ -895,7 +1031,7 @@ pre-resolution)
   echo "RESOLUTION-OK codex=$ST residual=$residual attempts=$(( $(runner_count 04-consultation) + $(runner_count 06-resolution) )) responses=$(response_count)${CLAIM_TOKEN:+ claim=$CLAIM_TOKEN}${BUDGET:-}"
   ;;
 pre-report)
-  initial_packets; codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; codex_skip_check
+  schema_check; initial_packets; codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
   phase_status 04-consultation.md 4
   consultation=$PST
   # Both exchange phases, first: a SKIPPED consultation may still hide an
@@ -979,9 +1115,9 @@ post-join)
   [ -s "$ART/01-lead.md" ] || fail "01-lead.md missing or empty"
   [ -r "$ART/01-lead.md" ] || fail "01-lead.md is still sealed (mode $(mode "$ART/01-lead.md")); Phase 3 restores it to 600"
   [ "$(lastline "$ART/01-lead.md")" = "STATUS: PHASE 1 COMPLETE" ] || fail "01-lead.md does not end with STATUS: PHASE 1 COMPLETE"
-  codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; codex_skip_check
+  schema_check; codex_status; accepted_check; launch_records_check; live_claim_check; review_seal_check; exchange_drift_check; codex_skip_check
   # The snapshot tree must still resolve after Codex returns, or Phase-5 citations at the head cannot be verified (codex-protocol.md).
   if [ -s "$ART/00-brief.md.tree" ]; then git -C "$(repo_field repo)" cat-file -e "$(cat "$ART/00-brief.md.tree")^{tree}" 2>/dev/null || fail "snapshot tree $(cat "$ART/00-brief.md.tree") no longer resolves in $(repo_field repo); it was garbage-collected or the repository moved"; fi
-  echo "POST-JOIN-OK lead=complete codex=$ST brief=$(cut -c1-12 "$ART/00-brief.md.sha256") scope=$(cut -c1-12 "$ART/00-scope.md.sha256")"
+  echo "POST-JOIN-OK lead=complete codex=$ST participants=$PSTATUS brief=$(cut -c1-12 "$ART/00-brief.md.sha256") scope=$(cut -c1-12 "$ART/00-scope.md.sha256")"
   ;;
 esac

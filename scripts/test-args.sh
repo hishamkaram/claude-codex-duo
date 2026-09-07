@@ -20,7 +20,7 @@ FAIL=0
 # Tests of the invariant itself call "$PG" directly.
 top_up_claims() {
   local dir="$1" prefix f slots taken n d
-  for prefix in 02-codex 04-consultation 06-resolution; do
+  for prefix in $(cut -f1 "$dir/00-participants.tsv" 2>/dev/null | sed 's/^/02-/') 04-consultation 06-resolution; do
     slots=0; taken=0
     for f in "$dir/$prefix".meta "$dir/$prefix".exit "$dir/$prefix".progress "$dir/$prefix".attempt*.meta "$dir/$prefix".attempt*.exit "$dir/$prefix".attempt*.progress; do [ -e "$f" ] && printf '%s\n' "${f%.*}"; done > "$TMP/.slots"
     slots=$(sort -u "$TMP/.slots" | grep -c . || true)
@@ -31,7 +31,9 @@ top_up_claims() {
     done
   done
 }
-fixture_revs() {  # what build-brief.sh (.base/.head) and pre-codex (00-repo.txt) record in a real run
+fixture_revs() {  # what build-brief.sh (.base/.head), Phase 0 (00-participants.tsv) and pre-codex (00-repo.txt, 00-schema) record in a real run
+  [ -e "$1/00-participants.tsv" ] || printf 'p1\tcodex\t-\n' > "$1/00-participants.tsv"
+  [ -e "$1/00-schema" ] || printf 'codex-pr-review/4\n' > "$1/00-schema"
   [ -e "$1/00-brief.md.repo" ] || (cd "$G2" && pwd -P) > "$1/00-brief.md.repo"
   [ -e "$1/00-brief.md.base" ] || printf '%s\n' "$SHA2" > "$1/00-brief.md.base"
   [ -e "$1/00-brief.md.head" ] || printf '%s\n' "$SHA2" > "$1/00-brief.md.head"
@@ -42,8 +44,12 @@ mkbrief() {  # a brief whose Target section restates fixture_revs: the gate pins
 }
 # File mode, portable: GNU stat (-c) on Linux, BSD stat (-f) on macOS — the same detection phase-gate.sh uses.
 if stat --version >/dev/null 2>&1; then fmode() { stat -c %a "$1" 2>/dev/null; }; else fmode() { stat -f %Lp "$1" 2>/dev/null; }; fi
-pgw() { [ -d "${2:-}" ] && { top_up_claims "$2"; fixture_revs "$2"; }; bash "$PG" "$@"; }
-pgwg() { local g="$1"; shift; [ -d "${2:-}" ] && { top_up_claims "$2"; fixture_revs "$2"; }; PHASE_GATE_CLAIM_GRACE_SEC="$g" bash "$PG" "$@"; }
+fixture_prov() {  # what Phase 3 writes beside the matrix: one raiser row per origin, over the first participant
+  [ -e "$1/03-matrix.tsv" ] && [ ! -e "$1/03-provenance.tsv" ] || return 0
+  awk -F'\t' '$2=="BOTH"||$2=="CONFLICT"{printf "%s\tlead\tCL-%02d\n%s\tp1\tCX-%02d\n",$1,NR,$1,NR; next} $2=="CLAUDE-ONLY"{printf "%s\tlead\tCL-%02d\n",$1,NR; next} $2=="CODEX-ONLY"{printf "%s\tp1\tCX-%02d\n",$1,NR}' "$1/03-matrix.tsv" > "$1/03-provenance.tsv"
+}
+pgw() { [ -d "${2:-}" ] && { top_up_claims "$2"; fixture_revs "$2"; fixture_prov "$2"; }; bash "$PG" "$@"; }
+pgwg() { local g="$1"; shift; [ -d "${2:-}" ] && { top_up_claims "$2"; fixture_revs "$2"; fixture_prov "$2"; }; PHASE_GATE_CLAIM_GRACE_SEC="$g" bash "$PG" "$@"; }
 chk() {
   local n="$1" e="$2" sub="$3"; shift 3
   local out code; out=$("$@" 2>&1); code=$?
@@ -95,7 +101,7 @@ HOME="$TMP/nohome" bash "$R" "$PFX5" --prompt-file "$PROMPT" >/dev/null 2> "$TMP
 PFX6="$TMP/runner-race"; mkdir -p "$PFX6.claim"; printf 'pid=1\nat=now\ngate=pre-codex\n' > "$PFX6.claim/owner"
 HOME="$TMP/nohome" bash "$R" "$PFX6" --prompt-file "$PROMPT" >/dev/null 2>&1 & HOME="$TMP/nohome" bash "$R" "$PFX6" --prompt-file "$PROMPT" >/dev/null 2>&1 & wait
 # Round-32 debate: with --claim the runner writes nothing before it owns the claim.
-PFX7="$TMP/claimmode/02-codex"; mkdir -p "$TMP/claimmode"
+PFX7="$TMP/claimmode/02-p1"; mkdir -p "$TMP/claimmode"
 chk "claim mode: missing claim refused" 4 "does not exist" bash "$R" "$PFX7" --claim t1 --prompt-file "$PROMPT"
 [ -z "$(ls "$TMP/claimmode")" ] && printf '  ok    %-42s\n' "claim mode: nothing written without a claim" || { printf '  FAIL  claim mode: wrote %s\n' "$(ls "$TMP/claimmode")"; FAIL=1; }
 mkdir -p "$PFX7.claim"; printf 'pid=1\ntoken=t1\n' > "$PFX7.claim/owner"
@@ -112,7 +118,7 @@ printf 'pid=1\ntoken=tX1\n' > "$PFX7.claim/owner"
 chk "CL-03r39: token compared as a fixed string" 4 "does not carry token t.1" bash "$R" "$PFX7" --claim 't.1' --prompt-file "$PROMPT"
 printf 'pid=1\ntoken=t1\n' > "$PFX7.claim/owner"
 # L-02r37: a runner launched without --claim against a token-bearing claim still takes it (legacy path).
-PFX7L="$TMP/claimlegacy/02-codex"; mkdir -p "$PFX7L.claim"; printf 'pid=1\ntoken=t9\n' > "$PFX7L.claim/owner"
+PFX7L="$TMP/claimlegacy/02-p1"; mkdir -p "$PFX7L.claim"; printf 'pid=1\ntoken=t9\n' > "$PFX7L.claim/owner"
 HOME="$TMP/nohome" bash "$R" "$PFX7L" --prompt-file "$PROMPT" >/dev/null 2>&1
 [ -d "$PFX7L.claim/runner" ] && grep -q '^runner_pid=' "$PFX7L.claim/owner" && printf '  ok    %-42s\n' "L-02r37: legacy runner takes a token-bearing claim" || { printf '  FAIL  L-02r37: legacy runner did not take the claim\n'; FAIL=1; }
 # CX-03r38: the runner takes the claim under <prefix>.claim.lock; a stale lock is reclaimed, a held one refused.
@@ -128,7 +134,7 @@ chk "CL-01r42: unremovable stale lock exits 4, no hang" 4 "cannot be removed" ba
 rm -rf "$PFX7.claim.lock"
 # CX-01r39: the runner keeps the claim lock until the previous attempt's sidecars are rotated,
 # so a stale <prefix>.exit cannot let a concurrent gate rotate the live claim.
-PFX8="$TMP/claimrot/02-codex"; mkdir -p "$TMP/claimrot/bin" "$PFX8.claim"; printf 'pid=1\ntoken=t8\n' > "$PFX8.claim/owner"; printf '1\n' > "$PFX8.exit"; printf 'old\n' > "$PFX8.stdout"
+PFX8="$TMP/claimrot/02-p1"; mkdir -p "$TMP/claimrot/bin" "$PFX8.claim"; printf 'pid=1\ntoken=t8\n' > "$PFX8.claim/owner"; printf '1\n' > "$PFX8.exit"; printf 'old\n' > "$PFX8.stdout"
 printf '#!/bin/sh\ncase "$1" in *.exit) [ -d "%s.claim.lock" ] && : > "%s/lock-held";; esac\nexec /bin/mv "$@"\n' "$PFX8" "$TMP/claimrot" > "$TMP/claimrot/bin/mv"; chmod +x "$TMP/claimrot/bin/mv"
 PATH="$TMP/claimrot/bin:$PATH" HOME="$TMP/nohome" bash "$R" "$PFX8" --claim t8 --prompt-file "$PROMPT" >/dev/null 2>&1
 [ -e "$TMP/claimrot/lock-held" ] && [ -e "$PFX8.attempt1.exit" ] && [ ! -e "$PFX8.claim.lock" ] && printf '  ok    %-42s\n' "CX-01r39: lock held through sidecar rotation, then released" || { printf '  FAIL  CX-01r39: lock-held=%s rotated=%s lock-left=%s\n' "$([ -e "$TMP/claimrot/lock-held" ] && echo y || echo n)" "$([ -e "$PFX8.attempt1.exit" ] && echo y || echo n)" "$([ -e "$PFX8.claim.lock" ] && echo y || echo n)"; FAIL=1; }
@@ -171,6 +177,174 @@ for v in 08 09 007; do
 done
 chk "--poll-sec 0 rejected"        4 "between 1 and"  bash "$R" "$PFX" --poll-sec 0 --prompt-file "$PROMPT"
 chk "oversized --max-min rejected" 4 "between 1 and"  bash "$R" "$PFX" --max-min 12345678 --prompt-file "$PROMPT"
+
+echo "runner: ccr backend (hermetic fake ccr on PATH)"
+# The fake gateway: `version`, `model show <alias> --json`, `launch …`. Behaviour is chosen by
+# FAKE_CCR_MODE (ok|write|fail|noresult|sleep|grandchild); argv and stdin are recorded so a test
+# can assert the exact read-only launch line the runner is required to use.
+CCRBIN="$TMP/ccrbin"; mkdir -p "$CCRBIN"
+cat > "$CCRBIN/ccr" <<'FAKE'
+#!/bin/bash
+case "${1:-}" in
+  version) echo "ccr ${FAKE_CCR_VERSION:-0.4.11} (fake, test-args.sh)"; exit 0;;
+  model)
+    [ "${2:-}" = show ] || { echo "fake ccr: unsupported model subcommand" >&2; exit 2; }
+    [ -z "${FAKE_CCR_SHOW_FAIL:-}" ] || { echo "model alias not found: $3" >&2; exit 1; }
+    printf '{"alias":"%s","provider":"litellm","provider_model":"%s","claude_model_id":"anthropic.ccr.%s","compatibility":"degraded","schema_version":9,"effective_capabilities":{"values":{"supports_tools":%s,"supports_streaming":true}}}\n' "$3" "${FAKE_CCR_MODEL:-claude-haiku-4-5}" "$3" "${FAKE_CCR_TOOLS:-true}"; exit 0;;
+  launch)
+    shift
+    [ -z "${FAKE_CCR_ARGV_OUT:-}" ] || printf '%s\n' "$@" > "$FAKE_CCR_ARGV_OUT"
+    if [ "${FAKE_CCR_MODE:-}" = outside ]; then  # review round 2 F-06: write exactly where the smoke's step 3 points
+      OUTF=$(sed -n 's/.*echo hello > \(.*smoke-outside\.txt\).*/\1/p' | head -1); mkdir -p "$(dirname "$OUTF")"; echo hello > "$OUTF"
+    elif [ -n "${FAKE_CCR_STDIN_OUT:-}" ]; then cat > "$FAKE_CCR_STDIN_OUT"; else cat > /dev/null; fi
+    SID="${FAKE_CCR_SESSION:-sess-fake-0001}"; RES=""
+    PREV=""; for a in "$@"; do [ "$PREV" = "--resume" ] && RES="resume:$a"; PREV="$a"; done
+    case "$RES" in resume:*) [ -n "${FAKE_CCR_SESSION:-}" ] || SID="${RES#resume:}";; esac   # a resumed session keeps its session_id (verified live 2026-09-07)
+    printf '{"type":"system","subtype":"init","session_id":"%s","model":"anthropic.ccr.fake","tools":["Read","Grep","Glob","Bash"]}\n' "$SID"
+    case "${FAKE_CCR_MODE:-ok}" in
+      write) echo hello > smoke-write.txt;;
+      fail) printf '{"type":"assistant","message":{"content":[{"type":"text","text":"boom"}]}}\n'; echo "waiting for Claude Code: exit status 1" >&2; exit 1;;
+      noresult) printf '{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}\n'; exit 0;;
+      sleep) sleep 600; exit 0;;
+      grandchild) sleep 600 & sleep 600; exit 0;;
+    esac
+    printf '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}\n'
+    TEXT=$(printf '%s' "${FAKE_CCR_RESULT:-DONE $RES argv=$*}" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    printf '{"type":"result","subtype":"success","is_error":false,"result":"%s","session_id":"%s","num_turns":1}\n' "$TEXT" "$SID"; exit 0;;
+  *) echo "fake ccr: unknown command $1" >&2; exit 2;;
+esac
+FAKE
+chmod +x "$CCRBIN/ccr"
+CCRD="$TMP/ccrrun"; mkdir -p "$CCRD"; CP="$CCRD/02-p2"
+mkdir -p "$TMP/ccrerr"; sed 's/"subtype":"success","is_error":false/"subtype":"error_max_turns","is_error":true/' "$CCRBIN/ccr" > "$TMP/ccrerr/ccr"; chmod +x "$TMP/ccrerr/ccr"   # a fake whose result event is an error (review round 1: F-10)
+ccr_run() { PATH="$CCRBIN:$PATH" bash "$R" "$@"; }
+# T-1 / T-2: argument errors, exit 4 and .exit=4 on a claim-less prefix
+chk "T-1: --via without a value"          4 "requires a value"      bash "$R" "$CP" --via
+chk "T-1: --via bogus"                    4 "must be codex or ccr"  bash "$R" "$CP" --via bogus --prompt-file "$PROMPT"
+chk "T-1: --via ccr: (empty alias)"       4 "requires an alias"     bash "$R" "$CP" --via ccr: --prompt-file "$PROMPT"
+chk "T-1: alias with a shell character"   4 "letters, digits"       bash "$R" "$CP" --via 'ccr:a;b' --prompt-file "$PROMPT"
+[ "$(cat "$CP.exit" 2>/dev/null)" = 4 ] && printf '  ok    %-42s\n' "T-1: .exit records 4" || { printf '  FAIL  T-1: .exit missing\n'; FAIL=1; }
+chk "T-2: --max-turns with codex"         4 "ccr-only"              bash "$R" "$CP" --max-turns 5 --prompt-file "$PROMPT"
+chk "T-2: --resume-session with codex"    4 "ccr-only"              bash "$R" "$CP" --resume-session s1 --prompt-file "$PROMPT"
+chk "T-2: --resume-session + --resume-last" 4 "exclusive"           bash "$R" "$CP" --via ccr:x --resume-last --resume-session s1 --prompt-file "$PROMPT"
+chk "T-2: non-numeric --max-turns"        4 "whole number"          bash "$R" "$CP" --via ccr:x --max-turns abc --prompt-file "$PROMPT"
+rm -f "$CP".*
+# T-3: no ccr on PATH → LAUNCH-ERROR sidecars
+NOCCR="$TMP/noccr"; mkdir -p "$NOCCR"; ln -sf "$(command -v bash)" "$NOCCR/bash"; ln -sf "$(command -v python3)" "$NOCCR/python3"
+for t in dirname date sed grep head tr cat ls mv wc tail cut ps sleep mkdir rmdir stat shasum find git awk kill; do p=$(command -v $t 2>/dev/null) && ln -sf "$p" "$NOCCR/$t"; done
+out=$(PATH="$NOCCR" bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT" 2>&1); rc=$?
+[ "$rc" = 4 ] && grep -q 'ccr not found' "$CP.stderr" && grep -q '^outcome=LAUNCH-ERROR' "$CP.meta" && grep -q '^backend=ccr' "$CP.meta" && [ "$(cat "$CP.exit")" = 4 ] && printf '  ok    %-42s\n' "T-3: ccr missing → LAUNCH-ERROR sidecars" || { printf '  FAIL  T-3: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+rm -f "$CP".*
+# T-4 / T-5 / T-6: the probe — version gate, model show, happy path with JSON and the smoke record
+chk "T-4: ccr below minimum refused"      4 "requires ccr >= 0.4.11" env PATH="$CCRBIN:$PATH" FAKE_CCR_VERSION=0.4.10 bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT"
+chk "T-4: probe below minimum"            1 "PROBE UNAVAILABLE"     env PATH="$CCRBIN:$PATH" FAKE_CCR_VERSION=0.4.10 bash "$R" --probe --via ccr:x
+chk "T-5: model show failing"             1 "PROBE UNAVAILABLE"     env PATH="$CCRBIN:$PATH" FAKE_CCR_SHOW_FAIL=1 bash "$R" --probe --via ccr:x
+chk "T-5: supports_tools false"           1 "supports_tools=false"  env PATH="$CCRBIN:$PATH" FAKE_CCR_TOOLS=false bash "$R" --probe --via ccr:x
+chk "T-5: launch with supports_tools false" 4 "supports_tools=false" env PATH="$CCRBIN:$PATH" FAKE_CCR_TOOLS=false bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT"
+chk "probe: codex label carries backend"  1 "backend=codex\|PROBE"  env HOME="$TMP/nohome" bash "$R" --probe
+chk "probe: bad --via"                    1 "must be codex or ccr"  bash "$R" --probe --via bogus
+rm -f "$CP".*
+# T-5b: the smoke — a fake that writes a file ⇒ readonly=violated, nothing recorded
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=write bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'readonly=violated' && printf '%s' "$out" | grep -q 'smoke-write.txt' && [ ! -e "$CCRD/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "T-5b: writing smoke → readonly=violated, no record" || { printf '  FAIL  T-5b: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=fail bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'smoke launch exited 1' && [ ! -e "$CCRD/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "T-5b: failing smoke launch → UNAVAILABLE" || { printf '  FAIL  T-5b(fail): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+# T-5c: launch gate — no record ⇒ exit 4 and nothing launched
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv-none" bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT" 2>&1); rc=$?
+[ "$rc" = 4 ] && grep -q 'ccr smoke missing for x' "$CP.stderr" && [ ! -e "$TMP/argv-none" ] && printf '  ok    %-42s\n' "T-5c: launch without a smoke record refused" || { printf '  FAIL  T-5c: rc=%s stderr=%s\n' "$rc" "$(head -2 "$CP.stderr" 2>/dev/null | tr '\n' ' ')"; FAIL=1; }
+rm -f "$CP".*
+# T-6: probe happy path records the smoke and prints the JSON
+out=$(PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q '^PROBE SUCCEEDED backend=ccr alias=x provider=litellm model=claude-haiku-4-5 compatibility=degraded tools=true readonly=verified ccr=0.4.11' && printf '%s' "$out" | grep -q '"schema_version"' && grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" && grep -qx 'ccr=0.4.11' "$CCRD/.ccr-smoke.x" && grep -q '^launch_sha256=' "$CCRD/.ccr-smoke.x" && printf '  ok    %-42s\n' "T-6: probe SUCCEEDED + JSON + smoke record" || { printf '  FAIL  T-6: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+# T-5c (continued): a record for another version or a violated record refuses the launch
+printf 'alias=x\nccr=0.4.10\nmodel=claude-haiku-4-5\nreadonly=verified\nlaunch_sha256=%s\n' "$(grep '^launch_sha256=' "$CCRD/.ccr-smoke.x" | cut -d= -f2)" > "$CCRD/.ccr-smoke.y"
+chk "T-5c: record from another ccr version" 4 "another ccr version" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-py" --via ccr:y --prompt-file "$PROMPT"
+sed 's/^readonly=verified/readonly=violated/' "$CCRD/.ccr-smoke.x" > "$CCRD/.ccr-smoke.z"
+chk "T-5c: violated record"               4 "not 'readonly=verified'" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-pz" --via ccr:z --prompt-file "$PROMPT"
+# review round 1 F-02: the deep-plan layout — record beside the round prefixes ($ART/debate) and launch there
+mkdir -p "$CCRD/dp/debate"; PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/dp/debate" >/dev/null 2>&1
+chk "F-02: deep-plan prefix launches with its own record" 0 "COMPLETED" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/dp/debate/r0-codex" --via ccr:x --fresh --prompt-file "$PROMPT" --poll-sec 1
+grep -q -- '--record-dir "$ART/debate"' plugins/codex-deep-plan/skills/deep-plan-duo/references/codex-invocation.md && grep -q -- '--record-dir "$ART/debate"' plugins/codex-deep-plan/skills/deep-plan-duo/SKILL.md && printf '  ok    %-42s\n' "F-02: deep-plan documents --record-dir \$ART/debate" || { printf '  FAIL  F-02: deep-plan docs still record the smoke in $ART\n'; FAIL=1; }
+# review round 1 F-05: the probe validates the alias and the record directory before the smoke, and fails on a write error
+chk "F-05: probe refuses an alias with a slash" 1 "alias may contain only" env PATH="$CCRBIN:$PATH" bash "$R" --probe --via 'ccr:a/b' --record-dir "$CCRD"
+[ ! -e "$CCRD/.ccr-smoke.a" ] && [ ! -d "$CCRD/.ccr-smoke.a" ] && printf '  ok    %-42s\n' "F-05: nothing recorded for a bad alias" || { printf '  FAIL  F-05: a record was written for a/b\n'; FAIL=1; }
+mkdir -p "$CCRD/ro"; chmod 500 "$CCRD/ro"
+if [ "$(id -u)" != 0 ]; then
+  out=$(PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/ro" 2>&1); rc=$?
+  [ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'not writable' && ! printf '%s' "$out" | grep -q 'recorded=' && printf '  ok    %-42s\n' "F-05: read-only record dir → UNAVAILABLE, no recorded=" || { printf '  FAIL  F-05(ro): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+fi
+chmod 700 "$CCRD/ro"
+chk "F-05: --record-dir that is not a directory" 1 "is not a directory" env PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/nonexistent"
+# review round 1 F-04: a smoke that never returns is killed as a group and reported UNAVAILABLE within the bound
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=grandchild CODEX_RUN_SMOKE_MAX_SEC=3 bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
+SPG=$(printf '%s' "$out" | sed -n 's/.*smoke timed out after 3s (process group \([0-9][0-9]*\) terminated).*/\1/p' | head -1)
+[ "$rc" = 1 ] && [ -n "$SPG" ] && ! kill -0 -- "-$SPG" 2>/dev/null && [ -z "$(pgrep -g "$SPG" 2>/dev/null)" ] && printf '  ok    %-42s\n' "F-04: hung smoke → UNAVAILABLE, group killed" || { printf '  FAIL  F-04: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; [ -n "$SPG" ] && pkill -g "$SPG" 2>/dev/null; FAIL=1; }
+grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" && printf '  ok    %-42s\n' "F-04: the earlier record survives a failed re-probe" || { printf '  FAIL  F-04: record clobbered\n'; FAIL=1; }
+# review round 2 F-03: the smoke bound must be a positive whole number, or the probe refuses before launching anything
+chk "F-03: CODEX_RUN_SMOKE_MAX_SEC=abc → UNAVAILABLE" 1 "positive whole number" env PATH="$CCRBIN:$PATH" CODEX_RUN_SMOKE_MAX_SEC=abc bash "$R" --probe --via ccr:x --record-dir "$CCRD"
+chk "F-03: CODEX_RUN_SMOKE_MAX_SEC=0 → UNAVAILABLE" 1 "positive whole number" env PATH="$CCRBIN:$PATH" CODEX_RUN_SMOKE_MAX_SEC=0 bash "$R" --probe --via ccr:x --record-dir "$CCRD"
+chk "F-02: CODEX_RUN_SMOKE_MAX_SEC oversized → UNAVAILABLE" 1 "at most 9 digits" env PATH="$CCRBIN:$PATH" CODEX_RUN_SMOKE_MAX_SEC=999999999999 bash "$R" --probe --via ccr:x --record-dir "$CCRD"
+grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" || { printf '  FAIL  F-03: record clobbered\n'; FAIL=1; }
+# review round 2 F-06: a session that writes OUTSIDE the smoke repository (step 3 of the prompt) is readonly=violated, no record
+mkdir -p "$CCRD/outside"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=outside bash "$R" --probe --via ccr:x --record-dir "$CCRD/outside" 2>&1); rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'readonly=violated' && printf '%s' "$out" | grep -q 'smoke-outside.txt' && [ ! -e "$CCRD/outside/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "F-06: write outside the smoke repo → violated" || { printf '  FAIL  F-06: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | tail -1)"; FAIL=1; }
+# F-10 (probe): a smoke whose result event is an error is not readonly=verified
+out=$(PATH="$TMP/ccrerr:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/dp" 2>&1); rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'smoke result is an error event (error_max_turns' && [ ! -e "$CCRD/dp/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "F-10: error result in the smoke → UNAVAILABLE" || { printf '  FAIL  F-10(probe): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+rm -f "$CCRD/02-py".* "$CCRD/02-pz".* "$CCRD/.ccr-smoke.y" "$CCRD/.ccr-smoke.z"
+# T-7: happy path — exact argv, stdin = prompt, sidecars, thread = session id, last-session file
+printf 'review this\n' > "$CCRD/prompt.md"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv7" FAKE_CCR_STDIN_OUT="$TMP/stdin7" FAKE_CCR_SESSION=sess-7 bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+WANT_ARGV="$(printf '%s\n' --model x --permission-mode plan -p --no-lifecycle --no-statusline -- --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --disallowedTools Write,Edit,MultiEdit,NotebookEdit,Agent --max-turns 100)"
+[ "$rc" = 0 ] && [ "$(cat "$TMP/argv7")" = "$WANT_ARGV" ] && cmp -s "$TMP/stdin7" "$CCRD/prompt.md" && [ "$(cat "$CP.exit")" = 0 ] && grep -q '^outcome=COMPLETED' "$CP.meta" && grep -q '^backend=ccr' "$CP.meta" && grep -q '^thread=sess-7' "$CP.meta" && grep -q '^alias=x' "$CP.meta" && grep -q '^provider=litellm' "$CP.meta" && grep -q '^pgid=[0-9]' "$CP.meta" && grep -q '"type":"result"' "$CP.joblog" && grep -q '^DONE ' "$CP.stdout" && [ "$(cat "$CCRD/.ccr-last-session")" = sess-7 ] && grep -q 'launched backend=ccr pid=[0-9]* pgid=[0-9]* alias=x' "$CP.progress" && printf '  ok    %-42s\n' "T-7: ccr happy path, exact argv, sidecars" || { printf '  FAIL  T-7: rc=%s out=%s argv=%s\n' "$rc" "$(printf '%s' "$out" | head -1)" "$(tr '\n' ' ' < "$TMP/argv7" 2>/dev/null)"; FAIL=1; }
+# T-8: resume semantics
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8" bash "$R" "$CP" --via ccr:x --resume-last --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 0 ] && grep -qx -- '--resume' "$TMP/argv8" && grep -qx 'sess-7' "$TMP/argv8" && grep -q 'resume:sess-7' "$CP.stdout" && [ -e "$CP.attempt1.meta" ] && printf '  ok    %-42s\n' "T-8: --resume-last passes --resume <last session>" || { printf '  FAIL  T-8(resume-last): rc=%s\n' "$rc"; FAIL=1; }
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8b" bash "$R" "$CP" --via ccr:x --resume-session s2 --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 0 ] && grep -qx 's2' "$TMP/argv8b" && grep -q 'resume:s2' "$CP.stdout" && printf '  ok    %-42s\n' "T-8: --resume-session passes --resume <id>" || { printf '  FAIL  T-8(resume-session): rc=%s\n' "$rc"; FAIL=1; }
+# review round 1 F-01: an explicit resume is its own mode, recorded for the gates
+grep -qx 'mode=--resume-session' "$CP.meta" && grep -qx 'resume_session=s2' "$CP.meta" && grep -qx 'thread=s2' "$CP.meta" && printf '  ok    %-42s\n' "F-01: --resume-session recorded as mode" || { printf '  FAIL  F-01: mode line %s\n' "$(grep '^mode=' "$CP.meta")"; FAIL=1; }
+chk "F-01: --resume-session with --resume-last refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-session s2 --resume-last --prompt-file "$CCRD/prompt.md"
+chk "F-01: --resume-last then --resume-session refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-last --resume-session s2 --prompt-file "$CCRD/prompt.md"
+# review round 2 F-09: --fresh is exclusive with either resume mode, whichever comes first
+chk "F-09: --fresh then --resume-session refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --fresh --resume-session s2 --prompt-file "$CCRD/prompt.md"
+chk "F-09: --resume-session then --fresh refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-session s2 --fresh --prompt-file "$CCRD/prompt.md"
+chk "F-09: --fresh then --resume-last refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --fresh --resume-last --prompt-file "$CCRD/prompt.md"
+chk "F-09: --resume-last then --fresh refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-last --fresh --prompt-file "$CCRD/prompt.md"
+[ ! -e "$CCRD/02-px.meta" ] && printf '  ok    %-42s\n' "F-09: refused launches write no sidecar" || { printf '  FAIL  F-09: sidecar written\n'; FAIL=1; }
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8c" bash "$R" "$CP" --via ccr:x --fresh --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 0 ] && ! grep -qx -- '--resume' "$TMP/argv8c" && printf '  ok    %-42s\n' "T-8: --fresh passes no --resume" || { printf '  FAIL  T-8(fresh): rc=%s\n' "$rc"; FAIL=1; }
+mkdir -p "$CCRD/nolast"; cp "$CCRD/.ccr-smoke.x" "$CCRD/nolast/"
+chk "T-8: --resume-last without a session" 4 "no previous ccr session" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/nolast/02-p1" --via ccr:x --resume-last --prompt-file "$CCRD/prompt.md"
+# review round 1 F-10: a result event that is an error (is_error / non-success subtype) with child exit 0 is FAILED
+out=$(PATH="$TMP/ccrerr:$PATH" bash "$R" "$CCRD/02-perr" --via ccr:x --fresh --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 1 ] && grep -qx 'outcome=FAILED' "$CCRD/02-perr.meta" && grep -q '^result_event=error_max_turns is_error=True' "$CCRD/02-perr.meta" && printf '  ok    %-42s\n' "F-10: error result event with exit 0 → FAILED" || { printf '  FAIL  F-10: rc=%s meta=%s\n' "$rc" "$(grep -E '^(outcome|result_event)=' "$CCRD/02-perr.meta" | tr '\n' ' ')"; FAIL=1; }
+# T-9: child failure and missing result event
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=fail bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 1 ] && [ "$(cat "$CP.exit")" = 1 ] && grep -q '^outcome=FAILED' "$CP.meta" && grep -q '^child_exit=1' "$CP.meta" && printf '  ok    %-42s\n' "T-9: child exit 1 → FAILED" || { printf '  FAIL  T-9(fail): rc=%s\n' "$rc"; FAIL=1; }
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=noresult bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 1 ] && grep -q '^outcome=FAILED' "$CP.meta" && grep -q '^child_exit=0' "$CP.meta" && printf '  ok    %-42s\n' "T-9: exit 0 without a result event → FAILED" || { printf '  FAIL  T-9(noresult): rc=%s\n' "$rc"; FAIL=1; }
+# T-10 / T-10b: stall kills the group (a grandchild too) and exits 2 only after the group is gone; timeout exits 3
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=grandchild bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 1 --poll-sec 5 --max-min 5 2>&1); rc=$?
+PG=$(awk -F= '$1=="pgid"{print $2}' "$CP.meta")
+[ "$rc" = 2 ] && [ "$(cat "$CP.exit")" = 2 ] && grep -q '^outcome=STALLED' "$CP.meta" && grep -q 'terminated (confirmed: no member left)' "$CP.progress" && [ -n "$PG" ] && ! kill -0 -- "-$PG" 2>/dev/null && printf '  ok    %-42s\n' "T-10b: stall → group (with grandchild) killed, exit 2" || { printf '  FAIL  T-10b: rc=%s pgid=%s\n' "$rc" "$PG"; pkill -g "$PG" 2>/dev/null; FAIL=1; }
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=sleep bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 5 --poll-sec 5 --max-min 1 2>&1); rc=$?
+PG=$(awk -F= '$1=="pgid"{print $2}' "$CP.meta")
+[ "$rc" = 3 ] && grep -q '^outcome=TIMEOUT' "$CP.meta" && grep -q '^cancel_confirmed=yes' "$CP.meta" && printf '  ok    %-42s\n' "T-10: timeout → exit 3, cancel confirmed" || { printf '  FAIL  T-10(timeout): rc=%s\n' "$rc"; pkill -g "$PG" 2>/dev/null; FAIL=1; }
+# T-10: exit 5 — the process group cannot be read (stub ps), so the child is killed and nothing is retried
+PSBIN="$TMP/psbin"; mkdir -p "$PSBIN"; printf '#!/bin/sh\necho ""\n' > "$PSBIN/ps"; chmod +x "$PSBIN/ps"
+out=$(PATH="$PSBIN:$CCRBIN:$PATH" FAKE_CCR_MODE=sleep bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 5 ] && [ "$(cat "$CP.exit")" = 5 ] && grep -q '^pgid=unknown' "$CP.meta" && grep -q '^cancel_confirmed=no' "$CP.meta" && printf '  ok    %-42s\n' "T-10: unreadable pgid → child killed, exit 5" || { printf '  FAIL  T-10(exit5): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+# T-11: claim mode with the ccr backend — the existing claim rules apply unchanged
+CPC="$CCRD/claim/02-p1"; mkdir -p "$CCRD/claim"; cp "$CCRD/.ccr-smoke.x" "$CCRD/claim/"
+chk "T-11: claim mode, missing claim"     4 "does not exist"        env PATH="$CCRBIN:$PATH" bash "$R" "$CPC" --via ccr:x --claim t1 --prompt-file "$CCRD/prompt.md"
+[ -z "$(ls "$CCRD/claim" | grep -v '^\.ccr-smoke')" ] && printf '  ok    %-42s\n' "T-11: nothing written without a claim" || { printf '  FAIL  T-11: wrote %s\n' "$(ls "$CCRD/claim")"; FAIL=1; }
+mkdir -p "$CPC.claim"; printf 'pid=1\ntoken=t1\n' > "$CPC.claim/owner"
+chk "T-11: token mismatch refused"        4 "does not carry token t2" env PATH="$CCRBIN:$PATH" bash "$R" "$CPC" --via ccr:x --claim t2 --prompt-file "$CCRD/prompt.md"
+out=$(PATH="$CCRBIN:$PATH" bash "$R" "$CPC" --via ccr:x --claim t1 --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 0 ] && [ -d "$CPC.claim/runner" ] && grep -q '^runner_pid=' "$CPC.claim/owner" && printf '  ok    %-42s\n' "T-11: claim taken, ccr launch completed" || { printf '  FAIL  T-11(taken): rc=%s\n' "$rc"; FAIL=1; }
+chk "T-11: taken claim refused"           4 "already taken"         env PATH="$CCRBIN:$PATH" bash "$R" "$CPC" --via ccr:x --claim t1 --prompt-file "$CCRD/prompt.md"
 
 echo "builder: the file-list parser survives awkward filenames"
 # X-09 / X-10: a git path is bytes and may contain a newline; one changed file
@@ -230,6 +404,80 @@ out=$(bash "$I" --parse-only --pr "#12" 2>&1)
 printf '%s' "$out" | grep -q '"number": 12' && printf '  ok    %-42s\n' "#N parsed as a number" || { printf '  FAIL  pr parse: %s\n' "$out"; FAIL=1; }
 G2="$TMP/repo2"; mkdir -p "$G2"; ( cd "$G2" && git init -q && git config user.email t@t && git config user.name t && printf 'line one\nline two\nline three\n' > f.txt && printf 'FROM python\n' > Dockerfile && git add f.txt Dockerfile && git commit -qm init ) || { echo "  FAIL  fixture2"; FAIL=1; }
 SHA2=$(git -C "$G2" rev-parse HEAD)
+echo "implementer: write mode lives only in implement-run.sh (T-13..T-15)"
+IM=plugins/codex-deep-plan/scripts/implement-run.sh
+IMD="$TMP/impl"; mkdir -p "$IMD"; IP="$IMD/implement"
+chk "T-13: --via codex refused"            4 "write mode is ccr-only" bash "$IM" "$IP" --via codex --repo "$G2" --base "$SHA2" --branch impl/x --plan "$PROMPT"
+chk "T-13: --via missing"                  4 "ccr-only"               bash "$IM" "$IP" --repo "$G2" --base "$SHA2" --branch impl/x --plan "$PROMPT"
+chk "T-13: --plan missing"                 4 "--plan is required"     bash "$IM" "$IP" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/x
+chk "T-13: --branch missing"               4 "--branch is required"   bash "$IM" "$IP" --via ccr:x --repo "$G2" --base "$SHA2" --plan "$PROMPT"
+chk "T-13: --repo missing"                 4 "--repo is required"     bash "$IM" "$IP" --via ccr:x --base "$SHA2" --branch impl/x --plan "$PROMPT"
+chk "T-13: --base missing"                 4 "--base is required"     bash "$IM" "$IP" --via ccr:x --repo "$G2" --branch impl/x --plan "$PROMPT"
+chk "T-13: bad base"                       4 "does not name a commit" bash "$IM" "$IP" --via ccr:x --repo "$G2" --base deadbeef --branch impl/x --plan "$PROMPT"
+chk "T-13: unsafe branch name"             4 "not a safe branch"      bash "$IM" "$IP" --via ccr:x --repo "$G2" --base "$SHA2" --branch 'a..b' --plan "$PROMPT"
+chk "T-13: unknown arg"                    4 "unknown arg"            bash "$IM" "$IP" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/x --plan "$PROMPT" --write
+chk "T-13: no arguments"                   4 "out-prefix"             bash "$IM"
+[ -z "$(git -C "$G2" worktree list | grep -c impl 2>/dev/null | grep -v '^0$')" ] && printf '  ok    %-42s\n' "T-13: argument errors create no worktree" || { printf '  FAIL  T-13: a worktree was created\n'; FAIL=1; }
+# T-14: happy path — worktree on the branch at base, acceptEdits argv, cwd = worktree, sidecars
+printf '# PLAN\nAdd hello.txt containing hello and commit it.\n' > "$IMD/PLAN.md"
+cat > "$CCRBIN/ccr-impl-hook.sh" <<'HOOK'
+# executed by the fake ccr in "implement" mode: behave like an implementer inside cwd
+printf 'hello\n' > hello.txt; git add hello.txt >/dev/null 2>&1; git -c user.email=t@t -c user.name=t commit -qm "add hello" >/dev/null 2>&1
+HOOK
+python3 - "$CCRBIN/ccr" <<'PY'
+import sys; p=sys.argv[1]; s=open(p).read()
+s=s.replace('      write) echo hello > smoke-write.txt;;','      write) echo hello > smoke-write.txt;;\n      implement) pwd > "${FAKE_CCR_CWD_OUT:-/dev/null}"; . "$(dirname "$0")/ccr-impl-hook.sh";;')
+open(p,"w").write(s)
+PY
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=implement FAKE_CCR_ARGV_OUT="$TMP/argv14" FAKE_CCR_STDIN_OUT="$TMP/stdin14" FAKE_CCR_CWD_OUT="$TMP/cwd14" FAKE_CCR_RESULT="implemented" bash "$IM" "$IP" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/hello --plan "$IMD/PLAN.md" --test-cmd "true" --poll-sec 1 2>&1); rc=$?
+WT=$(cat "$IP.worktree" 2>/dev/null)
+[ "$rc" = 0 ] && grep -qx -- '--permission-mode' "$TMP/argv14" && grep -qx 'acceptEdits' "$TMP/argv14" && ! grep -qx 'plan' "$TMP/argv14" && grep -qx -- '--max-turns' "$TMP/argv14" && [ "$(cat "$TMP/cwd14")" = "$WT" ] && [ -d "$WT/.git" -o -f "$WT/.git" ] && [ "$(git -C "$WT" rev-parse --abbrev-ref HEAD)" = impl/hello ] && grep -q 'Add hello.txt' "$TMP/stdin14" && grep -q '^outcome=COMPLETED' "$IP.meta" && grep -q '^branch=impl/hello' "$IP.meta" && grep -q '^commits=1' "$IP.meta" && grep -q 'hello.txt' "$IP.diff" && [ "$(cat "$IP.plan.sha256")" = "$(shasum -a 256 "$IP.brief.md" | cut -d' ' -f1)" ] && [ "$(cat "$IP.exit")" = 0 ] && grep -q 'implemented' "$IP.stdout" && printf '  ok    %-42s\n' "T-14: implementer happy path" || { printf '  FAIL  T-14: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+[ "$(git -C "$G2" rev-parse --abbrev-ref HEAD)" != impl/hello ] && [ -z "$(git -C "$G2" status --porcelain)" ] && printf '  ok    %-42s\n' "T-14: the user's checkout is untouched" || { printf '  FAIL  T-14: user checkout changed\n'; FAIL=1; }
+# review round 1 F-17: the launcher pre-allows git and the test commands, and commits what the child left uncommitted
+grep -qxF -- '--allowedTools' "$TMP/argv14" && grep -qxF 'Bash(git commit:*)' "$TMP/argv14" && grep -qxF 'Bash(git add:*)' "$TMP/argv14" && printf '  ok    %-42s\n' "F-17: git add/commit pre-allowed for the child" || { printf '  FAIL  F-17: allowedTools missing from argv\n'; FAIL=1; }
+cat > "$CCRBIN/ccr-impl-hook.sh" <<'HOOK'
+# an implementer that edits but cannot commit (headless git denied): leaves the work in the tree
+printf 'left\n' > left.txt
+HOOK
+IPU="$IMD/uncommitted/implement"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=implement FAKE_CCR_ARGV_OUT="$TMP/argv17" FAKE_CCR_RESULT="edited, could not commit" bash "$IM" "$IPU" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/left --plan "$IMD/PLAN.md" --test-cmd "bash scripts/test.sh" --test-cmd "python3 -m pytest" --poll-sec 1 2>&1); rc=$?
+WTU=$(cat "$IPU.worktree" 2>/dev/null)
+[ "$rc" = 0 ] && grep -qxF 'Bash(bash scripts/test.sh)' "$TMP/argv17" && grep -qxF 'Bash(bash scripts/test.sh:*)' "$TMP/argv17" && grep -qxF 'Bash(python3 -m pytest:*)' "$TMP/argv17" && ! grep -qxF 'Bash(bash:*)' "$TMP/argv17" && ! grep -qxF 'Bash(python3:*)' "$TMP/argv17" && grep -q '^commits=1' "$IPU.meta" && grep -q '^launcher_committed_paths=1' "$IPU.meta" && grep -q '^uncommitted_paths=0' "$IPU.meta" && grep -q 'left.txt' "$IPU.diff" && git -C "$WTU" log -1 --format=%s | grep -q 'implement: uncommitted work' && printf '  ok    %-42s\n' "F-17: launcher commits uncommitted work; test cmds allowed" || { printf '  FAIL  F-17: rc=%s meta=%s\n' "$rc" "$(grep -E '^(commits|launcher_committed_paths|uncommitted_paths)=' "$IPU.meta" | tr '\n' ' ')"; FAIL=1; }
+# review round 2 F-01: when the repository's hook rejects the launcher's recovery commit, the run is FAILED
+# (exit 1, launcher_commit=failed) and the diff still shows the work the branch lacks
+mkdir -p "$G2/.git/hooks"; printf '#!/bin/sh\necho "pre-commit: rejected" >&2\nexit 1\n' > "$G2/.git/hooks/pre-commit"; chmod +x "$G2/.git/hooks/pre-commit"
+IPH="$IMD/hooked/implement"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=implement FAKE_CCR_RESULT="edited, could not commit" bash "$IM" "$IPH" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/hooked --plan "$IMD/PLAN.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 1 ] && [ "$(cat "$IPH.exit")" = 1 ] && grep -qx 'outcome=FAILED' "$IPH.meta" && grep -qx 'launcher_commit=failed' "$IPH.meta" && grep -qx 'launcher_committed_paths=0' "$IPH.meta" && grep -qx 'uncommitted_paths=1' "$IPH.meta" && grep -qx 'commits=0' "$IPH.meta" && grep -q 'left.txt' "$IPH.diff" && grep -q 'could not commit 1 uncommitted path' "$IPH.progress" && printf '  ok    %-42s\n' "F-01: hook-rejected recovery commit → FAILED, diff kept" || { printf '  FAIL  F-01(hook): rc=%s meta=%s\n' "$rc" "$(grep -E '^(outcome|launcher_commit|commits|uncommitted_paths)=' "$IPH.meta" 2>/dev/null | tr '\n' ' ')"; FAIL=1; }
+rm -f "$G2/.git/hooks/pre-commit"
+grep -qx 'launcher_commit=ok' "$IPU.meta" && printf '  ok    %-42s\n' "F-01: a successful recovery commit records launcher_commit=ok" || { printf '  FAIL  F-01(ok): %s\n' "$(grep '^launcher_commit=' "$IPU.meta")"; FAIL=1; }
+cat > "$CCRBIN/ccr-impl-hook.sh" <<'HOOK'
+# executed by the fake ccr in "implement" mode: behave like an implementer inside cwd
+printf 'hello\n' > hello.txt; git add hello.txt >/dev/null 2>&1; git -c user.email=t@t -c user.name=t commit -qm "add hello" >/dev/null 2>&1
+HOOK
+# review round 2 F-02: a --test-cmd is pre-allowed as the whole command (leading NAME=value words dropped),
+# never as its interpreter; one with shell metacharacters is refused with a warning and no rule
+IPT="$IMD/testcmds/implement"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=implement FAKE_CCR_ARGV_OUT="$TMP/argv2f" bash "$IM" "$IPT" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/testcmds --plan "$IMD/PLAN.md" --test-cmd "CI=1 npm test" --test-cmd "npm test && echo ok" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 0 ] && grep -qxF 'Bash(npm test)' "$TMP/argv2f" && grep -qxF 'Bash(npm test:*)' "$TMP/argv2f" && ! grep -qF 'CI=1' "$TMP/argv2f" && ! grep -qF 'echo ok' "$TMP/argv2f" && ! grep -qxF 'Bash(npm:*)' "$TMP/argv2f" && printf '%s' "$out" | grep -q "npm test && echo ok' cannot be pre-allowed" && printf '  ok    %-42s\n' "F-02: whole-command rules; metacharacters refused" || { printf '  FAIL  F-02: rc=%s argv=%s\n' "$rc" "$(grep 'Bash(' "$TMP/argv2f" 2>/dev/null | tr '\n' ' ')"; FAIL=1; }
+# review round 2 F-05: the implementer's own result parser treats an error result event (child exit 0) as FAILED
+IPE="$IMD/errresult/implement"
+out=$(PATH="$TMP/ccrerr:$PATH" bash "$IM" "$IPE" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/errresult --plan "$IMD/PLAN.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 1 ] && [ "$(cat "$IPE.exit")" = 1 ] && grep -qx 'outcome=FAILED' "$IPE.meta" && grep -qx 'child_exit=0' "$IPE.meta" && grep -q '^result_event=error_max_turns is_error=True' "$IPE.meta" && printf '  ok    %-42s\n' "F-05: implementer error result event → FAILED" || { printf '  FAIL  F-05: rc=%s meta=%s\n' "$rc" "$(grep -E '^(outcome|result_event)=' "$IPE.meta" 2>/dev/null | tr '\n' ' ')"; FAIL=1; }
+chk "T-14: existing worktree refused"      4 "worktree path already exists" bash "$IM" "$IP" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/other --plan "$IMD/PLAN.md"
+IP2="$IMD/second/implement"
+chk "T-14: existing branch refused"        4 "branch already exists"  env PATH="$CCRBIN:$PATH" bash "$IM" "$IP2" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/hello --plan "$IMD/PLAN.md"
+# T-15: child failure → 1; stall → 2; the worktree is never auto-removed
+IP3="$IMD/third/implement"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=fail bash "$IM" "$IP3" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/fail --plan "$IMD/PLAN.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 1 ] && grep -q '^outcome=FAILED' "$IP3.meta" && [ -d "$(cat "$IP3.worktree")" ] && printf '  ok    %-42s\n' "T-15: child failure → exit 1, worktree kept" || { printf '  FAIL  T-15(fail): rc=%s\n' "$rc"; FAIL=1; }
+IP4="$IMD/fourth/implement"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=sleep bash "$IM" "$IP4" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/stall --plan "$IMD/PLAN.md" --stall-min 1 --poll-sec 5 --max-min 5 2>&1); rc=$?
+PG=$(awk -F= '$1=="pgid"{print $2}' "$IP4.meta")
+[ "$rc" = 2 ] && grep -q '^outcome=STALLED' "$IP4.meta" && [ -n "$PG" ] && ! kill -0 -- "-$PG" 2>/dev/null && [ -d "$(cat "$IP4.worktree")" ] && printf '  ok    %-42s\n' "T-15: stall → exit 2, group killed, worktree kept" || { printf '  FAIL  T-15(stall): rc=%s\n' "$rc"; pkill -g "$PG" 2>/dev/null; FAIL=1; }
+for b in impl/hello impl/fail impl/stall; do w=$(git -C "$G2" worktree list | awk -v b="[$b]" '$3==b{print $1}'); [ -n "$w" ] && git -C "$G2" worktree remove --force "$w" >/dev/null 2>&1; git -C "$G2" branch -D "$b" >/dev/null 2>&1; done
+
+
 printf 'The export endpoint should be rate limited.\n' > "$TMP/req.txt"
 A="$TMP/art1"
 out=$(bash "$I" --repo "$G2" --out "$A" --request "make it fast" --request-file "$TMP/req.txt" 2>&1); code=$?
@@ -258,6 +506,10 @@ chk "init: non-numeric comment fragment" 2 "must be #issuecomment"  bash "$I" --
 # F-16: free text may begin with a dash
 bash "$I" --repo "$G2" --out "$TMP/art16" --request "-v is ignored" >/dev/null 2>&1 && grep -q '^-v is ignored$' "$TMP/art16/inputs/request-1.md" \
   && printf '  ok    %-42s\n' "request text may start with a dash" || { printf '  FAIL  dash-leading request rejected\n'; FAIL=1; }
+# review round 1 F-14: an explicit slug is normalised like a derived one (it names the run dir and the plan/<slug> branch)
+bash "$I" --repo "$G2" --out "$TMP/artslug" --slug "Fix Login!" --request x >/dev/null 2>&1
+python3 -c "import json; m=json.load(open('$TMP/artslug/meta.json')); assert m['slug']=='fix-login', m['slug']" \
+  && printf '  ok    %-42s\n' "F-14: explicit slug normalised" || { printf '  FAIL  F-14: slug not normalised\n'; FAIL=1; }
 # proportionality (debate 2026-09-03): --deep is recorded; the resolved mode is left to the skill
 bash "$I" --repo "$G2" --out "$TMP/artdeep" --deep --request x >/dev/null 2>&1
 python3 -c "import json; m=json.load(open('$TMP/artdeep/meta.json')); assert m['mode_requested']=='deep' and m['mode'] is None, m" \
@@ -423,13 +675,24 @@ chk "verdict: hypothesis-only BLOCKER"  1 "hypothesis-only"     python3 "$V" --e
 mkobj "$TMP/v-praise.json" 0 APPROVE '[]' "great plan, I agree"
 chk "verdict: praise language rejected" 1 "praise"              python3 "$V" --extract "$TMP/v-praise.json" --round 0
 mkobj "$TMP/v-badcite.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"MAJOR","claim":"c","evidence":["f.txt:2-2@'"$SHA2"' \"line nine\""],"proposed_change":"p","falsifier":"f"}]' "x"
-chk "verdict: fabricated citation caught" 1 "quote not found"   python3 "$V" --extract "$TMP/v-badcite.json" --round 0 --repo "$G2"
+chk "verdict: fabricated citation dropped, objection discarded" 0 "DROPPED_OBJECTION: X-1" python3 "$V" --extract "$TMP/v-badcite.json" --out "$TMP/v-badcite.out.json" --round 0 --repo "$G2"
+python3 -c "import json,sys; v=json.load(open('$TMP/v-badcite.out.json')); sys.exit(0 if v['objections']==[] and v.get('dropped_citations') and 'DROPPED_OBJECTION' in v.get('flags',[]) else 1)" && printf '  ok    %-42s\n' "dropped citation recorded in verdict json" || { printf '  FAIL  dropped citation not recorded\n'; FAIL=1; }
+# a non-verbatim citation beside a verbatim one only trims the evidence list
+mkobj "$TMP/v-mixcite.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"MAJOR","claim":"c","evidence":["f.txt:2-2@'"$SHA2"' \"line nine\"","f.txt:2-2@'"$SHA2"' \"line two\""],"proposed_change":"p","falsifier":"f"}]' "x"
+chk "verdict: one bad citation trims evidence" 0 "DROPPED_CITATION: X-1 lost 1" python3 "$V" --extract "$TMP/v-mixcite.json" --round 0 --repo "$G2"
+# a root cause whose only citation is not verbatim survives, flagged E4
+python3 - "$TMP/v-ok.json" "$TMP/v-rcbad.json" "$SHA2" <<'PY2'
+import json,sys
+v=json.load(open(sys.argv[1])); v["objections"]=[]; v["verdict"]="REJECT"
+v["root_causes"][0]["evidence"]=['f.txt:2-2@%s "line nine"' % sys.argv[3]]; json.dump(v,open(sys.argv[2],"w"))
+PY2
+chk "verdict: unverified root cause flagged" 0 "UNVERIFIED_ROOT_CAUSE: RC-1" python3 "$V" --extract "$TMP/v-rcbad.json" --round 0 --repo "$G2"
 # F-02: an unpinned path citation is not evidence
 mkobj "$TMP/v-unpinned.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"BLOCKER","claim":"c","evidence":["src/x.py:9999"],"proposed_change":"p","falsifier":"f"}]' "x"
 chk "verdict: unpinned citation rejected" 1 "no sha-pinned"     python3 "$V" --extract "$TMP/v-unpinned.json" --round 0
 # F-02: a citation to a commit other than the base is rejected
 mkobj "$TMP/v-later.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"MAJOR","claim":"c","evidence":["f.txt:2-2@'"$SHA_LATER"' \"line two\""],"proposed_change":"p","falsifier":"f"}]' "x"
-chk "verdict: non-base sha rejected"   1 "base SHA"             python3 "$V" --extract "$TMP/v-later.json" --round 0 --repo "$G2" --base-sha "$SHA2"
+chk "verdict: non-base sha citation dropped" 0 "base SHA"       python3 "$V" --extract "$TMP/v-later.json" --round 0 --repo "$G2" --base-sha "$SHA2"
 # F-11: extensionless paths are ordinary paths
 mkobj "$TMP/v-noext.json" 0 REJECT '[{"id":"X-1","class":"FACT_ERROR","severity":"MAJOR","claim":"c","evidence":["Dockerfile:1-1@'"$SHA2"' \"FROM python\""],"proposed_change":"p","falsifier":"f"}]' "x"
 chk "verdict: extensionless path accepted" 0 "OK"               python3 "$V" --extract "$TMP/v-noext.json" --round 0 --repo "$G2" --base-sha "$SHA2"
@@ -481,6 +744,21 @@ v["objection_resolutions"]=[{"id":"X-1","status":"WITHDRAWN","because":"you make
 json.dump(v,open(sys.argv[2],"w"))
 PY2
 chk "verdict: evidence-free withdrawal" 1 "praise"              python3 "$V" --extract "$TMP/v-r2.json" --round 2 --prior "$TMP/r1.json"
+python3 - "$TMP/v-r2.json" "$TMP/v-r2plan.json" <<'PY'
+import json,sys
+v=json.load(open(sys.argv[1]))
+v["objection_resolutions"]=[{"id":"X-1","status":"WITHDRAWN","because":"CH-3 and T-4b now carry the check"}]
+v["changed_positions"]=[{"objection_id":"X-1","from":"MAJOR","to":"WITHDRAWN","because":"CH-3, T-4b"}]
+json.dump(v,open(sys.argv[2],"w"))
+PY
+chk "verdict: withdrawal citing a plan row accepted" 0 "OK"      python3 "$V" --extract "$TMP/v-r2plan.json" --round 2 --prior "$TMP/r1.json"
+python3 - "$TMP/v-r2.json" "$TMP/v-r2bare.json" <<'PY'
+import json,sys
+v=json.load(open(sys.argv[1]))
+v["objection_resolutions"]=[{"id":"X-1","status":"WITHDRAWN","because":"the plan now handles it"}]
+json.dump(v,open(sys.argv[2],"w"))
+PY
+chk "verdict: withdrawal naming nothing rejected" 1 "without a citation or evidence id" python3 "$V" --extract "$TMP/v-r2bare.json" --round 2 --prior "$TMP/r1.json"
 python3 - "$TMP/r1.json" "$TMP/v-r2b.json" <<'PY2'
 import json,sys
 v=json.load(open(sys.argv[1])); v["round"]=2; v["objections"]=[]; v["objection_resolutions"]=[]
@@ -635,15 +913,15 @@ printf '%s\n' "$(git -C "$G2" rev-parse HEAD)" > "$GA/00-brief.md.head"
 chk "CX-02r38: recorded head differs from the brief's Target" 1 "differs from the frozen brief's Target head" pgw pre-codex "$GA" "$G2"
 cp "$TMP/ga-head.bak" "$GA/00-brief.md.head"
 # CX-03r38: claim creation/rotation and a runner taking the claim share <prefix>.claim.lock.
-mkdir "$GA/02-codex.claim.lock"
+mkdir "$GA/02-p1.claim.lock"
 chk "CX-03r38: held claim lock blocks the launch gate" 1 "claim.lock is held" pgw pre-codex "$GA" "$G2"
-touch -t 202001010000 "$GA/02-codex.claim.lock"
+touch -t 202001010000 "$GA/02-p1.claim.lock"
 chk "CX-03r38: stale claim lock reclaimed" 0 "PREFLIGHT-OK" pgw pre-codex "$GA" "$G2"
-[ ! -e "$GA/02-codex.claim.lock" ] && printf '  ok    %-42s\n' "CX-03r38: gate releases the claim lock" || { printf '  FAIL  CX-03r38: claim lock left behind\n'; FAIL=1; }
-out=$(pgw pre-codex "$GA" "$G2" 2>&1); tok=$(printf '%s' "$out" | grep -oE 'claim=[0-9a-f]{16}' | cut -d= -f2)
-[ -n "$tok" ] && grep -qx "token=$tok" "$GA/02-codex.claim/owner" && printf '  ok    %-42s\n' "CX-03r36: gate prints the claim token it wrote" || { printf '  FAIL  CX-03r36: token missing (%s)\n' "$out"; FAIL=1; }
+[ ! -e "$GA/02-p1.claim.lock" ] && printf '  ok    %-42s\n' "CX-03r38: gate releases the claim lock" || { printf '  FAIL  CX-03r38: claim lock left behind\n'; FAIL=1; }
+out=$(pgw pre-codex "$GA" "$G2" 2>&1); tok=$(printf '%s' "$out" | grep -oE 'claim\.p1=[0-9a-f]{16}' | cut -d= -f2)
+[ -n "$tok" ] && grep -qx "token=$tok" "$GA/02-p1.claim/owner" && printf '  ok    %-42s\n' "CX-03r36: gate prints the claim token it wrote" || { printf '  FAIL  CX-03r36: token missing (%s)\n' "$out"; FAIL=1; }
 ( cd "$GA" && chk "gate: pre-codex with a relative ART" 0 "PREFLIGHT-OK" bash "$OLDPWD/$PG" pre-codex . "$G2" )
-GN="$TMP/gate-nopre"; mkdir -p "$GN"; printf 'scope\n' > "$GN/00-scope.md"; mkbrief "$GN"; printf 'lead\n' > "$GN/01-lead.md"; chmod 000 "$GN/01-lead.md"; printf 'x\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$GN/02-codex.md"
+GN="$TMP/gate-nopre"; mkdir -p "$GN"; printf 'scope\n' > "$GN/00-scope.md"; mkbrief "$GN"; printf 'lead\n' > "$GN/01-lead.md"; chmod 000 "$GN/01-lead.md"; printf 'x\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$GN/02-p1.md"
 chk "gate: pre-phase3 without pre-codex" 1 "pre-codex never ran" pgw pre-phase3 "$GN"
 printf 'lead\n' > "$GA/01-lead.md"; chmod 600 "$GA/01-lead.md"
 chk "gate: pre-codex, lead readable"   1 "not sealed"           pgw pre-codex "$GA" "$G2"
@@ -665,20 +943,20 @@ printf 'scope\n' > "$GB/00-scope.md"; mkbrief "$GB"
 out=$(PATH="$GB/bin:$PATH" pgw pre-codex "$GB" "$G2" 2>&1); code=$?
 [ "$code" = 1 ] && printf '%s' "$out" | grep -q "cannot hash" && [ ! -e "$GB/00-brief.md.sha256" ] && printf '  ok    %-42s exit=1\n' "gate: no hasher → fail, nothing recorded" || { printf '  FAIL  gate: no hasher: exit=%s out=%s\n' "$code" "$out"; FAIL=1; }
 # pre-phase3 — SKIPPED form needs no runner sidecar (F-02); COMPLETE form does
-chk "gate: pre-phase3, no 02-codex.md"  1 "02-codex.md"         pgw pre-phase3 "$GA"
-printf 'outcome\n' > "$GA/02-codex.md"
+chk "gate: pre-phase3, no 02-p1.md"  1 "02-p1.md"         pgw pre-phase3 "$GA"
+printf 'outcome\n' > "$GA/02-p1.md"
 chk "gate: pre-phase3, no STATUS line" 1 "STATUS"               pgw pre-phase3 "$GA"
-printf 'PROBE FAILED\nSTATUS: PHASE 2 COMPLETE (SKIPPED — probe failed)\n' > "$GA/02-codex.md"
+printf 'PROBE FAILED\nSTATUS: PHASE 2 COMPLETE (SKIPPED — probe failed)\n' > "$GA/02-p1.md"
 chk "gate: pre-phase3, SKIPPED, no .exit" 0 "codex=SKIPPED"     pgw pre-phase3 "$GA"
 [ -e "$GA/02-review-seal.sha256" ] && grep -q '^phase2=SKIPPED' "$GA/02-review-seal.sha256" && printf '  ok    %-42s\n' "CX-02r22: SKIPPED join writes a seal" || { printf '  FAIL  CX-02r22: no seal after SKIPPED join\n'; FAIL=1; }
-printf 'outcome\nSTATUS: PHASE 2 COMPLETE\n' > "$GA/02-codex.md"
-chk "gate: pre-phase3, COMPLETE, no .exit" 1 "02-codex.exit"    pgw pre-phase3 "$GA"
-echo 0 > "$GA/02-codex.exit"
-printf 'blind Codex output\n' > "$GA/02-codex.stdout"
+printf 'outcome\nSTATUS: PHASE 2 COMPLETE\n' > "$GA/02-p1.md"
+chk "gate: pre-phase3, COMPLETE, no .exit" 1 "02-p1.exit"    pgw pre-phase3 "$GA"
+echo 0 > "$GA/02-p1.exit"
+printf 'blind Codex output\n' > "$GA/02-p1.stdout"
 chk "CX-02r22: status flip after SKIPPED join caught" 1 "status changed after JOIN-OK" pgw pre-phase3 "$GA"
 chmod u+w "$GA/02-review-seal.sha256"; rm -f "$GA/02-review-seal.sha256" "$GA/00-accepted.sha256"   # fresh join (seal + ledger) for the COMPLETE cases
 chk "gate: pre-phase3, COMPLETE status" 0 "JOIN-OK"             pgw pre-phase3 "$GA"
-printf 'outcome\nSTATUS: PHASE 2 COMPLETE\n\n' > "$GA/02-codex.md"
+printf 'outcome\nSTATUS: PHASE 2 COMPLETE\n\n' > "$GA/02-p1.md"
 chk "gate: pre-phase3, trailing blank line" 0 "JOIN-OK"         pgw pre-phase3 "$GA"
 chmod 600 "$GA/01-lead.md"
 chk "gate: pre-phase3, lead readable"  1 "not sealed"           pgw pre-phase3 "$GA"
@@ -711,111 +989,232 @@ printf 'brief changed\n' > "$GA/00-brief.md"
 chk "gate: post-join, hash mismatch"   1 "changed since"        pgw post-join "$GA"
 
 # CX-01r22: pre-codex must refuse to relaunch over an exit-5 / unconfirmed-cancel
-# Phase-2 sidecar even when no seal (and no 02-codex.md) exists.
+# Phase-2 sidecar even when no seal (and no 02-p1.md) exists.
 PC5="$TMP/cx01r22"; mkdir -p "$PC5"; printf 'scope\n' > "$PC5/00-scope.md"; mkbrief "$PC5"
-printf '5\n' > "$PC5/02-codex.exit"
-chk "CX-01r22: pre-codex rejects exit-5 sidecar without seal" 1 "02-codex recorded exit 5" pgw pre-codex "$PC5" "$G2"
-rm -f "$PC5/02-codex.exit"; printf 'outcome=STALLED\ncancel_confirmed=no\n' > "$PC5/02-codex.attempt1.meta"
+printf '5\n' > "$PC5/02-p1.exit"
+chk "CX-01r22: pre-codex rejects exit-5 sidecar without seal" 1 "02-p1 recorded exit 5" pgw pre-codex "$PC5" "$G2"
+rm -f "$PC5/02-p1.exit"; printf 'outcome=STALLED\ncancel_confirmed=no\n' > "$PC5/02-p1.attempt1.meta"
 chk "CX-01r22: pre-codex rejects rotated cancel_confirmed=no" 1 "cancel_confirmed=no" pgw pre-codex "$PC5" "$G2"
-rm -f "$PC5/02-codex.attempt1.meta"
+rm -f "$PC5/02-p1.attempt1.meta"
 chk "CX-01r22: pre-codex passes once sidecars are gone" 0 "PREFLIGHT-OK" pgw pre-codex "$PC5" "$G2"
 # CX-02r25 / CX-01r26, as simplified by the round-27 debate: a claim is in flight
 # while its runner has started (.progress, no .exit) or while the claim directory
 # is younger than the grace window (a directory with no owner file counts); no
 # pid heuristics. Beyond that, recovery is explicit removal.
-[ -d "$PC5/02-codex.claim" ] && printf '  ok    %-42s\n' "CX-02r25: pre-codex takes a claim" || { printf '  FAIL  CX-02r25: no claim directory\n'; FAIL=1; }
-printf '0s launched job=x\n' > "$PC5/02-codex.progress"
+[ -d "$PC5/02-p1.claim" ] && printf '  ok    %-42s\n' "CX-02r25: pre-codex takes a claim" || { printf '  FAIL  CX-02r25: no claim directory\n'; FAIL=1; }
+printf '0s launched job=x\n' > "$PC5/02-p1.progress"
 chk "CX-02r25: running runner blocks a second launch" 1 "runner has started" pgw pre-codex "$PC5" "$G2"
-rm -f "$PC5/02-codex.progress"
+rm -f "$PC5/02-p1.progress"
 chk "CX-02r25: stale claim (past grace, no runner) reclaimed" 0 "PREFLIGHT-OK" pgw pre-codex "$PC5" "$G2"
-[ -d "$PC5/02-codex.claim.spent1" ] && printf '  ok    %-42s\n' "CX-02r25: stale claim rotated aside" || { printf '  FAIL  CX-02r25: stale claim not rotated\n'; FAIL=1; }
+[ -d "$PC5/02-p1.claim.spent1" ] && printf '  ok    %-42s\n' "CX-02r25: stale claim rotated aside" || { printf '  FAIL  CX-02r25: stale claim not rotated\n'; FAIL=1; }
 chk "CX-01r26: fresh claim is in flight during the grace window" 1 "may still be launching" pgwg 600 pre-codex "$PC5" "$G2"
-rm -f "$PC5/02-codex.claim/owner"
+rm -f "$PC5/02-p1.claim/owner"
 chk "CX-01r27: claim directory without an owner file counts as in flight" 1 "may still be launching" pgwg 600 pre-codex "$PC5" "$G2"
-touch -t 202001010000 "$PC5/02-codex.claim"
+touch -t 202001010000 "$PC5/02-p1.claim"
 chk "CX-01r26: claim older than the grace window is reclaimed" 0 "PREFLIGHT-OK" pgwg 600 pre-codex "$PC5" "$G2"
 # CX-03r30: a claim whose runner took its lock (claim/runner) is in flight regardless of age.
-mkdir -p "$PC5/02-codex.claim/runner"; touch -t 202001010000 "$PC5/02-codex.claim"
+mkdir -p "$PC5/02-p1.claim/runner"; touch -t 202001010000 "$PC5/02-p1.claim"
 chk "CX-03r30: stamped claim stays in flight past the grace window" 1 "runner has started" pgwg 600 pre-codex "$PC5" "$G2"
 # Round-32 debate: release is the only recovery for a started-and-died claim; it never deletes.
-printf '%s\n' "$$" > "$PC5/02-codex.claim/runner/pid"
-chk "release: live runner refused" 1 "is still alive" bash "$PG" release "$PC5" 02-codex
-printf '2147483646\n' > "$PC5/02-codex.claim/runner/pid"
-printf '0s launched job=task-fake-job1\n' > "$PC5/02-codex.progress"
-chk "release: job without a reachable codex plugin refused" 1 "cannot locate the codex plugin" env HOME="$TMP/nohome" bash "$PG" release "$PC5" 02-codex
+printf '%s\n' "$$" > "$PC5/02-p1.claim/runner/pid"
+chk "release: live runner refused" 1 "is still alive" bash "$PG" release "$PC5" 02-p1
+printf '2147483646\n' > "$PC5/02-p1.claim/runner/pid"
+printf '0s launched job=task-fake-job1\n' > "$PC5/02-p1.progress"
+chk "release: job without a reachable codex plugin refused" 1 "cannot locate the codex plugin" env HOME="$TMP/nohome" bash "$PG" release "$PC5" 02-p1
 FAKE="$TMP/fakehome/.claude/plugins/cache/openai-codex/codex/9.9.9/scripts"; mkdir -p "$FAKE"
 printf 'if (process.argv.includes("--all")) { console.log(JSON.stringify({running: process.env.FAKE_RUNNING ? [{id:"task-live-1", workspaceRoot: process.env.FAKE_RUNNING}] : []})); } else { console.log(JSON.stringify({job:{status:process.env.FAKE_STATUS||"running"}})); }\n' > "$FAKE/codex-companion.mjs"
-chk "release: running job refused" 1 "not provably finished" env HOME="$TMP/fakehome" FAKE_STATUS=running bash "$PG" release "$PC5" 02-codex
+chk "release: running job refused" 1 "not provably finished" env HOME="$TMP/fakehome" FAKE_STATUS=running bash "$PG" release "$PC5" 02-p1
 ( exec -a "task-worker --job-id task-fake-job1" sleep 30 ) & WPID=$!; sleep 1
-chk "release: live worker process refused" 1 "worker process for job task-fake-job1 is still alive" env HOME="$TMP/fakehome" FAKE_STATUS=completed bash "$PG" release "$PC5" 02-codex
+chk "release: live worker process refused" 1 "worker process for job task-fake-job1 is still alive" env HOME="$TMP/fakehome" FAKE_STATUS=completed bash "$PG" release "$PC5" 02-p1
 kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null
-chk "release: finished job rotates the claim" 0 "RELEASED 02-codex -> 02-codex.claim.spent" env HOME="$TMP/fakehome" FAKE_STATUS=completed bash "$PG" release "$PC5" 02-codex
-[ ! -d "$PC5/02-codex.claim" ] && ls -d "$PC5"/02-codex.claim.spent*/runner >/dev/null 2>&1 && grep -q '^released_by=phase-gate.sh release' "$PC5"/02-codex.claim.spent*/owner && printf '  ok    %-42s\n' "release: rotated claim keeps runner/ (still a counted launch)" || { printf '  FAIL  release: claim not rotated with runner\n'; FAIL=1; }
-chk "release: nothing live to release" 1 "no live claim" bash "$PG" release "$PC5" 02-codex
-rm -f "$PC5/02-codex.progress"; rm -rf "$PC5"/02-codex.claim.spent*
+chk "release: finished job rotates the claim" 0 "RELEASED 02-p1 -> 02-p1.claim.spent" env HOME="$TMP/fakehome" FAKE_STATUS=completed bash "$PG" release "$PC5" 02-p1
+[ ! -d "$PC5/02-p1.claim" ] && ls -d "$PC5"/02-p1.claim.spent*/runner >/dev/null 2>&1 && grep -q '^released_by=phase-gate.sh release' "$PC5"/02-p1.claim.spent*/owner && printf '  ok    %-42s\n' "release: rotated claim keeps runner/ (still a counted launch)" || { printf '  FAIL  release: claim not rotated with runner\n'; FAIL=1; }
+chk "release: nothing live to release" 1 "no live claim" bash "$PG" release "$PC5" 02-p1
+rm -f "$PC5/02-p1.progress"; rm -rf "$PC5"/02-p1.claim.spent*
 # CX-01r34: .progress exists but records no job id (runner killed between `task` and the append) — release must
 # consult the companion and refuse while any job runs in the reviewed repository.
-mkdir -p "$PC5/02-codex.claim/runner"; printf '2147483646\n' > "$PC5/02-codex.claim/runner/pid"; : > "$PC5/02-codex.progress"
+mkdir -p "$PC5/02-p1.claim/runner"; printf '2147483646\n' > "$PC5/02-p1.claim/runner/pid"; : > "$PC5/02-p1.progress"
 fixture_revs "$PC5"
-chk "CX-01r34: unrecorded job without a reachable plugin refused" 1 "cannot locate the codex plugin" env HOME="$TMP/nohome" bash "$PG" release "$PC5" 02-codex
-chk "CX-01r34: unrecorded job with a running job in the repo refused" 1 "records no job id, and a Codex job is still running" env HOME="$TMP/fakehome" FAKE_RUNNING="$G2" bash "$PG" release "$PC5" 02-codex
-chk "CX-01r34: unrecorded job, nothing running → released" 0 "RELEASED 02-codex" env HOME="$TMP/fakehome" bash "$PG" release "$PC5" 02-codex
-rm -f "$PC5/02-codex.progress"; rm -rf "$PC5"/02-codex.claim.spent*
+chk "CX-01r34: unrecorded job without a reachable plugin refused" 1 "cannot locate the codex plugin" env HOME="$TMP/nohome" bash "$PG" release "$PC5" 02-p1
+chk "CX-01r34: unrecorded job with a running job in the repo refused" 1 "records no job id, and a Codex job is still running" env HOME="$TMP/fakehome" FAKE_RUNNING="$G2" bash "$PG" release "$PC5" 02-p1
+chk "CX-01r34: unrecorded job, nothing running → released" 0 "RELEASED 02-p1" env HOME="$TMP/fakehome" bash "$PG" release "$PC5" 02-p1
+rm -f "$PC5/02-p1.progress"; rm -rf "$PC5"/02-p1.claim.spent*
 # CX-03r37: runner/ without a pid is a runner mid-acquisition unless it is old.
-mkdir -p "$PC5/02-codex.claim/runner"
-chk "CX-03r37: fresh pid-less runner dir refused" 1 "taking the 02-codex claim right now" env HOME="$TMP/nohome" bash "$PG" release "$PC5" 02-codex
-touch -t 202001010000 "$PC5/02-codex.claim/runner"
-chk "CX-03r37: old pid-less runner dir released" 0 "RELEASED 02-codex" env HOME="$TMP/nohome" bash "$PG" release "$PC5" 02-codex
-rm -rf "$PC5"/02-codex.claim.spent*
+mkdir -p "$PC5/02-p1.claim/runner"
+chk "CX-03r37: fresh pid-less runner dir refused" 1 "taking the 02-p1 claim right now" env HOME="$TMP/nohome" bash "$PG" release "$PC5" 02-p1
+touch -t 202001010000 "$PC5/02-p1.claim/runner"
+chk "CX-03r37: old pid-less runner dir released" 0 "RELEASED 02-p1" env HOME="$TMP/nohome" bash "$PG" release "$PC5" 02-p1
+rm -rf "$PC5"/02-p1.claim.spent*
 # lock-only claim (runner/ but no .progress): provably no job, rotated after the pid check alone
-mkdir -p "$PC5/02-codex.claim/runner"; printf '2147483646\n' > "$PC5/02-codex.claim/runner/pid"
-chk "release: lock-only dead claim rotated" 0 "RELEASED 02-codex" env HOME="$TMP/nohome" bash "$PG" release "$PC5" 02-codex
-rm -rf "$PC5"/02-codex.claim.spent*
-mkdir -p "$PC5/02-codex.claim/runner"; touch -t 202001010000 "$PC5/02-codex.claim"
-rm -rf "$PC5/02-codex.claim/runner"
+mkdir -p "$PC5/02-p1.claim/runner"; printf '2147483646\n' > "$PC5/02-p1.claim/runner/pid"
+chk "release: lock-only dead claim rotated" 0 "RELEASED 02-p1" env HOME="$TMP/nohome" bash "$PG" release "$PC5" 02-p1
+rm -rf "$PC5"/02-p1.claim.spent*
+mkdir -p "$PC5/02-p1.claim/runner"; touch -t 202001010000 "$PC5/02-p1.claim"
+rm -rf "$PC5/02-p1.claim/runner"
 # CX-02r27: the claim is the gate's last step, so a failing preflight check leaves no claim behind.
-rm -rf "$PC5"/02-codex.claim*; printf 'lead\n' > "$PC5/01-lead.md"; chmod 600 "$PC5/01-lead.md"
+rm -rf "$PC5"/02-p1.claim*; printf 'lead\n' > "$PC5/01-lead.md"; chmod 600 "$PC5/01-lead.md"
 chk "CX-02r27: unsealed lead fails preflight" 1 "not sealed" pgw pre-codex "$PC5" "$G2"
-[ ! -d "$PC5/02-codex.claim" ] && printf '  ok    %-42s\n' "CX-02r27: failed preflight leaves no claim" || { printf '  FAIL  CX-02r27: claim left behind by a failed preflight\n'; FAIL=1; }
+[ ! -d "$PC5/02-p1.claim" ] && printf '  ok    %-42s\n' "CX-02r27: failed preflight leaves no claim" || { printf '  FAIL  CX-02r27: claim left behind by a failed preflight\n'; FAIL=1; }
 rm -f "$PC5/01-lead.md"
 chk "CX-02r27: preflight passes again with no leftover claim" 0 "PREFLIGHT-OK" pgw pre-codex "$PC5" "$G2"
 # L-01r26: spent claims are bounded.
-printf '4\n' > "$PC5/02-codex.exit"
-for n in $(seq 1 9); do mkdir -p "$PC5/02-codex.claim.spent$n"; done
+printf '4\n' > "$PC5/02-p1.exit"
+for n in $(seq 1 9); do mkdir -p "$PC5/02-p1.claim.spent$n"; done
 chk "L-01r26: tenth spent claim refused" 1 "spent claims already" pgw pre-codex "$PC5" "$G2"
-rm -rf "$PC5"/02-codex.claim.spent[1-9] "$PC5/02-codex.exit"
+rm -rf "$PC5"/02-p1.claim.spent[1-9] "$PC5/02-p1.exit"
 # CX-03r23: an unjoined but COMPLETE Phase 2 must not be silently redone; a SKIPPED one may be retried.
-printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$PC5/02-codex.md"; printf '0\n' > "$PC5/02-codex.exit"; printf 'body\n' > "$PC5/02-codex.stdout"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$PC5/02-p1.md"; printf '0\n' > "$PC5/02-p1.exit"; printf 'body\n' > "$PC5/02-p1.stdout"
 chk "CX-03r23: pre-codex refuses to redo an unjoined completed review" 1 "already records a completed blind review" pgw pre-codex "$PC5" "$G2"
-printf 'PROBE FAILED\nSTATUS: PHASE 2 COMPLETE (SKIPPED — probe failed)\n' > "$PC5/02-codex.md"; rm -f "$PC5/02-codex.exit" "$PC5/02-codex.stdout"
+printf 'PROBE FAILED\nSTATUS: PHASE 2 COMPLETE (SKIPPED — probe failed)\n' > "$PC5/02-p1.md"; rm -f "$PC5/02-p1.exit" "$PC5/02-p1.stdout"
 chk "CX-03r23: pre-codex allows retrying a SKIPPED review" 0 "PREFLIGHT-OK" pgw pre-codex "$PC5" "$G2"
 # CX-01r30: a SKIPPED Phase 2 over a successful (exit 0) attempt, current or rotated, is not skippable.
-printf '0\n' > "$PC5/02-codex.attempt3.exit"; printf 'body\n' > "$PC5/02-codex.attempt3.stdout"
+printf '0\n' > "$PC5/02-p1.attempt3.exit"; printf 'body\n' > "$PC5/02-p1.attempt3.stdout"
 chk "CX-01r30: SKIPPED review over a rotated exit-0 attempt refused" 1 "succeeded (exit 0, non-empty response); write the terminal artifact" pgw pre-codex "$PC5" "$G2"
-rm -f "$PC5/02-codex.attempt3."*; printf '0\n' > "$PC5/02-codex.exit"; printf 'body\n' > "$PC5/02-codex.stdout"
+rm -f "$PC5/02-p1.attempt3."*; printf '0\n' > "$PC5/02-p1.exit"; printf 'body\n' > "$PC5/02-p1.stdout"
 chk "CX-01r30: SKIPPED review over a current exit-0 attempt refused" 1 "succeeded (exit 0" pgw pre-codex "$PC5" "$G2"
 # L-01r31: exit 0 with an empty response is a failed attempt — skippable, and never a COMPLETE review.
-: > "$PC5/02-codex.stdout"
+: > "$PC5/02-p1.stdout"
 chk "L-01r31: SKIPPED review over an empty exit-0 response allowed" 0 "PREFLIGHT-OK" pgw pre-codex "$PC5" "$G2"
-printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$PC5/02-codex.md"
-chk "L-01r31: COMPLETE review with an empty response refused" 1 "02-codex.stdout is empty" pgw pre-codex "$PC5" "$G2"
-rm -f "$PC5/02-codex.md"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$PC5/02-p1.md"
+chk "L-01r31: COMPLETE review with an empty response refused" 1 "02-p1.stdout is empty" pgw pre-codex "$PC5" "$G2"
+rm -f "$PC5/02-p1.md"
 chk "CX-05r36: exit 0 with an empty body does not block a Phase-2 relaunch" 0 "PREFLIGHT-OK" pgw pre-codex "$PC5" "$G2"
-printf 'PROBE FAILED\nSTATUS: PHASE 2 COMPLETE (SKIPPED — probe failed)\n' > "$PC5/02-codex.md"
-rm -f "$PC5/02-codex.exit" "$PC5/02-codex.stdout"
+printf 'PROBE FAILED\nSTATUS: PHASE 2 COMPLETE (SKIPPED — probe failed)\n' > "$PC5/02-p1.md"
+rm -f "$PC5/02-p1.exit" "$PC5/02-p1.stdout"
 # CX-01r24: an accepted current attempt with no terminal artifact must not be relaunched.
-rm -f "$PC5/02-codex.md"; printf '0\n' > "$PC5/02-codex.exit"; printf 'body\n' > "$PC5/02-codex.stdout"
-chk "CX-01r24: pre-codex refuses relaunch over accepted attempt without 02-codex.md" 1 "accepted attempt with no 02-codex.md" pgw pre-codex "$PC5" "$G2"
-rm -f "$PC5/02-codex.exit" "$PC5/02-codex.stdout"
+rm -f "$PC5/02-p1.md"; printf '0\n' > "$PC5/02-p1.exit"; printf 'body\n' > "$PC5/02-p1.stdout"
+chk "CX-01r24: pre-codex refuses relaunch over accepted attempt without 02-p1.md" 1 "accepted attempt with no 02-p1.md" pgw pre-codex "$PC5" "$G2"
+rm -f "$PC5/02-p1.exit" "$PC5/02-p1.stdout"
+
+echo "review: participants (00-participants.tsv, 02-p<k>, 03-provenance.tsv, 00-schema, ccr release)"
+VP=plugins/codex-pr-review/skills/two-model-pr-review/scripts/validate-provenance.py
+# T-16: pre-codex with two participants takes two claims; without the file it fails
+PA="$TMP/parts"; mkdir -p "$PA"; printf 'scope\n' > "$PA/00-scope.md"; mkbrief "$PA"
+printf 'p1\tcodex\t-\np2\tccr\tsome-alias\n' > "$PA/00-participants.tsv"
+out=$(pgw pre-codex "$PA" "$G2" 2>&1); rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'participants=2' && printf '%s' "$out" | grep -qE 'claim\.p1=[0-9a-f]{16}' && printf '%s' "$out" | grep -qE 'claim\.p2=[0-9a-f]{16}' && [ -d "$PA/02-p1.claim" ] && [ -d "$PA/02-p2.claim" ] && [ "$(cat "$PA/00-schema")" = codex-pr-review/4 ] && [ -s "$PA/00-participants.tsv.sha256" ] && printf '  ok    %-42s\n' "T-16: pre-codex claims every participant" || { printf '  FAIL  T-16: rc=%s out=%s\n' "$rc" "$out"; FAIL=1; }
+PN="$TMP/parts-none"; mkdir -p "$PN"; printf 'scope\n' > "$PN/00-scope.md"; mkbrief "$PN"; fixture_revs "$PN"; rm -f "$PN/00-participants.tsv"
+chk "T-16: pre-codex without participants file" 1 "00-participants.tsv missing" bash "$PG" pre-codex "$PN" "$G2"
+printf 'p1\tcodex\t-\np2\tcodex\t-\n' > "$PN/00-participants.tsv"
+chk "T-16: two codex participants refused" 1 "at most one" bash "$PG" pre-codex "$PN" "$G2"
+printf 'p1\tccr\t-\n' > "$PN/00-participants.tsv"
+chk "T-16: ccr participant without alias refused" 1 "needs an alias" bash "$PG" pre-codex "$PN" "$G2"
+printf 'p2\tcodex\t-\n' > "$PN/00-participants.tsv"
+chk "T-16: participants out of order refused" 1 "expected id p1" bash "$PG" pre-codex "$PN" "$G2"
+printf 'p1\tccr\ta;b\n' > "$PN/00-participants.tsv"
+chk "T-16: alias with shell characters refused" 1 "needs an alias" bash "$PG" pre-codex "$PN" "$G2"
+# T-17: the participants file is frozen with the packets
+printf 'p1\tcodex\t-\np2\tccr\tother-alias\n' > "$PA/00-participants.tsv"
+chk "T-17: participants edited after pre-codex" 1 "00-participants.tsv changed since" pgw pre-codex "$PA" "$G2"
+printf 'p1\tcodex\t-\np2\tccr\tsome-alias\n' > "$PA/00-participants.tsv"
+# T-26: the schema marker — missing or another contract fails every gate with the legacy message
+printf 'codex-pr-review/3\n' > "$PA/00-schema"
+chk "T-26: legacy schema marker refused" 1 "legacy run directory" pgw pre-codex "$PA" "$G2"
+printf 'codex-pr-review/4\n' > "$PA/00-schema"
+PL="$TMP/legacy"; mkdir -p "$PL"; printf 'scope\n' > "$PL/00-scope.md"; mkbrief "$PL"; fixture_revs "$PL"; printf 'lead\n' > "$PL/01-lead.md"; chmod 000 "$PL/01-lead.md"
+pgw pre-codex "$PL" "$G2" >/dev/null 2>&1; printf 'x\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$PL/02-p1.md"; rm -f "$PL/00-schema"
+chk "T-26: pre-phase3 without the marker" 1 "legacy run directory" bash "$PG" pre-phase3 "$PL"
+printf 'codex-pr-review/4\n' > "$PL/00-schema"
+chk "T-26: marker back → hash mismatch is the next check" 0 "JOIN-OK" bash "$PG" pre-phase3 "$PL"
+grep -q ' 00-schema  pre-phase3  final$' "$PL/00-accepted.sha256" && awk '{print $2}' "$PL/00-accepted.sha256" | grep -n . | grep -q '02-review-seal.sha256' && printf '  ok    %-42s\n' "T-26: schema marker accepted after the seal" || { printf '  FAIL  T-26: ledger rows %s\n' "$(cat "$PL/00-accepted.sha256")"; FAIL=1; }
+# T-18: JOIN-OK needs every participant terminal; the seal lists lead + every body; the exchange participant is the lowest-k COMPLETE
+printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$PA/01-lead.md"; chmod 000 "$PA/01-lead.md"
+printf 'x\nSTATUS: PHASE 2 COMPLETE (SKIPPED — probe failed)\n' > "$PA/02-p1.md"
+chk "T-18: p2 not terminal → no join" 1 "02-p2.md missing" pgw pre-phase3 "$PA"
+printf 'x\nSTATUS: PHASE 2 COMPLETE\n' > "$PA/02-p2.md"; echo 0 > "$PA/02-p2.exit"; printf 'blind output of p2\n' > "$PA/02-p2.stdout"
+mkdir -p "$PA/02-p2.claim/runner"   # the runner took the claim (top_up_claims covers p1's slots)
+out=$(pgw pre-phase3 "$PA" 2>&1); rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'codex=COMPLETE' && printf '%s' "$out" | grep -q 'participants=p1:SKIPPED,p2:COMPLETE' && printf '%s' "$out" | grep -q 'exchange=p2 via=ccr:some-alias' && [ "$(cat "$PA/02-exchange-participant")" = p2 ] && grep -q '  02-p1.md$' "$PA/02-review-seal.sha256" && grep -q '  02-p2.stdout$' "$PA/02-review-seal.sha256" && grep -q ' 02-exchange-participant  pre-phase3  final$' "$PA/00-accepted.sha256" && printf '  ok    %-42s\n' "T-18: join over two participants, exchange = lowest COMPLETE" || { printf '  FAIL  T-18: rc=%s out=%s\n' "$rc" "$out"; FAIL=1; }
+chmod 600 "$PA/01-lead.md"   # Phase 3 restores the lead before any post-join gate
+printf 'edited\n' > "$PA/02-p2.stdout"
+chk "T-18: edited participant body caught" 1 "initial review bodies changed" pgw post-join "$PA"
+printf 'blind output of p2\n' > "$PA/02-p2.stdout"
+printf 'p1\n' > "$PA/02-exchange-participant"
+chk "T-18: exchange participant drift caught" 1 "changed after it was accepted" pgw post-join "$PA"
+printf 'p2\n' > "$PA/02-exchange-participant"
+# T-21: the thread anchor reads the exchange participant's .meta
+printf 'outcome=COMPLETED\nbackend=ccr\nthread=sess-p2\nmode=--fresh\n' > "$PA/02-p2.meta"
+chmod 600 "$PA/01-lead.md"; printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$PA/01-lead.md"; chmod 000 "$PA/01-lead.md"
+chmod u+w "$PA/02-review-seal.sha256"; rm -f "$PA/02-review-seal.sha256" "$PA/00-accepted.sha256" "$PA/02-exchange-participant"; pgw pre-phase3 "$PA" >/dev/null 2>&1 || { printf '  FAIL  T-21: re-join\n'; FAIL=1; }
+chmod 600 "$PA/01-lead.md"
+printf 'm\nSTATUS: PHASE 3 COMPLETE\n' > "$PA/03-matrix.md"; printf 'F-01\tBOTH\tP2\nF-02\tCODEX-ONLY\tP1\n' > "$PA/03-matrix.tsv"
+printf 'F-01\tBOTH\tP2\tINCLUDE\tBOTH\nF-02\tCODEX-ONLY\tP1\tINCLUDE\tprovisional-P1\n' > "$PA/03-debate-selection.tsv"; base_packets "$PA"
+# T-20: provenance is validated and accepted as a draft at pre-consultation
+top_up_claims "$PA"; fixture_revs "$PA"
+chk "T-20: pre-consultation without provenance" 1 "03-provenance.tsv missing" bash "$PG" pre-consultation "$PA"
+printf 'F-01\tlead\tCL-01\nF-02\tp1\tCX-01\n' > "$PA/03-provenance.tsv"
+chk "T-20: origin inconsistent with raisers (BOTH needs a participant)" 1 "03-provenance.tsv is invalid" pgw pre-consultation "$PA"
+chk "T-20: validator names the reason" 1 "origin BOTH but raisers" python3 "$VP" --matrix "$PA/03-matrix.tsv" --participants "$PA/00-participants.tsv" --provenance "$PA/03-provenance.tsv"
+printf 'F-01\tlead\tCL-01\nF-01\tp2\tCX-04\nF-02\tp9\tCX-01\n' > "$PA/03-provenance.tsv"
+chk "T-20: unknown raiser rejected" 1 "neither lead nor a listed participant" python3 "$VP" --matrix "$PA/03-matrix.tsv" --participants "$PA/00-participants.tsv" --provenance "$PA/03-provenance.tsv"
+printf 'F-01\tlead\tCL-01\nF-01\tp2\tCX-04\n' > "$PA/03-provenance.tsv"
+chk "T-20: matrix id without a row rejected" 1 "no provenance row" python3 "$VP" --matrix "$PA/03-matrix.tsv" --participants "$PA/00-participants.tsv" --provenance "$PA/03-provenance.tsv"
+printf 'F-01\tlead\tCL-01\nF-01\tp2\tCX-04\nF-02\tp2\tCX-01\n' > "$PA/03-provenance.tsv"
+out=$(pgw pre-consultation "$PA" 2>&1); rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q 'exchange=p2 via=ccr:some-alias' && grep -q ' 03-provenance.tsv  pre-consultation  draft$' "$PA/00-accepted.sha256" && printf '  ok    %-42s\n' "T-20: consistent provenance accepted as draft" || { printf '  FAIL  T-20: rc=%s out=%s\n' "$rc" "$out"; FAIL=1; }
+printf 'F-01\tlead\tCL-01\nF-01\tp2\tCX-05\nF-02\tp2\tCX-01\n' > "$PA/03-provenance.tsv"
+chk "T-20: provenance may be corrected before consultation launches" 0 "CONSULTATION-OK" pgw pre-consultation "$PA"
+TOK=$(pgw pre-consultation "$PA" 2>&1 | grep -oE 'claim=[0-9a-f]{16}' | cut -d= -f2)
+# T-21: a consultation resumed on another participant's session fails the thread check
+mkdir -p "$PA/04-consultation.claim/runner"; printf 'c\nSTATUS: PHASE 4 COMPLETE\n' > "$PA/04-consultation.md"; echo 0 > "$PA/04-consultation.exit"
+printf 'outcome=COMPLETED\nbackend=ccr\nthread=sess-p1\nmode=--resume-last\n' > "$PA/04-consultation.meta"
+printf '```json\n{"phase":"consultation","dispositions":[{"id":"F-01","action":"MAINTAIN","claim":"c","severity":"P2","locations":["a:1"],"trigger":"t","impact":"i","observations":["a:1 \\"x\\""],"falsifier":"f","proposed_checks":["c"],"open_factual_questions":[]},{"id":"F-02","action":"MAINTAIN","claim":"c","severity":"P1","locations":["a:1"],"trigger":"t","impact":"i","observations":["a:1 \\"x\\""],"falsifier":"f","proposed_checks":["c"],"open_factual_questions":[]}]}\n```\n' > "$PA/04-consultation.stdout"
+chk "T-21: consultation on the wrong participant's session" 1 "resumed unexpected Codex thread (wanted sess-p2" pgw pre-verification "$PA"
+# review round 2 F-04: an explicit --resume-session is anchored exactly like --resume-last
+printf 'outcome=COMPLETED\nbackend=ccr\nthread=sess-p1\nmode=--resume-session\nresume_session=sess-p1\n' > "$PA/04-consultation.meta"
+chk "F-04: --resume-session on the wrong participant's session" 1 "resumed unexpected Codex thread (wanted sess-p2" pgw pre-verification "$PA"
+printf 'outcome=COMPLETED\nbackend=ccr\nthread=sess-p2\nmode=--resume-session\nresume_session=sess-p2\n' > "$PA/04-consultation.meta"
+chk "F-04: --resume-session on the exchange participant's session" 0 "VERIFICATION-OK" pgw pre-verification "$PA"
+printf 'outcome=COMPLETED\nbackend=ccr\nthread=sess-p2\nmode=--resume-last\n' > "$PA/04-consultation.meta"
+chk "T-21: consultation on the exchange participant's session" 0 "VERIFICATION-OK" pgw pre-verification "$PA"
+# T-22: the exchange budget is unchanged with N participants (4 launches / 2 responses over 04/06)
+for n in 1 2 3 4; do mkdir -p "$PA/06-resolution.claim.spent$n/runner"; done   # + the consultation claim = 5 launches
+printf 'v\nSTATUS: PHASE 5 COMPLETE\n' > "$PA/05-verification.md"; printf 'F-01\tCONFIRMED\ttrace\tf.txt:2@%s "line two"\nF-02\tUNVERIFIABLE\n' "$SHA2" > "$PA/05-verdicts.tsv"; printf 'F-02\n' > "$PA/06-resolution-selection.ids"
+chk "T-22: launch cap counts every exchange claim" 1 "attempt cap exceeded (5 > 4)" pgw pre-resolution "$PA"
+rm -rf "$PA/06-resolution.claim.spent4"
+chk "T-22: at the cap → OK with budget=exhausted" 0 "RESOLUTION-OK.*attempts=4.*budget=exhausted" pgw pre-resolution "$PA"
+# T-19 / T-19b: release iterates participants; a ccr attempt is released only when its whole process group is gone, and never via the companion
+PR="$TMP/parts-release"; mkdir -p "$PR"; printf 'scope\n' > "$PR/00-scope.md"; mkbrief "$PR"; printf 'p1\tcodex\t-\np2\tccr\tsome-alias\n' > "$PR/00-participants.tsv"
+pgw pre-codex "$PR" "$G2" >/dev/null 2>&1 || { printf '  FAIL  T-19: preflight\n'; FAIL=1; }
+chk "T-19: unknown prefix refused" 1 "unknown phase prefix" bash "$PG" release "$PR" 02-p3
+mkdir -p "$PR/02-p2.claim/runner"; printf '2147483646\n' > "$PR/02-p2.claim/runner/pid"
+python3 -c 'import os,sys; os.setpgrp(); os.execvp("sleep",["sleep","60"])' & GRP=$!; sleep 1
+printf '0s launched backend=ccr pid=2147483646 pgid=%s alias=some-alias\n' "$GRP" > "$PR/02-p2.progress"
+chk "T-19b: live process group refused" 1 "process group $GRP of 02-p2 is still alive" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+kill -TERM -- "-$GRP" 2>/dev/null; wait "$GRP" 2>/dev/null; sleep 1
+chk "T-19b: group gone → released without the companion" 0 "RELEASED 02-p2" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+rm -rf "$PR"/02-p2.claim.spent*; rm -f "$PR/02-p2.progress"
+mkdir -p "$PR/02-p2.claim/runner"; printf '2147483646\n' > "$PR/02-p2.claim/runner/pid"; printf '0s launched backend=ccr pid=2147483646 alias=some-alias\n' > "$PR/02-p2.progress"
+chk "T-19b: launch line without pgid refused" 1 "has no pgid=" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+: > "$PR/02-p2.progress"
+chk "T-19b: ccr attempt with no launch line, nothing running → released" 0 "RELEASED 02-p2" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+rm -rf "$PR"/02-p2.claim.spent* "$PR/02-p2.progress"
+# T-16 (re-entry): a SKIPPED participant may be relaunched alone while a COMPLETE one is kept
+printf 'lead\n' > "$PR/01-lead.md"; chmod 000 "$PR/01-lead.md"
+printf 'x\nSTATUS: PHASE 2 COMPLETE\n' > "$PR/02-p1.md"; echo 0 > "$PR/02-p1.exit"; printf 'body\n' > "$PR/02-p1.stdout"; mkdir -p "$PR/02-p1.claim/runner"
+printf 'x\nSTATUS: PHASE 2 COMPLETE (SKIPPED — probe failed)\n' > "$PR/02-p2.md"
+out=$(pgw pre-codex "$PR" "$G2" 2>&1); rc=$?
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -qE 'claim\.p2=' && ! printf '%s' "$out" | grep -qE 'claim\.p1=' && printf '  ok    %-42s\n' "T-16: re-entry relaunches only the SKIPPED participant" || { printf '  FAIL  T-16(re-entry): rc=%s out=%s\n' "$rc" "$out"; FAIL=1; }
+printf 'x\nSTATUS: PHASE 2 COMPLETE\n' > "$PR/02-p2.md"; echo 0 > "$PR/02-p2.exit"; printf 'body2\n' > "$PR/02-p2.stdout"; mkdir -p "$PR/02-p2.claim/runner"
+chk "T-16: every participant complete → run pre-phase3" 1 "already records a completed blind review" pgw pre-codex "$PR" "$G2"
 
 echo "review: consultation validator and state gates"
 CV=plugins/codex-pr-review/skills/two-model-pr-review/scripts/validate-consultation.py
 [ -x "$CV" ] && printf '  ok    %-42s\n' "consultation validator is executable" || { printf '  FAIL  consultation validator is not executable\n'; FAIL=1; }
+# review round 1 F-18: a citation quoting the runner's own option value "--via codex" is not an attribution
+python3 - <<'PY' && printf '  ok    %-42s\n' "F-18: '--via codex' passes, 'via codex' is caught" || { printf '  FAIL  F-18: provenance filter on the --via flag\n'; FAIL=1; }
+import sys; sys.path.insert(0, "plugins/codex-pr-review/skills/two-model-pr-review/scripts"); import review_common as rc
+assert rc.PROVENANCE_RE.search('argument-hint: [--via codex|ccr:<alias>[,...]]') is None
+assert rc.PROVENANCE_RE.search('default --via codex; at most one') is None
+assert rc.PROVENANCE_RE.search('reviewed via codex') is not None
+assert rc.PROVENANCE_RE.search('checked by Codex') is not None
+assert rc.PROVENANCE_RE.search('according to the lead') is not None
+PY
 CS="$TMP/consult"; mkdir -p "$CS"
 printf 'scope\n' > "$CS/00-scope.md"; mkbrief "$CS"
 pgw pre-codex "$CS" "$G2" >/dev/null || { printf '  FAIL  consultation fixture pre-codex\n'; FAIL=1; }
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$CS/01-lead.md"; chmod 000 "$CS/01-lead.md"
-printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$CS/02-codex.md"; printf '0\n' > "$CS/02-codex.exit"; printf 'blind codex body\n' > "$CS/02-codex.stdout"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$CS/02-p1.md"; printf '0\n' > "$CS/02-p1.exit"; printf 'blind codex body\n' > "$CS/02-p1.stdout"
 top_up_claims "$CS"; mv "$CS/00-repo.txt" "$TMP/cs-repo.bak"
 chk "CX-01r33: join requires the recorded repository" 1 "00-repo.txt missing" bash "$PG" pre-phase3 "$CS"
 # CX-02r38: a 00-repo.txt redirected to another (valid) revision before the join is rejected: it must restate the frozen brief's Target.
@@ -863,7 +1262,7 @@ rm -rf "$CS/04-consultation.claim"
 JN="$TMP/join-interrupted"; mkdir -p "$JN"; printf 'scope\n' > "$JN/00-scope.md"; mkbrief "$JN"
 pgw pre-codex "$JN" "$G2" >/dev/null
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$JN/01-lead.md"; chmod 000 "$JN/01-lead.md"
-printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$JN/02-codex.md"; printf '0\n' > "$JN/02-codex.exit"; printf 'blind codex body\n' > "$JN/02-codex.stdout"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$JN/02-p1.md"; printf '0\n' > "$JN/02-p1.exit"; printf 'blind codex body\n' > "$JN/02-p1.stdout"
 jnjoin=$(pgw pre-phase3 "$JN") || { printf '  FAIL  CX-01r40 fixture join\n'; FAIL=1; }
 jnseal=$(printf '%s' "$jnjoin" | grep -oE 'seal=[0-9a-f]{12}')
 [ -n "$jnseal" ] && [ "$jnseal" = "seal=$(shasum -a 256 "$JN/02-review-seal.sha256" | cut -c1-12)" ] && printf '  ok    %-42s\n' "CX-01r41: JOIN-OK carries the seal fingerprint" || { printf '  FAIL  CX-01r41: JOIN-OK seal fingerprint missing or wrong (%s)\n' "$jnjoin"; FAIL=1; }
@@ -871,10 +1270,10 @@ cp "$JN/00-accepted.sha256" "$TMP/jn-ledger.bak"; cp "$JN/02-review-seal.sha256"
 rm -f "$JN/00-accepted.sha256"
 chk "CX-01r40: seal without ledger completed by pre-phase3" 0 "JOIN-OK.*$jnseal" bash "$PG" pre-phase3 "$JN"
 # CX-01r41: a join re-minted over an edited body after a wipe is visible only as a changed seal fingerprint.
-rm -f "$JN/00-accepted.sha256" "$JN/02-review-seal.sha256"; printf 'edited codex body\n' > "$JN/02-codex.stdout"
+rm -f "$JN/00-accepted.sha256" "$JN/02-review-seal.sha256"; printf 'edited codex body\n' > "$JN/02-p1.stdout"
 chk "CX-01r41: re-minted join prints a different seal fingerprint" 0 "JOIN-OK" bash "$PG" pre-phase3 "$JN"
 bash "$PG" pre-phase3 "$JN" 2>&1 | grep -q "$jnseal" && { printf '  FAIL  CX-01r41: re-minted seal kept the old fingerprint\n'; FAIL=1; } || printf '  ok    %-42s\n' "CX-01r41: re-minted seal fingerprint differs"
-rm -f "$JN/00-accepted.sha256" "$JN/02-review-seal.sha256"; printf 'blind codex body\n' > "$JN/02-codex.stdout"; pgw pre-phase3 "$JN" >/dev/null
+rm -f "$JN/00-accepted.sha256" "$JN/02-review-seal.sha256"; printf 'blind codex body\n' > "$JN/02-p1.stdout"; pgw pre-phase3 "$JN" >/dev/null
 cmp -s "$JN/02-review-seal.sha256" "$TMP/jn-seal.bak" || { printf '  FAIL  CX-01r41: fixture restore\n'; FAIL=1; }
 rm -f "$JN/00-accepted.sha256"
 chk "CX-01r40: seal without ledger completed by pre-phase3 (restored)" 0 "JOIN-OK.*$jnseal" bash "$PG" pre-phase3 "$JN"
@@ -914,7 +1313,7 @@ cat > "$CS/04-consultation.stdout" <<'CONSULT'
 CONSULT
 chk "consultation: exact response IDs"  0 "dispositions=2"       python3 "$CV" --manifest "$CS/03-matrix.tsv" --selection "$CS/03-debate-selection.tsv" --phase consultation --extract "$CS/04-consultation.stdout" --out "$CS/04-consultation.json"
 printf 'consultation\nSTATUS: PHASE 4 COMPLETE\n' > "$CS/04-consultation.md"
-printf 'thread=thread-1\noutcome=COMPLETED\n' > "$CS/02-codex.meta"
+printf 'thread=thread-1\noutcome=COMPLETED\n' > "$CS/02-p1.meta"
 printf 'thread=thread-2\noutcome=COMPLETED\ncommand=task --fresh --background --prompt-file p\n' > "$CS/04-consultation.meta"
 printf '0\n' > "$CS/04-consultation.exit"
 chk "gate: pre-verification"            0 "VERIFICATION-OK"      pgw pre-verification "$CS"
@@ -948,9 +1347,9 @@ chmod 600 "$CS/00-accepted.sha256"; cp "$TMP/cs-ledger.bak" "$CS/00-accepted.sha
 printf 'thread=wrong\noutcome=COMPLETED\ncommand=task --resume-last --background --prompt-file p\n' > "$CS/04-consultation.meta"
 chk "gate: thread mismatch"             1 "unexpected Codex thread" pgw pre-verification "$CS"
 printf 'thread=thread-2\noutcome=COMPLETED\ncommand=task --fresh --background --prompt-file p\n' > "$CS/04-consultation.meta"
-printf 'changed blind body\n' > "$CS/02-codex.stdout"
+printf 'changed blind body\n' > "$CS/02-p1.stdout"
 chk "gate: codex body tampered"         1 "initial review bodies changed" pgw pre-verification "$CS"
-printf 'blind codex body\n' > "$CS/02-codex.stdout"
+printf 'blind codex body\n' > "$CS/02-p1.stdout"
 cp "$CS/02-review-seal.sha256" "$CS/02-review-seal.sha256.good"
 chmod 600 "$CS/02-review-seal.sha256"
 printf 'invalid\n' > "$CS/02-review-seal.sha256"
@@ -1010,11 +1409,11 @@ PY2
 chk "CX-03r26: hand-edited verifier packets rejected at pre-report" 1 "05-verifier-packets.ndjson changed after it was accepted" pgw pre-report "$CS"
 cp "$TMP/cs-packets2.bak" "$CS/05-verifier-packets.ndjson"
 # CX-02r22: deleting the seal and flipping Phase 2 to SKIPPED must not reach REPORT-OK.
-cp "$CS/02-review-seal.sha256" "$TMP/cs-seal2.bak"; cp "$CS/02-codex.md" "$TMP/cs-02md.bak"
+cp "$CS/02-review-seal.sha256" "$TMP/cs-seal2.bak"; cp "$CS/02-p1.md" "$TMP/cs-02md.bak"
 chmod u+w "$CS/02-review-seal.sha256"; rm -f "$CS/02-review-seal.sha256"
-printf 'PROBE FAILED\nSTATUS: PHASE 2 COMPLETE (SKIPPED — probe failed)\n' > "$CS/02-codex.md"
+printf 'PROBE FAILED\nSTATUS: PHASE 2 COMPLETE (SKIPPED — probe failed)\n' > "$CS/02-p1.md"
 chk "CX-02r22: deleted seal + SKIPPED flip rejected at pre-report" 1 "02-review-seal.sha256 was accepted by pre-phase3 but is missing" pgw pre-report "$CS"
-cp "$TMP/cs-02md.bak" "$CS/02-codex.md"; cp "$TMP/cs-seal2.bak" "$CS/02-review-seal.sha256"; chmod 400 "$CS/02-review-seal.sha256"
+cp "$TMP/cs-02md.bak" "$CS/02-p1.md"; cp "$TMP/cs-seal2.bak" "$CS/02-review-seal.sha256"; chmod 400 "$CS/02-review-seal.sha256"
 # L-01r22: the selector is frozen at pre-consultation; editing it afterwards is caught.
 cp "$CS/03-debate-selection.tsv" "$TMP/cs-sel.bak"
 printf 'F-01\tBOTH\tP2\tEXCLUDE\tedited\n' > "$CS/03-debate-selection.tsv"
@@ -1092,16 +1491,21 @@ chk "CX-06r17: mode=--fresh accepted" 0 "REPORT-OK" pgw pre-report "$CS"
 # CX-03r18: a --fresh consultation retry needs no prior thread: with the Phase-2
 # thread unknown, mode=--fresh must still pass check_thread. The thread anchor is
 # a final ledger row, so removing it is caught rather than falling back.
-cp "$CS/02-codex.meta" "$TMP/cs-02meta.bak"; cp "$CS/04-consultation.thread" "$TMP/cs-anchor.bak"
-sed -i.bak 's/^thread=.*/thread=unknown/' "$CS/02-codex.meta" && rm -f "$CS/02-codex.meta.bak"
+cp "$CS/02-p1.meta" "$TMP/cs-02meta.bak"; cp "$CS/04-consultation.thread" "$TMP/cs-anchor.bak"
+sed -i.bak 's/^thread=.*/thread=unknown/' "$CS/02-p1.meta" && rm -f "$CS/02-p1.meta.bak"
 printf 'thread=unknown\noutcome=COMPLETED\nmode=--fresh\ncommand=task --fresh --background --prompt-file p\n' > "$CS/04-consultation.meta"
 chk "CX-03r18: fresh retry passes with unknown prior thread" 0 "REPORT-OK" pgw pre-report "$CS"
 printf 'thread=unknown\noutcome=COMPLETED\nmode=--resume-last\ncommand=task --resume-last --background --prompt-file p\n' > "$CS/04-consultation.meta"
 chk "CX-03r18: resume-last must match the accepted thread anchor" 1 "resumed unexpected Codex thread" pgw pre-report "$CS"
+# review round 2 F-04: pre-report anchors an explicit --resume-session the same way
+printf 'thread=unknown\noutcome=COMPLETED\nmode=--resume-session\nresume_session=unknown\ncommand=task --resume-session unknown --background --prompt-file p\n' > "$CS/04-consultation.meta"
+chk "F-04: pre-report rejects --resume-session off the anchor" 1 "resumed unexpected Codex thread" pgw pre-report "$CS"
+printf 'thread=thread-2\noutcome=COMPLETED\nmode=--resume-session\nresume_session=thread-2\ncommand=task --resume-session thread-2 --background --prompt-file p\n' > "$CS/04-consultation.meta"
+chk "F-04: pre-report accepts --resume-session on the anchor" 0 "REPORT-OK" pgw pre-report "$CS"
 chmod u+w "$CS/04-consultation.thread"; rm -f "$CS/04-consultation.thread"
 chk "ledger: deleted thread anchor caught" 1 "04-consultation.thread was accepted by pre-verification but is missing" pgw pre-report "$CS"
 cp "$TMP/cs-anchor.bak" "$CS/04-consultation.thread"; chmod 400 "$CS/04-consultation.thread"
-cp "$TMP/cs-02meta.bak" "$CS/02-codex.meta"
+cp "$TMP/cs-02meta.bak" "$CS/02-p1.meta"
 printf 'thread=thread-2\noutcome=COMPLETED\nmode=--fresh\ncommand=task --fresh --background --prompt-file p\n' > "$CS/04-consultation.meta"
 # CX-03r16: an exit-5 (unconfirmed cancel) consultation sidecar must block
 # pre-report even when the consultation phase was recorded as SKIPPED.
@@ -1192,14 +1596,14 @@ SK4="$TMP/f04"; mkdir -p "$SK4"
 printf 'scope\n' > "$SK4/00-scope.md"; mkbrief "$SK4"
 pgw pre-codex "$SK4" "$G2" >/dev/null
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$SK4/01-lead.md"; chmod 000 "$SK4/01-lead.md"
-printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK4/02-codex.md"; printf '0\n' > "$SK4/02-codex.exit"; printf 'blind codex body\n' > "$SK4/02-codex.stdout"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK4/02-p1.md"; printf '0\n' > "$SK4/02-p1.exit"; printf 'blind codex body\n' > "$SK4/02-p1.stdout"
 pgw pre-phase3 "$SK4" >/dev/null
 chmod 600 "$SK4/01-lead.md"
 printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$SK4/03-matrix.md"
 printf 'F-01\tCLAUDE-ONLY\tP2\n' > "$SK4/03-matrix.tsv"
 base_packets "$SK4"
 printf 'F-01\tCLAUDE-ONLY\tP2\tEXCLUDE\tCLAUDE-ONLY-P2\n' > "$SK4/03-debate-selection.tsv"
-printf 'codex declined\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$SK4/02-codex.md"
+printf 'codex declined\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$SK4/02-p1.md"
 chk "F-04: status downgrade after seal caught" 1 "status changed after JOIN-OK" pgw pre-consultation "$SK4"
 
 # F-03 (round 4): pre-phase3 and post-join must also call
@@ -1217,7 +1621,7 @@ SK4B="$TMP/f04b"; mkdir -p "$SK4B"
 printf 'scope\n' > "$SK4B/00-scope.md"; mkbrief "$SK4B"
 pgw pre-codex "$SK4B" "$G2" >/dev/null
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$SK4B/01-lead.md"; chmod 000 "$SK4B/01-lead.md"
-printf 'PROBE UNAVAILABLE\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$SK4B/02-codex.md"
+printf 'PROBE UNAVAILABLE\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$SK4B/02-p1.md"
 pgw pre-phase3 "$SK4B" >/dev/null
 chmod 600 "$SK4B/01-lead.md"
 printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$SK4B/03-matrix.md"
@@ -1234,7 +1638,7 @@ CANDIDATES3="$TMP/f03"; mkdir -p "$CANDIDATES3"
 printf 'scope\n' > "$CANDIDATES3/00-scope.md"; mkbrief "$CANDIDATES3"
 pgw pre-codex "$CANDIDATES3" "$G2" >/dev/null
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$CANDIDATES3/01-lead.md"; chmod 000 "$CANDIDATES3/01-lead.md"
-printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$CANDIDATES3/02-codex.md"; printf '0\n' > "$CANDIDATES3/02-codex.exit"; printf 'blind codex body\n' > "$CANDIDATES3/02-codex.stdout"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$CANDIDATES3/02-p1.md"; printf '0\n' > "$CANDIDATES3/02-p1.exit"; printf 'blind codex body\n' > "$CANDIDATES3/02-p1.stdout"
 pgw pre-phase3 "$CANDIDATES3" >/dev/null
 chmod 600 "$CANDIDATES3/01-lead.md"
 printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$CANDIDATES3/03-matrix.md"
@@ -1252,7 +1656,7 @@ SK8="$TMP/f08"; mkdir -p "$SK8"
 printf 'scope\n' > "$SK8/00-scope.md"; mkbrief "$SK8"
 pgw pre-codex "$SK8" "$G2" >/dev/null
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$SK8/01-lead.md"; chmod 000 "$SK8/01-lead.md"
-printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK8/02-codex.md"; printf '0\n' > "$SK8/02-codex.exit"; printf 'blind codex body\n' > "$SK8/02-codex.stdout"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK8/02-p1.md"; printf '0\n' > "$SK8/02-p1.exit"; printf 'blind codex body\n' > "$SK8/02-p1.stdout"
 pgw pre-phase3 "$SK8" >/dev/null
 chmod 600 "$SK8/01-lead.md"
 printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$SK8/03-matrix.md"
@@ -1263,7 +1667,7 @@ pgw pre-consultation "$SK8" >/dev/null
 # CX-01r24: pre-consultation refuses a second launch when an accepted attempt or the terminal artifact exists.
 printf '0\n' > "$SK8/04-consultation.exit"; printf '```json\n{"phase":"consultation","dispositions":[]}\n```\n' > "$SK8/04-consultation.stdout"; printf 'mode=--fresh\n' > "$SK8/04-consultation.meta"
 chk "CX-01r24: pre-consultation refuses relaunch over accepted attempt" 1 "with no 04-consultation.md yet" pgw pre-consultation "$SK8"
-printf 'thread=t-sk8\noutcome=COMPLETED\n' > "$SK8/02-codex.meta"; printf 'mode=--resume-last\nthread=t-other\n' > "$SK8/04-consultation.meta"
+printf 'thread=t-sk8\noutcome=COMPLETED\n' > "$SK8/02-p1.meta"; printf 'mode=--resume-last\nthread=t-other\n' > "$SK8/04-consultation.meta"
 chk "CX-04r37: valid response on the wrong thread allows the --fresh relaunch" 0 "CONSULTATION-OK" pgw pre-consultation "$SK8"
 # CL-01r39/40: while the authorized launch is in flight, a failing re-entry must not re-accept edited drafts.
 cp "$SK8/00-accepted.sha256" "$TMP/sk8-ledger-inflight.bak"; cp "$SK8/03-matrix.md" "$TMP/sk8-matrix.bak"
@@ -1386,14 +1790,14 @@ SK6="$TMP/f06"; mkdir -p "$SK6"
 printf 'scope\n' > "$SK6/00-scope.md"; mkbrief "$SK6"
 pgw pre-codex "$SK6" "$G2" >/dev/null
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$SK6/01-lead.md"; chmod 000 "$SK6/01-lead.md"
-printf 'PROBE UNAVAILABLE\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$SK6/02-codex.md"
+printf 'PROBE UNAVAILABLE\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$SK6/02-p1.md"
 # CX-01r19: an exit-5 / unconfirmed-cancel sidecar on the initial review blocks
 # the join even when the phase was recorded SKIPPED, and a rotated one too.
-printf '5\n' > "$SK6/02-codex.exit"
-chk "CX-01r19: pre-phase3 rejects exit-5 initial review (SKIPPED)" 1 "02-codex recorded exit 5" pgw pre-phase3 "$SK6"
-rm -f "$SK6/02-codex.exit"; printf 'outcome=STALLED\ncancel_confirmed=no\n' > "$SK6/02-codex.attempt1.meta"
+printf '5\n' > "$SK6/02-p1.exit"
+chk "CX-01r19: pre-phase3 rejects exit-5 initial review (SKIPPED)" 1 "02-p1 recorded exit 5" pgw pre-phase3 "$SK6"
+rm -f "$SK6/02-p1.exit"; printf 'outcome=STALLED\ncancel_confirmed=no\n' > "$SK6/02-p1.attempt1.meta"
 chk "CX-01r19: rotated cancel_confirmed=no blocks the join" 1 "cancel_confirmed=no" pgw pre-phase3 "$SK6"
-rm -f "$SK6/02-codex.attempt1.meta"
+rm -f "$SK6/02-p1.attempt1.meta"
 pgw pre-phase3 "$SK6" >/dev/null
 chmod 600 "$SK6/01-lead.md"
 printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$SK6/03-matrix.md"
@@ -1431,7 +1835,7 @@ SK1B="$TMP/f01r5"; mkdir -p "$SK1B"
 printf 'scope\n' > "$SK1B/00-scope.md"; mkbrief "$SK1B"
 pgw pre-codex "$SK1B" "$G2" >/dev/null
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$SK1B/01-lead.md"; chmod 000 "$SK1B/01-lead.md"
-printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK1B/02-codex.md"; printf '0\n' > "$SK1B/02-codex.exit"; printf 'blind codex body\n' > "$SK1B/02-codex.stdout"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK1B/02-p1.md"; printf '0\n' > "$SK1B/02-p1.exit"; printf 'blind codex body\n' > "$SK1B/02-p1.stdout"
 pgw pre-phase3 "$SK1B" >/dev/null
 chmod 600 "$SK1B/01-lead.md"
 printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$SK1B/03-matrix.md"
@@ -1528,7 +1932,7 @@ SK2R6="$TMP/f02r6"; mkdir -p "$SK2R6"
 printf 'scope\n' > "$SK2R6/00-scope.md"; mkbrief "$SK2R6"
 pgw pre-codex "$SK2R6" "$G2" >/dev/null
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$SK2R6/01-lead.md"; chmod 000 "$SK2R6/01-lead.md"
-printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK2R6/02-codex.md"; printf '0\n' > "$SK2R6/02-codex.exit"; printf 'blind codex body\n' > "$SK2R6/02-codex.stdout"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK2R6/02-p1.md"; printf '0\n' > "$SK2R6/02-p1.exit"; printf 'blind codex body\n' > "$SK2R6/02-p1.stdout"
 pgw pre-phase3 "$SK2R6" >/dev/null
 chmod 600 "$SK2R6/01-lead.md"
 printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$SK2R6/03-matrix.md"
@@ -1546,9 +1950,9 @@ SK4R6="$TMP/f04r6"; mkdir -p "$SK4R6"
 printf 'scope\n' > "$SK4R6/00-scope.md"; mkbrief "$SK4R6"
 pgw pre-codex "$SK4R6" "$G2" >/dev/null
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$SK4R6/01-lead.md"; chmod 000 "$SK4R6/01-lead.md"
-printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK4R6/02-codex.md"; printf '0\n' > "$SK4R6/02-codex.exit"; printf 'blind codex body\n' > "$SK4R6/02-codex.stdout"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK4R6/02-p1.md"; printf '0\n' > "$SK4R6/02-p1.exit"; printf 'blind codex body\n' > "$SK4R6/02-p1.stdout"
 pgw pre-phase3 "$SK4R6" >/dev/null
-printf 'codex declined\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$SK4R6/02-codex.md"
+printf 'codex declined\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$SK4R6/02-p1.md"
 chk "F-04r6: pre-codex catches sealed-run tampering" 1 "status changed after JOIN-OK" pgw pre-codex "$SK4R6" "$G2"
 
 echo "review: round-7 findings F-01r7/F-02r7 regressions"
@@ -1566,7 +1970,7 @@ SK2R7="$TMP/f02r7"; mkdir -p "$SK2R7"
 printf 'scope\n' > "$SK2R7/00-scope.md"; mkbrief "$SK2R7"
 pgw pre-codex "$SK2R7" "$G2" >/dev/null
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$SK2R7/01-lead.md"; chmod 000 "$SK2R7/01-lead.md"
-printf 'PROBE UNAVAILABLE\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$SK2R7/02-codex.md"
+printf 'PROBE UNAVAILABLE\nSTATUS: PHASE 2 COMPLETE (SKIPPED — declined)\n' > "$SK2R7/02-p1.md"
 pgw pre-phase3 "$SK2R7" >/dev/null
 chmod 600 "$SK2R7/01-lead.md"
 printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$SK2R7/03-matrix.md"
@@ -1600,7 +2004,7 @@ SK2R8="$TMP/f02r8"; mkdir -p "$SK2R8"
 printf 'scope\n' > "$SK2R8/00-scope.md"; mkbrief "$SK2R8"
 pgw pre-codex "$SK2R8" "$G2" >/dev/null
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$SK2R8/01-lead.md"; chmod 000 "$SK2R8/01-lead.md"
-printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK2R8/02-codex.md"; printf '0\n' > "$SK2R8/02-codex.exit"; printf 'blind codex body\n' > "$SK2R8/02-codex.stdout"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK2R8/02-p1.md"; printf '0\n' > "$SK2R8/02-p1.exit"; printf 'blind codex body\n' > "$SK2R8/02-p1.stdout"
 pgw pre-phase3 "$SK2R8" >/dev/null
 chmod 600 "$SK2R8/01-lead.md"
 printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$SK2R8/03-matrix.md"
@@ -1632,7 +2036,7 @@ SK1R10="$TMP/f01r10"; mkdir -p "$SK1R10"
 printf 'scope\n' > "$SK1R10/00-scope.md"; mkbrief "$SK1R10"
 pgw pre-codex "$SK1R10" "$G2" >/dev/null
 printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$SK1R10/01-lead.md"; chmod 000 "$SK1R10/01-lead.md"
-printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK1R10/02-codex.md"; printf '0\n' > "$SK1R10/02-codex.exit"; printf 'blind codex body\n' > "$SK1R10/02-codex.stdout"
+printf 'codex\nSTATUS: PHASE 2 COMPLETE\n' > "$SK1R10/02-p1.md"; printf '0\n' > "$SK1R10/02-p1.exit"; printf 'blind codex body\n' > "$SK1R10/02-p1.stdout"
 pgw pre-phase3 "$SK1R10" >/dev/null
 chmod 600 "$SK1R10/01-lead.md"
 printf 'matrix\nSTATUS: PHASE 3 COMPLETE\n' > "$SK1R10/03-matrix.md"
@@ -1650,7 +2054,7 @@ chk "CX-02r21: skip after a failed attempt accepted" 0 "VERIFICATION-OK consulta
 # CX-02r30: a SKIPPED consultation over an exit-0 attempt is allowed only if that response fails validation.
 printf '0\n' > "$SK1R10/04-consultation.attempt1.exit"; printf 'no json here\n' > "$SK1R10/04-consultation.attempt1.stdout"
 chk "CX-02r30: skip over a malformed exit-0 response accepted" 0 "VERIFICATION-OK consultation=SKIPPED" pgw pre-verification "$SK1R10"
-printf 'thread=t-sk1\noutcome=COMPLETED\n' > "$SK1R10/02-codex.meta"
+printf 'thread=t-sk1\noutcome=COMPLETED\n' > "$SK1R10/02-p1.meta"
 printf '```json\n{"phase":"consultation","dispositions":[{"id":"F-01","action":"MAINTAIN","claim":"first","severity":"P1","locations":["a:1"],"trigger":"t","impact":"i","observations":["a:1 \\"x\\""],"falsifier":"f","proposed_checks":["c"],"open_factual_questions":[]}]}\n```\n' > "$SK1R10/04-consultation.attempt1.stdout"
 printf 'mode=--resume-last\nthread=t-other\n' > "$SK1R10/04-consultation.attempt1.meta"
 chk "CX-04r37: valid response on the wrong thread is skippable" 0 "VERIFICATION-OK consultation=SKIPPED" pgw pre-verification "$SK1R10"
@@ -1834,7 +2238,7 @@ chk "CX-01r37: artifact-shaped root path still rejected" 1 "provenance or artifa
 # CX-02r16: table-driven — every shipped artifact name is rejected in free text
 # and in structured fields; ordinary repo paths that merely start with digits are not.
 n=0; bad=""
-for name in 00-scope.md 00-accepted.sha256 run/00-accepted.sha256 00-brief.md 00-brief.md.tree 00-brief.md.baseline 00-brief.md.sha256 00-run.md 00-intent.txt 00-conventions.txt 01-lead.md 01-lead.web.md 02-codex.stdout 02-codex.stderr 02-codex.joblog 02-codex.progress 02-codex.meta 02-codex.exit 02-codex.attempt2.stderr 03-findings.ndjson 03-findings.sha256 07-review.md 02-review-seal.sha256 03-matrix.tsv 03-debate-selection.tsv 04-consultation.thread 04-consultation.prompt.md 05-verifier-packets.ndjson 05-verdicts.tsv 06-resolution-selection.ids 06-resolution.json verify-scratch lead-scratch; do
+for name in 00-scope.md 00-accepted.sha256 run/00-accepted.sha256 00-brief.md 00-brief.md.tree 00-brief.md.baseline 00-brief.md.sha256 00-run.md 00-intent.txt 00-conventions.txt 01-lead.md 01-lead.web.md 02-p1.stdout 02-p1.stderr 02-p1.joblog 02-p1.progress 02-p1.meta 02-p1.exit 02-p1.attempt2.stderr 03-findings.ndjson 03-findings.sha256 07-review.md 02-review-seal.sha256 03-matrix.tsv 03-debate-selection.tsv 04-consultation.thread 04-consultation.prompt.md 05-verifier-packets.ndjson 05-verdicts.tsv 06-resolution-selection.ids 06-resolution.json verify-scratch lead-scratch; do
   python3 - "$TMP/f01r9.tsv" "$name" <<'PY2'
 import json,sys
 tsv,name=sys.argv[1],sys.argv[2]
@@ -1906,7 +2310,7 @@ chk "L-02r16: unterminated quoted path rejected" 1 "path:line" python3 "$PV" --m
 out=$(node - "$WF" <<'JSEOF' 2>&1
 const fs = require("fs"); const src = fs.readFileSync(process.argv[2], "utf8");
 const P = eval(src.match(/const PROVENANCE_RE = (.*)\n/)[1]);
-const bad = ["See 07-review.md","see run/07-review.md","open 02-codex.stderr","the 00-brief.md.tree hash","wrote verify-scratch/F-01","claude opus decided"];
+const bad = ["See 07-review.md","see run/07-review.md","open 02-p1.stderr","the 00-brief.md.tree hash","wrote verify-scratch/F-01","claude opus decided"];
 const good = ["the anthropic client retries twice","docs/00-intro.md:3","a haiku about opus","templates/REVIEW.md:12"];
 for (const t of bad) if (!P.test(t)) throw new Error("JS accepted: " + t);
 for (const t of good) if (P.test(t)) throw new Error("JS rejected: " + t);
@@ -2152,6 +2556,68 @@ bash "$AW" "$WD/s2" --expect "$WD/.stage-verify.done" --after-sec 12 --poll-sec 
 printf 'done\n' > "$WD/.stage-verify.done"
 wait "$S1"; R1=$?; wait "$S2"; R2=$?
 [ "$R1" = 0 ] && [ "$R2" = 0 ] && printf '  ok    %-42s\n' "watch: stage sentinel ends both watchers" || { printf '  FAIL  watch: sentinel exits %s/%s (want 0/0)\n' "$R1" "$R2"; FAIL=1; }
+
+echo "debate: next-opponent.py schedules the strongest dissent (T-27, T-27b)"
+NO=plugins/codex-debate/skills/codex-debate/scripts/next-opponent.py
+ND="$TMP/nd"; rm -rf "$ND"; mkdir -p "$ND"
+printf 'p1\tcodex\t-\np2\tccr\ta\np3\tccr\tb\np4\tccr\tc\np5\tccr\td\n' > "$ND/00-participants.tsv"
+ledger() {  # ledger <file> rows...  (each row: id|owner|grade|status|changed; claim names C-1)
+  { printf '| ID | Owner | Claim | Grade | Evidence | Status | Changed in |\n|---|---|---|---|---|---|---|\n'
+    for r in "$@"; do IFS='|' read -r id ow gr st ch <<< "$r"; printf '| %s | %s | C-1 is wrong | %s | f.txt | %s | %s |\n' "$id" "$ow" "$gr" "$st" "$ch"; done; } > "$ND/03-ledger.md"
+}
+no() { python3 "$NO" --art "$ND" --rounds "$1" ${2:+--total-rounds "$2"}; }
+# scores: p1 E2=2, p2 E0=4, p3 E0+E3=5, p4 (no open row), p5 E1=3 → p3 first
+ledger 'X1-01|p1|E2|OPEN|r0' 'X2-01|p2|E0|OPEN|r0' 'X3-01|p3|E0|OPEN|r0' 'X3-02|p3|E3|OPEN|r0' 'X4-01|p4|E1|VERIFIED-FALSE|r0' 'X5-01|p5|E1|OPEN|r0'
+chk "T-27: highest dissent score picked first" 0 "NEXT p3 round=1 pair_round=1 score=5" no 3
+# p3 faced in r1 with no change → coverage: p3 skipped until the others had a turn; next is p2 (4)
+touch "$ND/03-round-1-p3.md"
+chk "T-27: faced participant skipped (coverage)" 0 "NEXT p2 round=2 pair_round=1 score=4" no 3
+# tie: p2 and p5 both at 4 → lowest k
+ledger 'X1-01|p1|E2|OPEN|r0' 'X2-01|p2|E0|OPEN|r0' 'X3-01|p3|E0|OPEN|r0' 'X3-02|p3|E3|OPEN|r0' 'X5-01|p5|E0|OPEN|r0'
+chk "T-27: tie by lowest k" 0 "NEXT p2 round=2 pair_round=1 score=4 reason=highest dissent score, coverage turn, tie by lowest k" no 3
+# VERIFY pending with the participant just faced → the same participant is re-selected
+ledger 'X1-01|p1|E2|OPEN|r0' 'X2-01|p2|E0|OPEN|r0' 'X3-01|p3|E0|VERIFY-PENDING|r1' 'X3-02|p3|E3|OPEN|r0' 'X5-01|p5|E0|OPEN|r0'
+chk "T-27: VERIFY pending re-selects p3" 0 "NEXT p3 round=2 pair_round=2 score=5 reason=VERIFY pending" no 3
+# convergence: every row of every participant closed → DONE
+ledger 'X1-01|p1|E2|CONCEDED-BY-P1|r1' 'X2-01|p2|E0|VERIFIED-FALSE|r1' 'X3-01|p3|E0|CONCEDED-BY-CLAUDE|r1'
+chk "T-27: DONE at convergence" 0 "DONE p1:convergence; p2:convergence; p3:convergence; p4:convergence; p5:convergence" no 3
+# stalemate: p3's last two rounds changed nothing while its row stays OPEN; every other pair converged
+ledger 'X3-01|p3|E0|OPEN|r0'
+touch "$ND/03-round-2-p3.md"
+chk "T-27: DONE at stalemate" 0 "p3:stalemate" no 3
+# review round 1 F-03: a round that changed only a Claude-owned row (conceded, verified) is not a stalemate round
+ledger 'C-1|claude|E1|CONCEDED-BY-CLAUDE|r2' 'X3-01|p3|E0|OPEN|r0'
+chk "F-03: Claude-row change in the pair's round → not a stalemate" 0 "NEXT p3 round=3 pair_round=3" no 5
+ledger 'X3-01|p3|E0|OPEN|r0'
+# pair cap: rounds 2 with two rounds held and a change in r2 → cap, not stalemate
+ledger 'X3-01|p3|E0|OPEN|r2'
+chk "T-27: DONE at the pair cap" 0 "p3:pair cap" no 2
+# review round 1 F-15: one-turn coverage keeps the cycle in progress — after p1,p2,p3,p1,p2 the turn is p3's
+rm -f "$ND"/03-round-*.md
+ledger 'X1-01|p1|E0|OPEN|r4' 'X2-01|p2|E2|OPEN|r5' 'X3-01|p3|E3|OPEN|r3'
+printf 'p1\tcodex\t-\np2\tccr\ta\np3\tccr\tb\n' > "$ND/00-participants.tsv"
+for f in 1-p1 2-p2 3-p3 4-p1 5-p2; do touch "$ND/03-round-$f.md"; done
+chk "F-15: partial cycle kept after a complete one" 0 "NEXT p3 round=6 pair_round=2 score=1 reason=highest dissent score, coverage turn" no 5 15
+rm -f "$ND"/03-round-*.md; printf 'p1\tcodex\t-\np2\tccr\ta\np3\tccr\tb\np4\tccr\tc\np5\tccr\td\n' > "$ND/00-participants.tsv"
+# gap in the round numbering → usage error
+touch "$ND/03-round-4-p1.md"
+chk "T-27: round-file gap refused" 2 "not numbered 1..n" no 3
+rm -f "$ND/03-round-4-p1.md"
+# T-27b: N = 5, rounds 3, --total-rounds 5: the global budget never converts an open pair into a converged one
+rm -f "$ND"/03-round-*.md
+ledger 'X1-01|p1|E0|OPEN|r0' 'X2-01|p2|E0|OPEN|r0' 'X3-01|p3|E0|OPEN|r0' 'X4-01|p4|E0|OPEN|r0' 'X5-01|p5|E0|OPEN|r0'
+for k in 1 2 3 4 5; do touch "$ND/03-round-$k-p$k.md"; done
+chk "T-27b: global budget → UNRESOLVED-GLOBAL" 0 "UNRESOLVED-GLOBAL p1 p2 p3 p4 p5 (global budget 5 spent" no 3 5
+ledger 'X1-01|p1|E0|VERIFIED-FALSE|r1' 'X2-01|p2|E0|OPEN|r0' 'X3-01|p3|E0|OPEN|r0' 'X4-01|p4|E0|VERIFIED-FALSE|r4' 'X5-01|p5|E0|CONCEDED-BY-P5|r5'
+chk "T-27b: only unfinished pairs listed" 0 "UNRESOLVED-GLOBAL p2 p3 (global budget 5 spent; p1:convergence; p2:open; p3:open; p4:convergence; p5:convergence)" no 3 5
+# the same state under the default budget (N × rounds = 15) keeps scheduling
+chk "T-27b: default budget keeps scheduling" 0 "NEXT p2 round=6 pair_round=2 score=4" no 3
+# the hard cap: --total-rounds above 5 × N is clamped, --rounds above 5 refused
+chk "T-27b: --rounds above the hard cap" 2 "must be 1..5" no 6
+# every pair terminated → DONE even with budget left
+ledger 'X2-01|p2|E0|VERIFIED-TRUE|r6'
+chk "T-27b: DONE before the budget ends" 0 "DONE p1:convergence; p2:convergence; p3:convergence; p4:convergence; p5:convergence" no 3 15
+
 
 
 echo

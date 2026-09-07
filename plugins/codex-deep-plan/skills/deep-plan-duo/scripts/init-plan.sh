@@ -1,23 +1,23 @@
 #!/bin/bash
 # init-plan.sh — create the artifact directory for one deep-plan run and pin its inputs verbatim.
 #
-#   init-plan.sh --repo <path> --out <dir> [--slug <name>] [--rounds N] [--solo] [--deep] \
+#   init-plan.sh --repo <path> --out <dir> [--slug <name>] [--rounds N] [--solo] [--deep] [--via <spec>] [--implement ccr:<alias>] \
 #                (--issue <N|URL> | --pr <N|URL> | --comment <URL> | --request "<text>" | --request-file <file>)...
 #   init-plan.sh --parse-only (--issue|--pr|--comment) <value>      # print the parsed reference; no network
 #
-# Writes: <out>/meta.json (slug, repo, base_sha, branch, dirty_tree, rounds, solo, mode_requested, inputs[])
+# Writes: <out>/meta.json (slug, repo, base_sha, branch, dirty_tree, rounds, solo, mode_requested, via, implement, inputs[])
 #         <out>/00-scope.md.baseline (NUL-separated `git status`, the read-only audit baseline)
 #         <out>/inputs/<kind>-<id>.md one per input, body text untouched
 #         <out>/debate/ (empty)
 # Exit 0 ok · 2 usage error · 3 `gh` unavailable or a GitHub fetch failed (everything else is still
 # written; the message names the input so the caller can paste it with --request-file instead).
 set -uo pipefail
-USAGE='usage: init-plan.sh --repo <path> --out <dir> [--slug <name>] [--rounds N] [--solo] [--deep] (--issue <N|URL> | --pr <N|URL> | --comment <URL> | --request "<text>" | --request-file <file>)...
+USAGE='usage: init-plan.sh --repo <path> --out <dir> [--slug <name>] [--rounds N] [--solo] [--deep] [--via codex|ccr:<alias>] [--implement ccr:<alias>] (--issue <N|URL> | --pr <N|URL> | --comment <URL> | --request "<text>" | --request-file <file>)...
        init-plan.sh --parse-only (--issue|--pr|--comment) <value>'
 die2() { echo "init-plan.sh: $1" >&2; echo "$USAGE" >&2; exit 2; }
 need() { [ $# -ge 2 ] || die2 "$1 requires a value"; case "$2" in -*) die2 "$1 requires a value (got option $2)";; esac; }
 SK="$(cd "$(dirname "$0")/.." && pwd)"
-REPO=""; OUT=""; SLUG=""; ROUNDS=""; SOLO=false; DEEP=false; PARSE_ONLY=false
+REPO=""; OUT=""; SLUG=""; ROUNDS=""; SOLO=false; DEEP=false; PARSE_ONLY=false; VIA=codex; IMPLEMENT=""
 PAIRS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -27,6 +27,8 @@ while [ $# -gt 0 ]; do
     --rounds) need "$@"; ROUNDS="$2"; shift;;
     --solo) SOLO=true;;
     --deep) DEEP=true;;
+    --via) need "$@"; VIA="$2"; shift;;
+    --implement) need "$@"; IMPLEMENT="$2"; shift;;
     --parse-only) PARSE_ONLY=true;;
     --request) [ $# -ge 2 ] || die2 "--request requires a value"; PAIRS+=("request" "$2"); shift;;   # free text may begin with "-"
     --issue|--pr|--comment|--request-file) need "$@"; PAIRS+=("${1#--}" "$2"); shift;;
@@ -37,6 +39,11 @@ done
 if [ -z "$ROUNDS" ]; then if $DEEP; then ROUNDS=3; else ROUNDS=2; fi; fi
 case "$ROUNDS" in ''|*[!0-9]*) die2 "--rounds requires a whole number (got '$ROUNDS')";; esac
 ROUNDS=$(printf '%s' "$ROUNDS" | sed 's/^0*//'); [ -n "$ROUNDS" ] && [ "$ROUNDS" -ge 1 ] && [ "$ROUNDS" -le 3 ] || die2 "--rounds must be between 1 and 3"
+# --via names the second model (the runner validates the alias at probe time); --implement names the
+# write-capable implementer used only after plan-mode approval, and is ccr-only by design.
+case "$VIA" in codex|ccr:[A-Za-z0-9._-]*) ;; *) die2 "--via must be codex or ccr:<alias> (got '$VIA')";; esac
+case "$IMPLEMENT" in ""|ccr:[A-Za-z0-9._-]*) ;; *) die2 "--implement must be ccr:<alias> (got '$IMPLEMENT')";; esac
+[ "$SOLO" != true ] || [ "$VIA" = codex ] || die2 "--solo and --via are exclusive (solo runs no second model)"
 [ ${#PAIRS[@]} -gt 0 ] || die2 "at least one input is required (--issue, --pr, --comment, --request or --request-file)"
 if $PARSE_ONLY; then
   [ ${#PAIRS[@]} -eq 2 ] || die2 "--parse-only takes exactly one input"
@@ -58,12 +65,13 @@ else
   done
 fi
 
-python3 - "$PARSE_ONLY" "$REPO" "${OUT:-}" "$SLUG" "$ROUNDS" "$SOLO" "$DEEP" "${PAIRS[@]}" <<'PY'
+python3 - "$PARSE_ONLY" "$REPO" "${OUT:-}" "$SLUG" "$ROUNDS" "$SOLO" "$DEEP" "$VIA" "$IMPLEMENT" "${PAIRS[@]}" <<'PY'
 import datetime, json, os, re, subprocess, sys
 
 parse_only, repo, out, slug, rounds, solo = sys.argv[1] == "true", sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5]), sys.argv[6] == "true"
 deep = sys.argv[7] == "true"
-pairs = sys.argv[8:]
+via, implement = sys.argv[8], sys.argv[9] or None
+pairs = sys.argv[10:]
 inputs = [(pairs[i], pairs[i + 1]) for i in range(0, len(pairs), 2)]
 GH_URL = re.compile(r"^(?:https?://)?github\.com/(?P<owner>[\w.-]+)/(?P<repo>[\w.-]+)/(?P<kind>issues|pull)/(?P<number>\d+)(?:/[\w/-]*)?(?:#(?P<frag>[\w-]+))?/?$")
 
@@ -284,6 +292,10 @@ for kind, value in inputs:
         records.append({"kind": "comment", "id": str(ref["comment_id"]), "url": d.get("html_url") or ref["url"], "file": f"inputs/{fn}",
                         "comment_kind": ref["comment_kind"], "parent": ref["number"], "title": title})
 
+if slug:
+    # An explicit slug is normalised exactly like a derived one: it names the artifact directory
+    # and the documented implementer branch plan/<slug> (review round 1: F-14).
+    slug = re.sub(r"[^a-z0-9]+", "-", slug.lower()).strip("-") or "plan"
 if not slug:
     first = records[0] if records else None
     if first and first["kind"] != "request":
@@ -296,7 +308,7 @@ if not slug:
 # mode_requested is the user's flag; the skill writes the resolved "mode" (question|light|standard|deep)
 # after classifying intent and scale (references/phases.md §0).
 meta = {"slug": slug, "repo": repo, "base_sha": sha, "branch": branch, "dirty_tree": dirty, "rounds": rounds,
-        "solo": solo, "mode_requested": "deep" if deep else None, "mode": None, "created": NOW,
+        "solo": solo, "mode_requested": "deep" if deep else None, "mode": None, "via": via, "implement": implement, "created": NOW,
         "inputs": records, "failed_inputs": failures}
 json.dump(meta, open(os.path.join(out, "meta.json"), "w", encoding="utf-8"), indent=2)
 open(os.path.join(out, "meta.json"), "a").write("\n")

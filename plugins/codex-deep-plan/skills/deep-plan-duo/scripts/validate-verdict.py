@@ -18,7 +18,7 @@ import argparse, json, os, re, subprocess, sys, tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True   # never write __pycache__ into the plugin (validator check 5, review F-14)
 sys.path.insert(0, HERE)
-from duo_common import CITE_RE, CMD_RE, has_citation, has_evidence_ref, load_rounds, fold, outstanding  # noqa: E402
+from duo_common import CITE_RE, CMD_RE, has_citation, has_evidence_ref, has_concession_ref, load_rounds, fold, outstanding  # noqa: E402
 
 PRAISE = re.compile(r"\b(great|excellent|as you (correctly|rightly)|well done|i (fully )?agree|"
                     r"good (catch|point|plan|idea)|solid plan|nice work|impressive)\b", re.I)
@@ -196,7 +196,7 @@ def validate(v, round_, role, prior_rounds, mode=None):
             e.append("bare APPROVE requires at least 3 checks_performed")
 
     for cp in v.get("changed_positions") or []:
-        if not has_evidence_ref(cp.get("because", "")):
+        if not has_concession_ref(cp.get("because", "")):
             e.append(f"changed_positions[{cp.get('objection_id', '?')}]: evidence-free concession")
 
     res_ids = set()
@@ -205,7 +205,7 @@ def validate(v, round_, role, prior_rounds, mode=None):
         res_ids.add(rid)
         if r.get("status") not in RESOLUTIONS:
             e.append(f"objection_resolutions[{rid}]: status not in {sorted(RESOLUTIONS)}")
-        if r.get("status") in ("WITHDRAWN", "DOWNGRADED") and not has_evidence_ref(r.get("because", "")):
+        if r.get("status") in ("WITHDRAWN", "DOWNGRADED") and not has_concession_ref(r.get("because", "")):
             e.append(f"objection_resolutions[{rid}]: {r.get('status')} without a citation or evidence id")
         if r.get("status") == "DOWNGRADED" and r.get("severity") not in SEV:
             e.append(f"objection_resolutions[{rid}]: DOWNGRADED needs a new severity")
@@ -235,14 +235,20 @@ def validate(v, round_, role, prior_rounds, mode=None):
 
 
 def check_citations(v, repo, base):
-    """Run check-citations.py on every sha-pinned citation Codex offered."""
+    """Run check-citations.py on every sha-pinned citation Codex offered.
+
+    Returns (fails, cited, bad): `bad` is the set of evidence strings whose citation did not
+    resolve verbatim. A non-verbatim quote is a defect of ONE citation, not of the reply: the
+    caller drops that citation (and the objection, when no citation remains) and warns, so a
+    dropped shell redirect or a missing backtick never turns a whole blind analysis into T5
+    (run 2026-09-07: two rounds of 24 KB lost to one citation each)."""
     lines = []
     for o in v.get("objections") or []:
         lines += [str(x) for x in (o.get("evidence") or []) if CITE_RE.search(str(x))]
     for rc in v.get("root_causes") or []:
         lines += [str(x) for x in (rc.get("evidence") or []) if CITE_RE.search(str(x))]
     if not lines:
-        return [], 0
+        return [], 0, set()
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as t:
         t.write("\n".join(lines) + "\n"); tmp = t.name
     try:
@@ -253,8 +259,45 @@ def check_citations(v, repo, base):
     finally:
         os.unlink(tmp)
     if r.returncode == 0:
-        return [], len(lines)
-    return [l[2:].replace(tmp + ":", "codex citation #") for l in r.stderr.splitlines() if l.startswith("- ")], len(lines)
+        return [], len(lines), set()
+    fails, bad = [], set()
+    for l in r.stderr.splitlines():
+        if not l.startswith("- "):
+            continue
+        m = re.match(r"- " + re.escape(tmp) + r":(\d+): (.*)$", l)
+        if m and 1 <= int(m.group(1)) <= len(lines):
+            bad.add(lines[int(m.group(1)) - 1])
+            fails.append(f"codex citation #{m.group(1)}: {m.group(2)}")
+        else:
+            fails.append(l[2:])
+    return fails, len(lines), bad
+
+
+def prune_citations(v, bad):
+    """Remove every evidence string in `bad`; drop an objection left without a citation
+    (the contract already discards evidence-free objections). Returns warning lines."""
+    warns, kept = [], []
+    for o in v.get("objections") or []:
+        ev = [x for x in (o.get("evidence") or []) if str(x) not in bad]
+        removed = len(o.get("evidence") or []) - len(ev)
+        if removed and not has_citation(ev):
+            warns.append(f"DROPPED_OBJECTION: {o.get('id', '?')} discarded — its only sha-pinned citation was not verbatim")
+            continue
+        if removed:
+            warns.append(f"DROPPED_CITATION: {o.get('id', '?')} lost {removed} non-verbatim citation(s); {len(ev)} evidence item(s) remain")
+            o["evidence"] = ev
+        kept.append(o)
+    if "objections" in v:
+        v["objections"] = kept
+    for rc in v.get("root_causes") or []:
+        ev = [x for x in (rc.get("evidence") or []) if str(x) not in bad]
+        removed = len(rc.get("evidence") or []) - len(ev)
+        if removed:
+            rc["evidence"] = ev
+            tag = "UNVERIFIED_ROOT_CAUSE" if not has_citation(ev) else "DROPPED_CITATION"
+            warns.append(f"{tag}: {rc.get('id', '?')} lost {removed} non-verbatim citation(s); {len(ev)} evidence item(s) remain"
+                         + ("" if has_citation(ev) else " — treat as E4 in the ledger"))
+    return warns
 
 
 def main():
@@ -293,8 +336,14 @@ def main():
     errs, warns = validate(v, a.round, a.role, prior_rounds, mode)
     cited = 0
     if repo and not errs:
-        cite_fails, cited = check_citations(v, repo, base)
-        errs.extend(cite_fails)
+        cite_fails, cited, bad = check_citations(v, repo, base)
+        if bad:
+            v["dropped_citations"] = sorted(bad)
+            warns = [f"CITATION_DROPPED: {f}" for f in cite_fails if f.startswith("codex citation #")] + prune_citations(v, bad) + warns
+            cited -= len(bad)
+            errs.extend(f for f in cite_fails if not f.startswith("codex citation #"))
+        else:
+            errs.extend(cite_fails)
     if errs:
         print("FAIL:\n- " + "\n- ".join(errs), file=sys.stderr); return 1
     if warns:

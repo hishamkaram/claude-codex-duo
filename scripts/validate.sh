@@ -196,5 +196,38 @@ else:
     print(f"  ok      {ok}/{seen} recorded install(s) resolve to a matching directory")
 PLUGINCHECK
 
+echo "12. No ccr alias literal ships in a plugin (aliases are machine-local; only the placeholder <alias> may appear)"
+# `ccr:` followed by an alias-like character is a literal; `ccr:<alias>`, `ccr:$var`, `ccr:?*` (case patterns) and prose are not.
+HITS=$(grep -rnE --include='*.md' --include='*.sh' --include='*.py' --include='*.js' --include='*.json' 'ccr:[A-Za-z0-9]' plugins 2>/dev/null)
+if [ -n "$HITS" ]; then printf '%s\n' "$HITS" | while IFS= read -r h; do note FAIL "alias literal: $h"; done; FAIL=1
+else note ok "no alias literal under plugins/"; fi
+
+echo "13. The read-only runner never carries a write mode; the implementer is the only write-capable launcher"
+for r in plugins/*/scripts/codex-run.sh; do
+  grep -q 'acceptEdits' "$r" && note FAIL "$r mentions acceptEdits (write mode belongs to implement-run.sh only)" || note ok "$r has no write mode"
+  grep -q -- '--write is refused' "$r" || note FAIL "$r lost the --write refusal"
+  grep -q -- '--permission-mode plan' "$r" || note FAIL "$r lost --permission-mode plan on the ccr launch line"
+done
+IMPL=plugins/codex-deep-plan/scripts/implement-run.sh
+if [ -f "$IMPL" ]; then
+  grep -q -- '--permission-mode acceptEdits' "$IMPL" && note ok "$IMPL is the write-capable launcher" || note FAIL "$IMPL does not launch with --permission-mode acceptEdits"
+  grep -q 'write mode is ccr-only' "$IMPL" && note ok "$IMPL refuses every backend but ccr" || note FAIL "$IMPL must refuse --via codex (write mode is ccr-only)"
+fi
+
+echo "14. Every command's argument hint lists --via, and every command body forwards \$ARGUMENTS verbatim"
+# A body that expands only $1..$N drops every argument it does not name — the advertised --via never
+# reached the skill until the two-model review of the ccr backend caught it (F-08, F-09).
+for f in plugins/*/commands/*.md; do
+  grep -q -- '--via' "$f" && note ok "$f" || note FAIL "$f argument hint does not list --via"
+  grep -q '\$ARGUMENTS' "$f" && note ok "$f forwards \$ARGUMENTS" || note FAIL "$f does not forward \$ARGUMENTS (positional \$N expansions drop the options they do not name)"
+done
+
+echo "15. The debate protocol carries both the one-opponent and the N-participant grammars"
+PROTO=plugins/codex-debate/skills/codex-debate/references/protocol.md
+for needle in 'X-nn' 'CONCEDED-BY-CODEX' 'X<k>-nn' 'CONCEDED-BY-P<k>' 'dissent score' 'UNRESOLVED (global budget)'; do
+  grep -Fq -- "$needle" "$PROTO" && note ok "protocol.md: $needle" || note FAIL "protocol.md lacks '$needle'"
+done
+grep -Fq 'dissent score' plugins/codex-debate/skills/codex-debate/templates/DEBATE.md && note ok "DEBATE.md carries the aggregation rule" || note FAIL "DEBATE.md lacks the aggregation rule (dissent score)"
+
 echo
 [ $FAIL -eq 0 ] && { echo "ALL CHECKS PASSED"; exit 0; } || { echo "VALIDATION FAILED"; exit 1; }

@@ -20,7 +20,7 @@ The script's citation, artifact and provenance rules are a block generated from
 (`validate.sh` fails if it drifts); edit the Python module, never the block.
 The script is shipped at `${CLAUDE_PLUGIN_ROOT}/skills/two-model-pr-review/templates/review-workflow.js`
 and is passed by path (`scriptPath`) with a JSON `args` object; it is checked with `node --check`
-by `scripts/validate.sh`. Codex never runs inside a workflow agent: the monitored runner's
+by `scripts/validate.sh`. No second-model runner (Codex or a ccr alias) ever runs inside a workflow agent: the monitored runner's
 cancel and exit-code contract assumes one owner, and that owner is you.
 
 ## Agent types
@@ -102,7 +102,7 @@ unless every changed file is owned by exactly one shard and every shard file is 
 (unowned, duplicate or unknown paths are listed in the error). One `lead-reviewer` per shard
 (parallel), each writing and sealing `01-lead.<shard>.md`, each still searching consumers
 repo-wide for the symbols its files change. Merge only after Codex has finished OR before
-opening any `02-codex.*` file: `chmod 600` the shard files, concatenate them under one heading
+opening any `02-p<k>.*` file: `chmod 600` the shard files, concatenate them under one heading
 per shard with the per-shard coverage table the rubric already requires, add a "Cross-shard"
 section with anything you see spanning shards, write `01-lead.md`, `chmod 000` it, `chmod 000`
 every shard file again, and only then run `phase-gate.sh pre-phase3`. `pre-codex` refuses a

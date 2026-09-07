@@ -64,8 +64,9 @@ All plugins also trigger from plain language ("review PR 123 with Codex", "debat
 | OpenAI Codex plugin | `claude plugin install codex@openai-codex`, then `/codex:setup` and log in. All plugins drive Codex through that plugin's companion script in its read-only sandbox. |
 | `git`, `python3`, `node` | Standard tooling; macOS and Linux |
 | `gh` | deep-plan fetches issues, PRs and comments with it; codex-pr-review resolves a PR number with it. Without it, paste the text with `--request-file` or review a branch, commit or local changes. |
+| `ccr` (optional, ≥ 0.4.11) | [claude-code-router](https://github.com/hishamkaram/claude-code-router). With `--via ccr:<alias>` the second model is a headless, plan-mode, MCP-less Claude Code routed through the gateway to whatever provider the alias names; aliases come from `ccr model list` on your machine and are never hardcoded. Without `--via` nothing changes. |
 
-Sending repository content to Codex means sending it to OpenAI. All plugins ask for confirmation that this is permitted for the repository before the first Codex call.
+Sending repository content to Codex means sending it to OpenAI; sending it through a `ccr` alias means sending it to that alias's provider. All plugins ask for confirmation that this is permitted for the repository before the first second-model call, and the Phase 0 probe records the alias's `ccr model show` output verbatim in the run record.
 
 ## Installation
 
@@ -102,6 +103,9 @@ claude plugin update codex-deep-plan@claude-codex-duo
 # Review uncommitted work: staged, unstaged, deleted and untracked files
 /codex-pr-review:review-pr local HEAD "settlement preflight for enable/disable"
 
+# Review with two blind reviewers — Codex and a ccr alias — deduplicated before consultation
+/codex-pr-review:review-pr 123 main "PR body" --via codex,ccr:<alias>
+
 # Have Codex attack a position
 /codex-debate:debate "The per-tenant cache must be keyed by tenant+region, not tenant alone" challenge 3
 
@@ -112,8 +116,14 @@ claude plugin update codex-deep-plan@claude-codex-duo
 /codex-debate:debate "F-01 stale replay is P1, not P2" hypothesis 2 \
   --seed /tmp/two-model-pr-review/<repo>/<run>/05-verification.md
 
+# Three blind opponents; the moderator holds one-on-one rounds against the strongest dissent
+/codex-debate:debate "Retries belong in the client, not the gateway" challenge 3 --via codex,ccr:<alias-a>,ccr:<alias-b>
+
 # Plan one PR for three issues; a split is recommended if they do not share a root cause
 /codex-deep-plan:plan 1128 1098 1097
+
+# Plan with a ccr alias as the second model, then hand the approved plan to a cheap implementer on a new branch
+/codex-deep-plan:plan 1128 --via ccr:<alias> --implement ccr:<cheap-alias>
 
 # Plan the changes a PR review asked for (this plans, it does not review)
 /codex-deep-plan:plan pr 45
@@ -141,10 +151,10 @@ flowchart LR
 ```
 
 1. **Scope and brief.** Base and head are pinned to immutable SHAs. A neutral brief is generated deterministically by `build-brief.sh` before any finding exists; it contains the diff command, the alphabetical file list, the stated intent, the conventions, and the review rubric. It never mentions a second reviewer. `phase-gate.sh pre-codex` records the sha256 of the brief and the scope once; later gates compare and never rewrite.
-2. **Two reviews at once.** In one turn the monitored runner launches Codex in a fresh thread, read-only, from the brief, and the `lead-reviewer` agent starts in its own context from the same brief. The lead reviews in two passes (design, then implementation), writes its findings and immediately sets the file to mode 000. Neither context receives the other's output; the runner's completion line carries no Codex text.
+2. **Two reviews at once — or N+1.** In one turn the monitored runner launches every blind participant (`--via codex,ccr:<alias>,…`, 1 to 8, at most one Codex; the list is frozen in `00-participants.tsv` and hashed with the packets) in its own fresh thread or session, read-only, from the brief, and the `lead-reviewer` agent starts in its own context from the same brief. The lead reviews in two passes (design, then implementation), writes its findings and immediately sets the file to mode 000. Neither context receives the other's output; the runner's completion line carries no Codex text.
 3. **Join.** `phase-gate.sh pre-phase3` must pass — lead file sealed, Codex artifact written with its status line, hashes unchanged — before the orchestrator opens Codex's output. If the lead agent failed, the orchestrator reviews in-context first, without touching Codex's output.
-4. **Reconciliation and selection.** Every distinct finding from both sides is tabled as BOTH, CLAUDE-ONLY, CODEX-ONLY, or CONFLICT with one provisional severity. The complete selector includes every BOTH, CONFLICT, and provisional P0/P1 canonical finding.
-5. **Set-level consultation.** After the join, one bounded Codex exchange challenges the orchestrator's fair statement of every selected finding. It never changes either initial review packet. The response must contain exactly one normalized disposition per selected ID.
+4. **Reconciliation and selection.** Every distinct finding from the lead and every participant is tabled as BOTH (lead and at least one participant), CLAUDE-ONLY, CODEX-ONLY (participants only, any number), or CONFLICT with one provisional severity; `03-provenance.tsv` records who raised each canonical finding and is validated against the matrix. Agreement between participants is not evidence. The complete selector includes every BOTH, CONFLICT, and provisional P0/P1 canonical finding.
+5. **Set-level consultation.** After the join, one bounded exchange with the exchange participant (the lowest-numbered one that completed) challenges the orchestrator's fair statement of every selected finding. It never changes either initial review packet. The response must contain exactly one normalized disposition per selected ID.
 6. **Verification.** Each P0 to P3 finding and each CONFLICT is checked up an evidence ladder: quoted code, traced call path, executed test or repro. Verifiers receive only normalized factual packets — generated by the gate from the frozen Phase-3 base packets with the accepted consultation dispositions applied, and rebuilt by every later gate — so model identity and debate rhetoric never become evidence.
 7. **Residual resolution.** If verification leaves UNVERIFIABLE findings, one remaining shared-budget exchange can examine the executed evidence. Across consultation and resolution there are at most two successful Codex responses and four launches.
 
@@ -165,6 +175,7 @@ flowchart LR
 
 - **Motion discipline.** The motion must be a falsifiable statement or a choice between named options. Vague questions are rewritten and confirmed first.
 - **Modes.** `challenge` (Codex attacks Claude's position), `compare` (named options, both sides argue independently before seeing each other), `hypothesis` (root-cause debate against a failure).
+- **N opponents.** `--via codex,ccr:<alias>,…` (1 to 5) gives every opponent its own blind take, then Claude moderates one-on-one rounds: `next-opponent.py` picks the participant with the strongest open dissent (dissent score over its open rows, ties by lowest number, one turn each before anyone repeats, a pending VERIFY re-selects), each pair keeps its own round counter and termination rules, and a separate global budget (`--total-rounds`) marks whatever it cuts short `UNRESOLVED (global budget)` rather than converged. The ruling aggregates per owner. With one participant nothing changes.
 - **Claim ledger.** Every claim has an owner, an ID, an evidence grade (E0 executed, E1 quoted trace, E2 cited document, E3 reasoning, E4 assertion) and a status. E4 claims can never decide a ruling.
 - **Rules that bind both sides.** Positions move only for new evidence. Contested checkable facts are checked, not argued. Conceding to end the debate is a logged failure.
 - **Ruling.** UPHELD, OVERTURNED, REFINED, UNRESOLVED, or NO DEBATE, with mandatory sections for Claude's own concessions and the strongest surviving argument against the ruling.
@@ -189,6 +200,7 @@ flowchart LR
 - **Blind second model.** Round 0 gives Codex only the inputs, the base SHA and the in-scope paths; the brief is generated before any evidence exists and the builder refuses wording that reveals another analysis. Codex returns its own root causes, designs and single-PR verdict as JSON. `validate-verdict.py` enforces the objection contract (evidence, falsifier, proposed change), rejects praise and evidence-free concessions, makes a bare APPROVE require an adversarial attempt, and checks Codex's sha-pinned citations against the code.
 - **Bounded debate.** Default 2 rounds, 3 with `--deep`, hard cap 3. The protocol stops at the first condition met, in this order: T0 light or question settled on round 0, T1 converged, T4 a blocker that needs a human choice, T2 cap, T3 no new information for two rounds, T5 Codex unavailable (plan stamped `SOLO`, never simulated); `debate-status.py` evaluates T1–T4, the run records T0 and T5.
 - **Proportionate depth.** Phase 0 classifies the request. A *question* ("is the README current?") gets `ANSWER.md`: evidence, one blind Codex look, a verdict, and any defects found, with no plan. A *content correction* (documentation, wording, config values that are the source of truth) runs *light*: evidence for the edited lines, the direct correction as the fix (cause class `incorrect_authoritative_content`; a checker is at most an optional follow-up), one blind Codex round, a short plan. Anything with reported behaviour runs *standard*; `--deep` or several issues run everything. Light is provisional: it escalates after the evidence phase or after Codex's round if the content is generated or duplicated, or an accepted objection or new evidence requires a change beyond the edit.
+- **Implementer handoff.** With `--implement ccr:<alias>`, after plan-mode approval `implement-run.sh` creates a branch in a worktree at the base SHA and launches the alias through `ccr` with `--permission-mode acceptEdits` on the approved plan, recording the same sidecars plus the diff. It is a separate launcher: the review runner keeps refusing `--write`.
 - **Handoff.** `PLAN.md` carries only what an approver acts on — summary, root cause → change → test → closure, file-by-file plan, tests, order and rollback — and is copied verbatim into a Claude Code plan-mode plan for approval. Candidate scoring, risks, unknowns and the debate closure live in `PLAN-EVIDENCE.md` beside it, with the artifact directory as the source of record. `--no-plan-mode` prints it instead. The plan-mode tools are built in but not a documented skill contract; if no plan file path is offered the skill prints the plan.
 
 ### Reviewing uncommitted changes
@@ -202,7 +214,7 @@ Passing `local` (or `worktree`) as the target reviews the working tree as it is,
 
 ### The monitored runner
 
-Every Codex call goes through `scripts/codex-run.sh`, which wraps the Codex plugin's background task mode:
+Every second-model call goes through `scripts/codex-run.sh`, which wraps the Codex plugin's background task mode or, with `--via ccr:<alias>`, a headless Claude Code launched through the `ccr` gateway, under one contract:
 
 | Behaviour | Detail |
 |---|---|
@@ -213,8 +225,9 @@ Every Codex call goes through `scripts/codex-run.sh`, which wraps the Codex plug
 | Refusals | Exits immediately if `--write` is requested |
 | Probe | `--probe` checks the Codex plugin is installed, logged in and ready before a review spends any effort |
 | Launch claim | `--claim <token>` (token from the launch gate's `claim=`) makes the runner take exactly the claim the gate created before it writes anything; a missing, replaced or already-taken claim exits 4 with nothing written |
+| Backend | `--via codex` (default) or `--via ccr:<alias>`. The ccr backend runs `ccr launch --model <alias> --permission-mode plan` with an empty strict MCP config and the write tools disallowed, in its own process group (recorded as `pgid=` on the launch line so a stall can kill the whole group and `phase-gate.sh release` can prove it is gone); `--fresh`/`--resume-last` map to a new session / `--resume <session_id>` (`.ccr-last-session`), `--resume-session <id>` names one; `--probe --via ccr:<alias>` gates on the ccr version, records `ccr model show --json` and runs a read-only smoke in a throwaway repository, and every ccr launch in a run directory requires that smoke record (`.ccr-smoke.<alias>`, keyed by alias, recording the ccr version, the routed model and a digest of the launch line with the alias and turn count masked so one smoke covers every `--max-turns`) — missing, violated or mismatched means exit 4 with nothing launched. Same sidecars, same exit codes, same `--write` refusal. |
 
-Exit codes: `0` completed, `1` failed, `2` stalled, `3` timeout, `4` launch error or invalid invocation (nothing is written when the runner cannot take its launch claim — missing, replaced or already-taken claim, or a bad argument on a prefix that has a claim; a launch error after the claim is taken records its sidecars), `5` stalled or timed out with the cancel unconfirmed. A bad command line never exits 1, so a typo cannot be mistaken for an upstream failure, and `5` means do not retry because a worker may still be running.
+Exit codes (identical for both backends): `0` completed, `1` failed, `2` stalled, `3` timeout, `4` launch error or invalid invocation (nothing is written when the runner cannot take its launch claim — missing, replaced or already-taken claim, or a bad argument on a prefix that has a claim; a launch error after the claim is taken records its sidecars; a ccr alias without its smoke record), `5` stalled or timed out with the cancel unconfirmed (for ccr: a process in the recorded group survived TERM and KILL, or the child's process group could not be read at launch — `pgid=unknown` in `.meta`, child killed). A bad command line never exits 1, so a typo cannot be mistaken for an upstream failure, and `5` means do not retry because a worker may still be running.
 
 ## Artifacts
 
@@ -222,19 +235,20 @@ Everything is written outside the repository:
 
 ```text
 /tmp/two-model-pr-review/<repo>/<target>-<timestamp>/
-  00-scope.md (+ .sha256)  00-brief.md (+ .sha256 .tree .repo .base .head .baseline)  00-run.md  01-lead.md  02-codex.md (+ .stdout .stderr .joblog .meta .progress .exit)
+  00-scope.md (+ .sha256)  00-brief.md (+ .sha256 .tree .repo .base .head .baseline)  00-participants.tsv (the frozen reviewer list)  00-schema (codex-pr-review/4)  00-run.md  01-lead.md  02-p<k>.md per participant (+ .stdout .stderr .joblog .meta .progress .exit)  02-exchange-participant
   00-accepted.sha256 (the accept ledger: one row per accepted or generated artifact, verified by every gate)  00-repo.txt (reviewed repository, base and head revisions, recorded by pre-codex; Phase-5 citations must resolve at one of those two revisions)
-  02-review-seal.sha256  03-matrix.md (+ .tsv)  03-findings.ndjson  03-debate-selection.tsv  04-consultation.md (+ .json .stdout .meta .exit .thread)
+  02-review-seal.sha256  03-matrix.md (+ .tsv)  03-provenance.tsv (who raised each canonical finding)  03-findings.ndjson  03-debate-selection.tsv  04-consultation.md (+ .json .stdout .meta .exit .thread)
   05-verification.md (+ 05-verifier-packets.ndjson, generated; 05-verdicts.tsv)  06-resolution-selection.ids  06-resolution.md (+ .json .stdout .meta .exit)  07-review.md
   <phase>.claim/ (atomic launch claim, taken last; runner/ inside it is the record of a launch)  <phase>.claim.spentN/ (rotated claims, never deleted, at most nine; `phase-gate.sh release` is the only recovery for a started claim)  <phase>.claim.lock/ (held for milliseconds while a claim is created, rotated or taken; reclaimed after a minute)
 
 /tmp/codex-debate/<repo>/<motion-slug>-<timestamp>/
-  00-frame.md  01-claude-position.md  02-codex-blind.md  03-round-<k>.md  DEBATE.md
+  00-frame.md  00-participants.tsv  01-claude-position.md  02-codex-blind.md (one participant) | 02-blind-p<k>.md (N participants)  03-ledger.md  03-round-<n>[-p<k>].md  DEBATE.md
 
 /tmp/deep-plan-duo/<repo>/<slug>-<timestamp>/
   meta.json  inputs/<kind>-<id>.md  00-scope.md  01-evidence.md  02-root-cause.md  03-designs.md
   04-plan-draft.md  05-disagreements.md  debate/r<n>-prompt.md  debate/r<n>-codex.{json,stdout,meta,...}
   debate/divergence.md  PLAN.md + PLAN-EVIDENCE.md | DECISION-REQUIRED.md | ANSWER.md
+  implement/ (with --implement: worktree/, the brief, sidecars, .diff, .worktree, .plan.sha256 — the only step of the plugin that writes a branch)
 ```
 
 Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at the first missing artifact.
@@ -257,7 +271,7 @@ Each artifact ends with a `STATUS: PHASE <n> COMPLETE` line; a run resumes at th
 | Runner exit `3` (TIMEOUT) | Review exceeded `--max-min`. Large diffs should be split by subsystem in Phase 0. |
 | A reviewer agent never returns (`WATCH-OVERDUE` from the advisory watcher) | It is almost certainly blocked on a tool-approval prompt, not computing: a Bash call it issued is waiting for an answer. Approve or reject the pending prompt. Read-only tool calls never wait, which is why reviewers are told to search with the Grep and Glob tools. |
 | `WATCH-OVERDUE` from the deadline watcher | The review stops the agent with `TaskStop` and, once the stop is acknowledged, runs Phase 1 in-context. If the stop is not acknowledged it refuses to continue rather than let a stopped-but-running agent and the fallback both write `01-lead.md`. |
-| `phase-gate.sh pre-phase3` fails with `01-lead.md missing` | The lead-reviewer agent returned nothing or never wrote its file. The orchestrator must run the lead review in-context BEFORE opening any `02-codex.*` file, then seal it and rerun the gate. |
+| `phase-gate.sh pre-phase3` fails with `01-lead.md missing` | The lead-reviewer agent returned nothing or never wrote its file. The orchestrator must run the lead review in-context BEFORE opening any `02-p<k>.*` file, then seal it and rerun the gate. |
 | `phase-gate.sh` reports `... is CONFIRMED but its evidence cites @<sha>, which does not resolve` (or `neither the reviewed head nor the base`, `not a hex object id`, `quote is not found`, `outside the file`, `command evidence cannot be verified`) | A Phase-5 verdict's citation does not resolve in the reviewed repository. Fix the citation from the real code at the pinned sha (path, line range, verbatim quote); a `cmd:` line alone cannot carry CONFIRMED or REFUTED. |
 | `phase-gate.sh` or `codex-run.sh` reports `<phase>.claim.lock is held` | Another launch gate or runner is creating, rotating or taking that phase's claim at this moment (the lock is held for milliseconds). Retry; a lock older than a minute belongs to a dead process and is reclaimed automatically. |
 | `phase-gate.sh` reports `recorded <field> ... differs from the frozen brief's Target` or `00-accepted.sha256 exists but 02-review-seal.sha256 does not` | `00-repo.txt` (or the builder's `.repo`/`.base`/`.head` sidecars) no longer restates the frozen brief's Target section, or the join seal was removed after `JOIN-OK`. Both are post-launch tampering with the review's pins; start a fresh run directory. A join interrupted between its atomic steps (`02-review-seal.sha256 exists but has no row`, no later artifact yet) is completed by running `pre-phase3` again; compare its `seal=` with the one recorded in `00-run.md`. |
