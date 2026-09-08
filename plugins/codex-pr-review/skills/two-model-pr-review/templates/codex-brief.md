@@ -6,7 +6,9 @@ repository; nothing outside it is relevant to this review.
 
 ## Target
 - Repository: {{repo path}}
+- Tier: {{tier}}
 - Head: `{{head ref}}` ({{head SHA}})
+- Requested base: {{requested base}}
 - Base: `{{base ref}}` ({{base SHA}})
 - Diff command (read-only): `{{diff command}}`
 - {{head note}}
@@ -46,5 +48,9 @@ Use IDs `CX-01`, `CX-02`, … for findings and `CX-Q1`, `CX-Q2`, … for QUESTIO
 
 {{paste templates/finding.md, omitting "Raised by" and "Status"}}
 
-Close with a coverage statement: each rubric category marked reviewed or n/a,
-paths not reviewed and why, and the exact commands you ran with their results.
+Close as the rubric's **Output contract** directs for the `Tier` named above. At
+`full`: a coverage statement marking each rubric category reviewed or n/a, paths
+not reviewed and why, and the exact commands you ran with their results. At
+`compact-v1`: no category recital — give only the paths you could not review and
+why, the exact commands you ran with their results, and anything left
+unresolved.

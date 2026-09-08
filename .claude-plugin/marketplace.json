@@ -9,7 +9,7 @@
       "name": "codex-pr-review",
       "description": "Two-model PR review: concurrent blind lead/Codex reviews, set-level consultation before evidence-based verification, conditional residual resolution, and one merge decision; optional Workflow fan-out.",
       "source": "./plugins/codex-pr-review",
-      "version": "4.0.1",
+      "version": "5.0.0",
       "category": "code-review",
       "tags": [
         "code-review",

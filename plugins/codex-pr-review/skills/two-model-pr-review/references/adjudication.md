@@ -26,6 +26,18 @@ Every merged finding gets ONE canonical severity in the matrix. Provisionally
 record the highest any raiser gave; Phase 5 evidence sets the final severity. Never
 average severities and never let the last speaker decide.
 
+**Record a Phase-5 severity change, do not merely narrate it.** When a verifier returns
+`SEVERITY_FINAL:` with a severity rather than `unchanged`, write that row into
+`05-final-severity.tsv` — `F-nn<TAB>P0|P1|P2|P3`, one row per changed finding, no header —
+before `pre-resolution`. That file is the highest-precedence severity source: it outranks the
+verifier packet (what the verifier was handed after any consultation REFINE), which in turn
+outranks the matrix (provisional). The gate reads it for the change-anchor rule and
+`05-scope-attribution.tsv` reports it, so a finding promoted to P0/P1 during verification is
+held to the anchor requirement, and one demoted out of P0/P1 is released from it. Omitting the
+row leaves the gate enforcing a classification the merge decision no longer uses: the severity
+in `07-review.md` and the severity the gate checked must be the same number. No file is needed
+when Phase 5 changed nothing, which is the common case.
+
 Who raised what is recorded once, in `03-provenance.tsv` — one tab-separated row per
 raiser of each canonical ID and no header:
 
@@ -148,6 +160,26 @@ whether both did, establish ground truth, preferring in order:
 
 Prefer a throwaway `git worktree` for anything that could touch the working
 tree. Never auto-clean or restore the user's worktree.
+
+**Causal attribution binds every rung, not just (c).** Whatever rung you use,
+a P0 or P1 verdict of CONFIRMED asserts that THIS CHANGE is not safe to merge —
+so establish that the defect is introduced or newly activated by the change,
+not merely present at head. Rung (a) shows it fails at head and does not fail at
+base for the same reason; rung (b) traces the changed symbol to the affected
+site; rung (d) shows the behaviour changed here rather than earlier. A defect
+that exists identically at base and head is pre-existing: it belongs in the
+non-blocking list at its own severity, however real it is.
+
+Mechanically, the evidence recorded for a CONFIRMED P0/P1 must cite a path the
+change touches — its **change anchor**. `validate-verdicts.py` enforces exactly
+that and nothing more; the causal claim itself is yours to establish. When the
+defect lives in unchanged code that a changed caller newly reaches, the anchor
+is the changed line that reaches it and the unchanged site goes in the finding's
+other affected sites (`templates/finding.md` §Location). This is why the anchor
+rule does not conflict with the rubric's repo-wide consumer search: a consumer
+finding keeps a real anchor in the diff. REFUTED verdicts are exempt — citing
+the base is often the whole point of a refutation — as are P2/P3, which do not
+block a merge.
 
 Recipe for rung (a) without touching the repo (verified 2026-09-02 on a pnpm +
 vitest workspace): create `<artifact>/repro/`, symlink the repo's root

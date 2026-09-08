@@ -14,18 +14,35 @@ reviewer indefinitely. Use Bash for `git -C <repo> show|diff|log` at a pinned SH
 search finds candidates; confirm every line you quote or count at the pinned SHA before citing it.
 
 Review DESIGN (right approach? fits existing architecture? simpler pattern
-already used here? reversible?) and IMPLEMENTATION (does it do what it claims?)
-as separate passes. Write the DESIGN pass as its own short section (those four
-questions, answered) above the findings; design problems that are defects still
-become findings.
+already used here? reversible?) and IMPLEMENTATION (does it do what it claims?).
+Design problems that are defects still become findings.
 
 Exclude lockfiles, generated and vendored code by name with a one-line sanity
 check. If the diff exceeds ~2000 LOC, review subsystem-by-subsystem with
 per-subsystem coverage notes rather than skimming.
 
-## Checklist — apply every category; write "n/a" where it doesn't apply
+## Output contract — selected by the `Tier` line in the brief
 
-Silence is not coverage.
+**What you REVIEW never changes with the tier.** Every category below is applied
+at every tier, both lenses are considered, and consumers are searched repo-wide.
+The tier governs only how much of that reasoning you WRITE DOWN.
+
+- **`compact-v1`** (the default). ONE combined pass. Do NOT write a separate
+  DESIGN section, and do NOT walk the checklist category by category. Write: the
+  findings; the exact commands you ran with their results; any path you could NOT
+  review and why; and anything left unresolved. A design problem is filed as a
+  finding like any other. Under this tier, saying nothing about a category is not
+  a claim of coverage — the category recital is omitted, not abbreviated.
+- **`full`**. Both passes written separately: the DESIGN pass as its own short
+  section (those four questions, answered) above the findings, then the
+  IMPLEMENTATION pass; every checklist category marked reviewed or `n/a`, where
+  silence is not coverage; and a closing coverage statement naming each category.
+
+Neither tier may drop a finding, soften a severity, skip the consumer search, or
+claim a check it did not run. A finding costs the same in both tiers; only the
+prose around it differs.
+
+## Checklist — apply every category; write it up as the output contract directs
 
 - **Intent conformance, both directions:** does it accomplish the stated goal
   fully, and does the diff contain changes NOT explained by the stated intent?

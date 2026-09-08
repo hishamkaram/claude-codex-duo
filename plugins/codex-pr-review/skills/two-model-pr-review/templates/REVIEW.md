@@ -28,7 +28,7 @@ description. Then: whether that matches the stated intent.}}
 ## 6. CONSULTATION & DISAGREEMENT LOG
 BOTH: {{n}} | CLAUDE-ONLY: {{n}} | CODEX-ONLY: {{n}} | CONFLICT: {{n}}
 Selection: {{candidate count}} candidates · {{exact selector artifact and predicate summary}}
-Consultation: {{COMPLETE | SKIPPED — reason}} · dispositions: {{selected/returned ID equality}} · job ids: {{from 04-consultation*.meta}}
+Consultation: {{COMPLETE | SKIPPED — reason | NOT RUN BY POLICY — tier <tier>, an eligible phase deliberately not executed, never a failure}} · dispositions: {{selected/returned ID equality}} · job ids: {{from 04-consultation*.meta}}
 Verification: {{every P0–P3 finding verified from normalized evidence-only packets}}
 Residual resolution: {{COMPLETE | SKIPPED — reason}} · job ids: {{from 06-resolution*.meta}}
 Participants (from 00-participants.tsv and 03-provenance.tsv):
@@ -37,6 +37,8 @@ Participants (from 00-participants.tsv and 03-provenance.tsv):
 | p1 | {{codex | ccr}} | {{alias | -}} | {{SUCCEEDED | UNAVAILABLE | FAILED | DECLINED — reason}} | {{from 02-p1.meta: job= or thread=}} | {{n}} |
 Exchange participant: {{p<k> from 02-exchange-participant | none}} · unified budget: {{successful responses}}/2 responses, {{launches}}/4 launches
 Lead: {{`codex-pr-review:lead-reviewer` task <id> | general-purpose fallback (reason) | in-context fallback (reason)}} · join: {{JOIN-OK line from 03-matrix.md}} · review seal: {{unchanged | not applicable}}
+Tier: {{compact-v1 | full}} — from the frozen brief's `- Tier:` line. Both tiers apply every rubric category and search consumers repo-wide; `compact-v1` writes one combined pass with no category recital. State it plainly: a reader must be able to tell how much was written down, and must never read a shorter report as a shallower review.
+Scope: {{`<base>..<head>` — base is the merge base of <requested base> and the head, so the diff is what this change introduces | requested base was already the fork point}} · {{n}} file(s) excluded as trunk-only work by the merge-base correction (00-brief.md.scope.json) {{| merge-base correction applicable but not applied: the requested base was already the fork point}}
 Blindness: procedural (neutral packets hashed before any finding + lead sealed before any participant output was read + lead in its own context + mode-000 defense-in-depth + no participant told of another); not structurally guaranteed. {{Concurrency: the lead and {{N}} participant review(s) overlapped from <lead start> to <first end> (00-run.md) | single-model run: no cross-review, nothing ran concurrently}}
 {{every UNRESOLVED item with both positions and strongest evidence for each}}
 
@@ -48,8 +50,13 @@ Blindness: procedural (neutral packets hashed before any finding + lead sealed b
 Mandatory — write "none" only if genuinely none.}}
 
 ## 8. COVERAGE STATEMENT
-{{categories reviewed vs. n/a; paths you could not review and why; commands run
-and their results; what a human should still check manually}}
+{{paths you could not review and why; commands run and their results; what a human
+should still check manually. On tier `full` also list categories reviewed vs. n/a;
+on `compact-v1` do NOT — that tier's whole point is that the reviewers apply every
+category without writing a line per category, so a recital here would either be
+invented or copied from nothing}}
+{{when 05-scope-attribution.tsv has any `trunk-only` row: name those findings and say
+they were attributed to work the trunk did after this branch diverged, not to this change}}
 
 ## 9. GOOD PARTS
 {{2–3 bullets max}}

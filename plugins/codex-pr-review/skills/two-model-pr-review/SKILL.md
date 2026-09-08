@@ -49,10 +49,11 @@ You produce exactly one merge decision, backed by artifacts on disk.
 |---|---|
 | PR / branch | user's message → `gh pr view` → current branch |
 | Local changes | user says "my changes", "working tree", "uncommitted", or the tree is dirty and no PR/branch was named → head = `WORKTREE` (snapshot tree, see codex-protocol.md); base defaults to `HEAD` |
-| Base ref | user's message → PR base → `origin/main` / `origin/master` (range mode) · `HEAD` (local mode) |
+| Base ref | user's message → PR base → `origin/main` / `origin/master` (range mode) · `HEAD` (local mode). This is the REQUESTED base; `build-brief.sh` replaces it with the merge base and records both, so the diff is what the change introduces rather than what the trunk did meanwhile. This happens in BOTH modes — a snapshot tree is anchored at the commit it was captured from, and `--base` is caller-supplied in local mode too, so a local review against a moved trunk tip would otherwise inherit the trunk's work. With the default local base (`HEAD`) the merge base is `HEAD`, so the correction applies and simply does not fire. Do not compute a merge base yourself. |
 | Stated intent | PR body, linked issue, or spec file the user names |
 | Conventions | `CLAUDE.md`, `CONTRIBUTING.md`, `docs/adr/*`, nearby code |
 | Test/lint commands | `Makefile`, `package.json` scripts, CI config |
+| `--full` | optional, recognised anywhere: use `TIER=full` instead of the default `TIER=compact-v1`. The tier selects the reviewers' OUTPUT contract only (`references/review-rubric.md` §Output contract); both tiers apply every rubric category and search consumers repo-wide. Pass it straight through to `build-brief.sh --tier`. |
 | `--workflow` | optional; recognised anywhere in the argument list (local mode may omit the base ref, so it is not positional). Selects the Workflow-tool fan-out for Phase 5 verification (and Phase 1 above ~2000 LOC) per `references/workflow-mode.md`. Absent → default path. Any other `--token` is an error to report, never a mode. |
 | `--via` | optional, recognised anywhere: the second-model participants, a comma list of `codex` and `ccr:<alias>` entries (default `codex`; 1–8 entries; at most one `codex`, because the Codex companion resumes only the last thread in a repository). Each participant is one blind reviewer with its own claim, sidecars and session (§Participants). Aliases are machine-local; never assume one. |
 
@@ -83,7 +84,7 @@ the join records the **exchange participant** (`02-exchange-participant`, the lo
 COMPLETE one) and the consultation and residual exchanges run on its session under the
 unchanged budget — the others are never consulted in this version. Reconciliation is over the
 lead plus every participant; who raised what goes to `03-provenance.tsv` (§Phase 3), while the
-origin column keeps its four literals. `pre-codex` also writes `00-schema` (`codex-pr-review/4`):
+origin column keeps its four literals. `pre-codex` also writes `00-schema` (`codex-pr-review/5`):
 a run directory without it, or with another marker, is a legacy directory every gate refuses.
 
 ## Artifact directory and blindness
@@ -142,7 +143,20 @@ claim the lead ran before the participants: they run concurrently by design.
 Before starting any phase, list the artifact directory and resume at the first
 missing artifact. End every artifact with `STATUS: PHASE <n> COMPLETE` (or
 `STATUS: PHASE <n> COMPLETE (SKIPPED — <reason>)` for a phase that could not
-run). Never begin a phase before the artifacts it depends on exist with that
+run, or `STATUS: PHASE <n> NOT_RUN_POLICY <tier>` for an eligible phase the
+frozen tier deliberately did not execute).
+
+**SKIPPED and NOT_RUN_POLICY are different claims and must never be swapped.**
+SKIPPED means the run tried and got nothing usable, or the phase was ineligible —
+both derived from what happened. NOT_RUN_POLICY means the phase WAS eligible and
+the run chose not to execute it under the tier frozen in the brief. Recording a
+choice as a failure, or a failure as a choice, corrupts the one thing the audit
+trail exists to preserve. The gate enforces the distinction: a NOT_RUN_POLICY
+phase must cite the brief's tier, that tier must not be `full`, and no attempt
+may be recorded for it — no runner-taken claim and no `<prefix>.exit`. (The bare
+launch claim is not evidence of an attempt: the launch gate mints it as its last
+step, so an authorized-but-unused reservation is present on every legal
+omission.) A phase that ran and failed is SKIPPED, not a policy omission. Never begin a phase before the artifacts it depends on exist with that
 line. Never write two phases' artifacts in one pass; Phases 1 and 2 are the one
 deliberate exception — they are *launched* together and each writes its own
 artifact.
@@ -252,20 +266,35 @@ stays available. `pre-resolution` requires
 Phase 5 verification; `pre-report` requires terminal residual-resolution
 status. No `07-review.md` precedes `pre-report`, and `phase-gate.sh post-join` must
 print `POST-JOIN-OK` at completion. If the lead agent returns `LEAD FAILED`,
-null, or no `01-lead.md` exists when Codex finishes — or the deadline watcher
-fired and the `TaskStop` was acknowledged — run Phase 1 yourself in-context
-BEFORE opening any Codex output file (you may have read `.exit`/`.meta` and the
-cut-down progress line: no review text), then seal the file and run the join
-gate.
+null, or no `01-lead.md` exists when Codex finishes, run Phase 1 yourself
+in-context BEFORE opening any Codex output file (you may have read `.exit`/`.meta`
+and the cut-down progress line: no review text), then seal the file and run the
+join gate. A fired DEADLINE is NOT one of those cases and has exactly one policy,
+in the join turn below: record the run INCOMPLETE and stop. Those are two
+different facts — an agent that reported failure has finished and produced
+nothing, while a deadline is evidence of silence, and at 90 minutes an in-context
+rerun spends a second full review on one that was merely slow.
 
 ## Phases
 
-**Phase 0 — Scope and brief** → `00-scope.md`, `00-brief.md`
-Enumerate files, hunks, LOC, subsystems touched. Read intent and conventions.
-State what you will review, what you exclude (lockfiles, generated, vendored —
-by name, each with a one-line sanity check), and any missing context. If the
-diff exceeds ~2000 LOC, plan subsystem-by-subsystem review with a per-subsystem
-coverage table.
+**Phase 0 — Scope and brief** → `00-brief.md`, then `00-scope.md`
+**Build the brief FIRST, then write the scope document from it.** In range mode
+`build-brief.sh` is what resolves the effective base, so a scope document
+enumerated before it runs is enumerated from the REQUESTED base — and since the
+lead reads `00-scope.md` as well as the brief, the lead would get exactly the
+inflated file list the merge-base correction exists to eliminate, while a
+participant reading only the brief gets the corrected one. Two reviewers blind to
+different scopes also perturbs the `BOTH`/`CLAUDE-ONLY` origins the whole
+adjudication rests on.
+
+So: run `build-brief.sh` (below), then write `00-scope.md` from the brief's
+`Files in scope` list and `00-brief.md.scope.json`. Enumerate files, hunks, LOC
+and subsystems touched from that list. Read intent and conventions. State what
+you will review, what you exclude (lockfiles, generated, vendored — by name,
+each with a one-line sanity check), and any missing context. When
+`merge_base_applied` is true, say so in `00-scope.md` and name the excluded
+paths. If the diff exceeds ~2000 LOC, plan subsystem-by-subsystem review with a
+per-subsystem coverage table.
 
 Probe each participant once — `${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe` for codex,
 `… --probe --via ccr:<alias> --record-dir "$ART"` for each ccr alias — and record every printed
@@ -314,26 +343,46 @@ launch time in `00-run.md`.
 
 ```bash
 W=${CLAUDE_PLUGIN_ROOT}/skills/two-model-pr-review/scripts/agent-watch.sh
-"$W" "$ART/01-lead.advisory" --expect "$ART/01-lead.md" --after 20 --label lead-advisory   # background
-"$W" "$ART/01-lead.deadline" --expect "$ART/01-lead.md" --after 45 --label lead-deadline   # background
+"$W" "$ART/01-lead.advisory" --expect "$ART/01-lead.md" --expect-mode 000 --after 50 --label lead-advisory   # background
+"$W" "$ART/01-lead.deadline" --expect "$ART/01-lead.md" --expect-mode 000 --after 90 --label lead-deadline   # background
 ```
 
 A background job notifies once, when it exits, so one watcher cannot raise an
-advisory and then survive to raise a deadline — that is why there are two. Set
-the advisory window above the band a real review occupies (observed lead reviews
-run 4–26 minutes) so it means "something is wrong", not "this is taking a while".
+advisory and then survive to raise a deadline — that is why there are two.
+
+`--expect-mode 000` is what makes these watchers supervise anything. Without it
+the success test is "exists and is non-empty", which a producer satisfies the
+moment it creates the file — both watchers then exit 0 within seconds, every
+run, and the operator learns to ignore a signal that is always green. Mode 000
+is the lead's terminal act and the join gate's own definition of a finished
+review, so it tests completion instead. The lead also publishes atomically
+(write `.part`, seal it, rename), so the path never resolves to a partial file.
+
+The thresholds come from 200 measured lead reviews: median 19.9 min, p75 26.4,
+p90 36.7, p95 47.0, max 73.1. Advisory at 50 min sits just above p95 so it means
+"something is wrong", not "this is taking a while" — at the former 20-minute
+setting it would have fired on half of all runs. Deadline at 90 min is above
+every review yet observed. Do not tighten either toward the median: a watcher
+that cries wolf is worse than no watcher, because the one run that really is
+hung then looks exactly like the fifty that were not.
 
 - **Advisory watcher exits 3** — say in ONE line that the lead agent has not
   produced its file yet and a tool-approval prompt may be waiting for the user,
   then keep waiting. The deadline watcher is still alive. Do nothing destructive.
 - **Deadline watcher exits 3** — call `TaskStop` on the lead agent and read its
-  result. Only once the stop is acknowledged may you run Phase 1 in-context and
-  write `01-lead.md`. If the stop is NOT acknowledged, do not start the
-  in-context review: a stopped-but-running agent and a fallback would both write
-  the same file. Report it and stop, exactly as the runner's exit 5 forbids a
-  second worker after an unconfirmed cancel.
-- **Either watcher exits 0** — the lead file arrived; supervision for that unit
-  is over. The other watcher exits 0 by itself at its next poll.
+  result. Once the stop is acknowledged, record the run as INCOMPLETE: keep
+  whatever partial output exists, write `00-run.md` with the watcher verdict and
+  the stop confirmation, and STOP. Do NOT rerun Phase 1 in-context. A deadline is
+  evidence of silence, not of death, and at 90 minutes a review that merely ran
+  long would cost a second full review — the very latency this skill is trying to
+  spend well. If the stop is NOT acknowledged, stop anyway and say so: a
+  stopped-but-running agent and a fallback would both write the same file,
+  exactly as the runner's exit 5 forbids a second worker after an unconfirmed
+  cancel. Either way the run does not proceed to the join gate; report it and let
+  the user decide whether to relaunch.
+- **Either watcher exits 0** — the lead file arrived AND is sealed, so Phase 1 is
+  complete; supervision for that unit is over. The other watcher exits 0 by
+  itself at its next poll.
 
 **`TREE-IS-HEAD`.** The reviewers search the working tree, while the brief pins
 SHAs, so tell them in their task prompt which one the tree is. Range mode: `yes`
@@ -346,10 +395,15 @@ and makes every exhaustive or absence claim with one `git grep` at the pinned SH
 
 **Phase 1 — Lead review (in the agent)** → `01-lead.md`
 The agent reads only `00-scope.md` and `00-brief.md`, follows
-`references/review-rubric.md` (DESIGN pass first, then IMPLEMENTATION; every
-checklist category or `n/a`), uses `CL-01`-style IDs (`CL-Q1` for questions),
-writes `01-lead.md` in one write — ending with `STATUS: PHASE 1 COMPLETE` —
-seals it with `chmod 000`, and returns one `LEAD SEALED …` line. Codex uses `CX-`; canonical `F-nn` IDs are assigned only
+`references/review-rubric.md` at the tier the brief's `- Tier:` line names (both
+tiers apply every checklist category and search consumers repo-wide; the tier
+governs only what is written down — see §Output contract there), uses
+`CL-01`-style IDs (`CL-Q1` for questions), writes the review — ending with
+`STATUS: PHASE 1 COMPLETE` — and publishes it ATOMICALLY: one write to
+`01-lead.md.part`, `chmod 000`, then rename onto `01-lead.md`. It returns one
+`LEAD SEALED …` line. The rename is what lets a watcher treat the path's
+appearance as completion; never let the agent create `01-lead.md` early or write
+a placeholder there. Codex uses `CX-`; canonical `F-nn` IDs are assigned only
 in Phase 3. Never put the lead/Codex naming into any text that is pasted into
 the brief. With `--workflow` and a diff over ~2000 LOC, Phase 1 instead runs one
 `lead-reviewer` per subsystem through the shipped workflow script and you merge
@@ -374,7 +428,17 @@ reconciliation; the phase is COMPLETE when at least one participant completed.
 
 **Phase 3 — Reconciliation matrix** → `03-matrix.md`
 First run `phase-gate.sh pre-phase3 "$ART"`; it must print `JOIN-OK`. Only then
-`chmod 600 01-lead.md` and open every `02-p<k>.stdout`. The header of `03-matrix.md`
+`chmod 600 01-lead.md` and open every `02-p<k>.stdout`.
+
+**Before that `chmod 600`, confirm both watchers have exited** — each writes
+`<prefix>.exit`, so `01-lead.advisory.exit` and `01-lead.deadline.exit` must both
+exist. Mode 000 is a transient state, and the watchers detect completion by
+polling for it every 15 seconds: unsealing inside that window closes it forever,
+and a watcher that never observes it runs to its deadline and reports a finished
+review as overdue — which the deadline handler above turns into stopping the
+agent and recording a successful run INCOMPLETE. Waiting costs at most one poll
+interval. If a watcher has somehow not exited, unseal anyway but record in
+`00-run.md` that its verdict is stale, and do not act on a later exit 3 from it. The header of `03-matrix.md`
 records: the `JOIN-OK` line verbatim (it names every participant's status and the
 exchange participant); the mtime of `01-lead.md` (lead sealed); the first line of
 each `02-p<k>.progress` (launched); the time you opened the first `02-p<k>.stdout`;
@@ -410,7 +474,25 @@ prompt, then record SKIPPED if it remains malformed. The initial review bodies
 are hash-sealed at this boundary. Follow `references/adjudication.md` and
 `references/codex-protocol.md`.
 
-**Phase 5 — Verification** → `05-verification.md`, `05-verdicts.tsv`
+**Policy omission under `compact-v1`.** The selector INCLUDEs a row only when it
+is `CONFLICT`, `BOTH`, or P0/P1, so the non-blocking candidate this rule exists
+for is a `BOTH` or `CONFLICT` row at P2/P3 — the two reviewers disagreeing about
+a nit. When the tier is `compact-v1` and every selected candidate is non-blocking
+(no P0 or P1 among the `INCLUDE` rows of `03-debate-selection.tsv`), omit the
+exchange: write `04-consultation.md` ending
+`STATUS: PHASE 4 NOT_RUN_POLICY compact-v1` and launch no runner. Do NOT try to avoid
+or delete the launch claim: `pre-consultation` mints `04-consultation.claim` as its
+last step and you must still run that gate (it is what accepts the `03-*` artifacts
+that `pre-verification` requires), so an unused reservation is present on every legal
+omission and the gate is written to tolerate it — deleting a claim directory is never
+recoverable. Then let Phase 5 verify the unchanged base packets. When ANY selected candidate is a
+P0 or P1, run the consultation regardless of tier — the gate refuses the omission
+and it is right to. A disagreement over a nit is worth 6 minutes of nobody's
+time; a disagreement over a blocker is the entire reason there are two models. If
+no ID is selected at all the phase is already ineligible and records SKIPPED as
+before; the two states are not interchangeable.
+
+**Phase 5 — Verification** → `05-verification.md`, `05-verdicts.tsv`, and `05-final-severity.tsv` when Phase 5 changed a severity
 This phase decides truth. Run `phase-gate.sh pre-verification`: it generates
 `05-verifier-packets.ndjson` by applying the accepted consultation dispositions
 to the frozen base packets with `build-verifier-packets.py` (MAINTAIN leaves
@@ -428,7 +510,13 @@ or reviewer provenance. Codex cannot run tests or builds in its sandbox, so all
 execution here is yours. With `--workflow`, rungs (a), (b) and (d) run per
 finding through the `finding-verifier` agent; rung (c) runs once, sequentially.
 Write `05-verdicts.tsv` with one
-`F-nn<TAB>verdict<TAB>method<TAB>evidence` line per matrix ID (see
+`F-nn<TAB>verdict<TAB>method<TAB>evidence` line per matrix ID, and — for every finding whose
+verifier returned a `SEVERITY_FINAL:` other than `unchanged` — a `F-nn<TAB>P0|P1|P2|P3` row in
+`05-final-severity.tsv`. That file is the highest-precedence severity source (above the verifier
+packet, above the matrix) and is what the change-anchor rule and `05-scope-attribution.tsv` read,
+so the severity the report states and the severity the gate enforced are the same number; it is
+accepted as a draft beside the verdicts at `pre-resolution`. No file is needed when Phase 5
+changed no severity. (See
 adjudication.md; a CONFIRMED or REFUTED row must carry a real method and a
 `path:lines@sha "quote"` citation that RESOLVES AT A REVIEWED REVISION —
 `pre-resolution` and `pre-report` check, in the repository recorded by
@@ -464,6 +552,14 @@ end with `STATUS: PHASE 6 COMPLETE (SKIPPED — <reason>)`.
 Run `phase-gate.sh pre-report`, then fill `templates/REVIEW.md` completely. All
 nine sections, including the false-positive appendix and coverage statement, are
 mandatory.
+
+`pre-report` also writes `05-scope-attribution.tsv` and accepts it as final: one row per
+finding — `id severity verdict path in_requested in_effective disposition` — recording whether
+the finding's evidence path was inside the requested base's comparison, the reviewed one
+(the merge base, in both modes), or neither. It is descriptive, never a gate: it makes
+"would the old two-dot scope have produced this finding?" a lookup instead of archaeology
+across the run directory. A `trunk-only` row is a finding the merge-base correction kept out
+of scope. Cite it in §8 when any row is `trunk-only`.
 
 ## Codex availability and degradation
 

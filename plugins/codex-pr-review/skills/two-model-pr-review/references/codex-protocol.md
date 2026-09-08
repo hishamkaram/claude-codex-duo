@@ -95,7 +95,8 @@ companion.
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/skills/two-model-pr-review/scripts/build-brief.sh \
   --repo "$REPO" --base-ref "<name>" --base "<sha>" --head-ref "<name>" --head "<sha>" \
-  --intent-file "$ART/00-intent.txt" --conventions-file "$ART/00-conventions.txt" --out "$ART/00-brief.md"
+  --intent-file "$ART/00-intent.txt" --conventions-file "$ART/00-conventions.txt" --out "$ART/00-brief.md" \
+  [--tier compact-v1|full]
 # local changes: replace --head-ref/--head with   --head WORKTREE   (base defaults to HEAD; see next section)
 ```
 
@@ -104,6 +105,34 @@ is the convention paths and runnable commands you want Codex to see. The script
 fills every placeholder in `templates/codex-brief.md` (files sorted, rubric and
 finding schema pasted) and fails if any placeholder is left. Do not hand-edit
 the result except to remove something that would leak.
+
+`--tier` selects the reviewers' output contract and defaults to `compact-v1`;
+pass `--tier full` when the user gave `--full`. It lands as the brief's `- Tier:`
+line, is frozen with the brief, and is the only thing that may authorize a
+policy omission later (`phase-gate.sh` re-reads it from the brief rather than
+trusting a caller).
+
+**The base you pass is the REQUESTED base.** In range mode the builder computes
+`git merge-base --all <base> <head>`, requires exactly one result, and reviews
+from there — `review-rubric.md` §Scope makes the primary object `<BASE>...HEAD`,
+and a base resolved from a branch tip stops being the fork point as soon as the
+trunk moves on. It records both (`- Requested base:` and `- Base:`), writes the
+merge base to `00-brief.md.base`, and emits `00-brief.md.scope.json` naming every
+path the correction excluded. It exits 2 with an explanation when the histories
+share no common ancestor or have several merge bases — both mean the intended
+comparison is not determinable and guessing would review a scope nobody chose —
+and 3 when the corrected comparison turns out to be empty, which is a review of
+nothing rather than a review that found nothing.
+Worktree mode gets the SAME correction. The question is not whether the head is a
+commit but whether an ancestry question can be asked, and a snapshot tree has an
+anchor: the commit it was captured from. `--base` is caller-supplied in both modes
+(`/review-pr local <base-ref> …`), so a worktree run against a moved trunk tip
+would otherwise list the trunk's own post-divergence work as changes by the review
+target and compute the change anchor from the uncorrected base. With the default
+base (`HEAD`) the merge base IS `HEAD`, so the correction is applicable and simply
+does not fire — `merge_base_applicable` and `merge_base_applied` are different
+facts, and the sidecar records both. The recorded ref then reads
+`merge-base(<requested>, HEAD)`, naming a comparison git can reproduce.
 
 ## Local-changes mode (`--head WORKTREE`)
 
@@ -138,13 +167,17 @@ immediately after it returns (`git -C "$REPO" cat-file -e <tree>^{tree}`); if
 either check fails, discard the Codex output, recapture, and rerun Phase 2.
 
 Builder exit codes: 0 brief written (`00-brief.md.base` and `00-brief.md.head` record the reviewed revisions in both modes; `00-brief.md.tree` holds the SHA,
-`00-brief.md.baseline` the NUL-separated status); 3 nothing to review (tree
-equals base tree); 2 usage error (including `--out` inside the repository).
+`00-brief.md.baseline` the NUL-separated status); 3 nothing to review — in
+worktree mode the captured tree equals the base tree, in range mode the diff
+`base..head` is empty (the base already contains the head, or the head's tree is
+identical to the base's), and the two need different remedies: recapture the tree
+for the first, name a head the base does not already contain for the second;
+2 usage error (including `--out` inside the repository).
 
 ## Join turn — Phase 2 (blind reviews) launched beside Phase 1
 
 Pre-flight, must print `PREFLIGHT-OK` or stop (it also records the packet hashes
-once, writes the schema marker `00-schema` = `codex-pr-review/4`, and takes one
+once, writes the schema marker `00-schema` = `codex-pr-review/5`, and takes one
 launch claim per participant, printed as `claim.p<k>=<token>`):
 
 ```bash
