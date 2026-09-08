@@ -123,8 +123,16 @@ share no common ancestor or have several merge bases — both mean the intended
 comparison is not determinable and guessing would review a scope nobody chose —
 and 3 when the corrected comparison turns out to be empty, which is a review of
 nothing rather than a review that found nothing.
-Worktree mode is unaffected: a snapshot tree has no commit ancestry, and the
-local base (`HEAD`) is already an ancestor of the working tree.
+Worktree mode gets the SAME correction. The question is not whether the head is a
+commit but whether an ancestry question can be asked, and a snapshot tree has an
+anchor: the commit it was captured from. `--base` is caller-supplied in both modes
+(`/review-pr local <base-ref> …`), so a worktree run against a moved trunk tip
+would otherwise list the trunk's own post-divergence work as changes by the review
+target and compute the change anchor from the uncorrected base. With the default
+base (`HEAD`) the merge base IS `HEAD`, so the correction is applicable and simply
+does not fire — `merge_base_applicable` and `merge_base_applied` are different
+facts, and the sidecar records both. The recorded ref then reads
+`merge-base(<requested>, HEAD)`, naming a comparison git can reproduce.
 
 ## Local-changes mode (`--head WORKTREE`)
 

@@ -17,10 +17,12 @@ severity      the EFFECTIVE severity, highest source wins: 05-final-severity.tsv
 path          the repository path of the finding's recorded evidence citation, or "-"
 in_requested  yes|no|unknown — is that path in `git diff <requested base>..<head>`
 in_effective  yes|no|unknown — is that path in `git diff <effective base>..<head>`, the
-              reviewed comparison (the merge base in range mode). In worktree mode the two bases
-              are the same commit and the head is a snapshot tree; there is no correction to
-              attribute, but membership is still a fact, so both columns agree rather than say
-              "unknown"
+              reviewed comparison (the merge base, in BOTH modes — a snapshot tree is anchored at
+              the commit it was captured from, so worktree runs are corrected too). The two bases
+              are the same commit only when the correction did not fire; when it did, the columns
+              differ in worktree mode exactly as they do in range mode. Membership is always a
+              fact git can answer, so neither column says "unknown" merely because the head is a
+              tree"
 disposition   in-scope           both comparisons contain it — the correction changed nothing
               trunk-only         the requested base saw it, the reviewed comparison did not:
                                  the correction is what kept this finding out of the diff
@@ -107,6 +109,20 @@ def main() -> None:
         fail(f"cannot read the scope sidecar {args.scope}: {exc}")
     if not isinstance(scope, dict):
         fail(f"{args.scope} is not a JSON object")
+    # Validate the SHAPE, not just the JSON (round-5 CL-05). Missing revision keys used to degrade
+    # silently to None: every row became `unknown`, the script still printed OK and exited 0, and
+    # pre-report froze that table `final` with no second chance — indistinguishable from a genuine
+    # git failure, which is the other thing `unknown` means. A sidecar this run cannot read is a
+    # broken input, not an inconclusive answer.
+    for key in ("head", "effective_base", "requested_base"):
+        section = scope.get(key)
+        if not isinstance(section, dict):
+            fail(f"{args.scope}: '{key}' is missing or not an object; the sidecar cannot describe the reviewed comparison")
+    if not (scope.get("head") or {}).get("rev"):
+        fail(f"{args.scope}: head.rev is missing or empty; without the reviewed head no row can be attributed")
+    for key in ("effective_base", "requested_base"):
+        if not (scope.get(key) or {}).get("commit"):
+            fail(f"{args.scope}: {key}.commit is missing or empty; without both bases the correction cannot be attributed")
 
     head = (scope.get("head") or {}).get("rev", "")
     effective = (scope.get("effective_base") or {}).get("commit", "")

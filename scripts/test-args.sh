@@ -38,7 +38,13 @@ fixture_revs() {  # what build-brief.sh (.base/.head), Phase 0 (00-participants.
   [ -e "$1/00-brief.md.base" ] || printf '%s\n' "$SHA2BASE" > "$1/00-brief.md.base"
   [ -e "$1/00-brief.md.head" ] || printf '%s\n' "$SHA2" > "$1/00-brief.md.head"
   [ -e "$1/00-repo.txt" ] || printf 'repo=%s\nbase=%s\nhead=%s\n' "$(cd "$G2" && pwd -P)" "$SHA2BASE" "$SHA2" > "$1/00-repo.txt"
-  [ -e "$1/00-brief.md.scope.json" ] || printf '{"schema":"scope/1","mode":"range","merge_base_applied":false,"excluded_by_merge_base":[],"excluded_count":0}\n' > "$1/00-brief.md.scope.json"
+  # A REAL sidecar, pinned to the same revisions as 00-repo.txt and the brief. The old stub carried
+  # no head/requested_base/effective_base, so every attribution row the gate path produced was
+  # `unknown` and the generated content was never actually exercised (round-3 CL-06); round-5 CL-05
+  # then made a shapeless sidecar a hard error, which is what a run cannot describe its own
+  # comparison should be.
+  [ -e "$1/00-brief.md.scope.json" ] || printf '{"schema":"scope/1","mode":"range","repository":"%s","requested_base":{"ref":"HEAD~1","commit":"%s"},"effective_base":{"ref":"HEAD~1","commit":"%s"},"head":{"ref":"HEAD","rev":"%s"},"merge_base_applicable":true,"merge_base_applied":false,"comparison":{"old":"%s..%s","corrected":"%s..%s","equivalent_three_dot":null},"excluded_by_merge_base":[],"excluded_count":0}\n' \
+    "$(cd "$G2" && pwd -P)" "$SHA2BASE" "$SHA2BASE" "$SHA2" "$SHA2BASE" "$SHA2" "$SHA2BASE" "$SHA2" > "$1/00-brief.md.scope.json"
 }
 mkbrief() {  # a brief whose Target section restates fixture_revs: the gate pins 00-repo.txt to it (round-38 CX-02)
   printf -- '- Repository: %s\n- Tier: compact-v1\n- Head: `HEAD` (%s)\n- Requested base: `HEAD~1` (%s)\n- Base: `HEAD~1` (%s)\nbrief\n' "$(cd "$G2" && pwd -P)" "$SHA2" "$SHA2BASE" "$SHA2BASE" > "$1/00-brief.md"
@@ -625,8 +631,11 @@ chk "R-17: Phase 5 outranks the packet" 1 "which the reviewed change does not to
 printf 'F-01\tP9\n' > "$TMP/r17-bad.tsv"
 chk "R-17: an invalid final severity is refused" 1 "invalid severity" \
   python3 "$VV" --matrix "$TMP/r17-matrix2.tsv" --verdicts "$TMP/r17-verdicts.tsv" --final-severities "$TMP/r17-bad.tsv" --repo "$RN" --head "$RNH" --base "$RNB"
+# A mistyped id must be REJECTED, not filtered (round-5 CX-03): this file is hand-authored with no
+# upstream manifest check, so silently dropping the row keeps the old severity and suppresses the
+# very anchor check the row was written to trigger. The earlier version of this test enshrined that.
 printf 'F-77\tP1\n' > "$TMP/r17-extra.tsv"
-chk "R-17: a non-manifest id cannot be introduced" 0 "OK verdicts=1" \
+chk "R-17: a non-manifest id is refused, not dropped" 1 "not in the manifest" \
   python3 "$VV" --matrix "$TMP/r17-matrix.tsv" --verdicts "$TMP/r17-verdicts.tsv" --final-severities "$TMP/r17-extra.tsv" --repo "$RN" --head "$RNH" --base "$RNB"
 
 # R-18 (round-4 CX-04): NUL boundaries must survive the exclusion comparison. `tr '\0' '\n'` split
@@ -718,6 +727,45 @@ bash "$AW" "$WPD/w2" --expect "$WPD/g" --after 1 --label t >/dev/null 2>&1
 grep -q 'predicate=non-empty ' "$WPD/w2.progress" \
   && printf '  ok    %-42s\n' "R-22: the arrival predicate is named too" \
   || { printf '  FAIL  R-22: arrival-predicate log line missing\n'; FAIL=1; }
+
+# R-23 (round-5 CX-01/CL-01, raised independently by both models): the Phase-5 severity chain was
+# inert on the ONE path that actually spawns the verifier agent. The workflow schema is
+# additionalProperties:false and did not declare severity_final, so a promotion could only come
+# back as prose — verbatim the state the chain exists to fix.
+WFJ=plugins/codex-pr-review/skills/two-model-pr-review/templates/review-workflow.js
+grep -q "severity_final: { type: 'string', enum: \['unchanged', 'P0', 'P1', 'P2', 'P3'\] }" "$WFJ" \
+  && grep -q "'severity_note', 'severity_final', 'refutation_searched'" "$WFJ" \
+  && printf '  ok    %-42s\n' "R-23: the workflow schema carries severity_final" \
+  || { printf '  FAIL  R-23: workflow schema cannot transport severity_final\n'; FAIL=1; }
+grep -q "severity_final: 'unchanged'" "$WFJ" \
+  && printf '  ok    %-42s\n' "R-23: the null fallback names it too" \
+  || { printf '  FAIL  R-23: null-verdict fallback omits severity_final\n'; FAIL=1; }
+for f in plugins/codex-pr-review/agents/finding-verifier.md \
+         plugins/codex-pr-review/skills/two-model-pr-review/references/workflow-mode.md; do
+  grep -q 'severity_final' "$f" && printf '  ok    %-42s\n' "R-23: $(basename "$f") documents it" \
+    || { printf '  FAIL  R-23: %s omits severity_final\n' "$f"; FAIL=1; }
+done
+
+# R-24 (round-5 CL-03): three documents asserted worktree mode gets no correction, which round 5
+# made false — including the operational contract the orchestrator is pointed at.
+grep -q 'Worktree mode gets the SAME correction' plugins/codex-pr-review/skills/two-model-pr-review/references/codex-protocol.md \
+  && printf '  ok    %-42s\n' "R-24: the protocol states the new behaviour" \
+  || { printf '  FAIL  R-24: codex-protocol.md still says worktree is unaffected\n'; FAIL=1; }
+grep -rq 'a snapshot tree has no commit ancestry' plugins/codex-pr-review/ \
+  && { printf '  FAIL  R-24: a stale worktree claim survives under plugins/\n'; FAIL=1; } \
+  || printf '  ok    %-42s\n' "R-24: no stale worktree claim remains"
+
+# R-25 (round-5 CL-05): a sidecar missing its revision keys used to degrade to an all-`unknown`
+# table that still exited 0 — and pre-report freezes that table `final` with no second chance.
+printf '{"schema":"scope/1","mode":"range"}\n' > "$TMP/r25-bad.json"
+chk "R-25: a shapeless scope sidecar is refused" 1 "is missing or not an object" \
+  python3 "$SA" --matrix "$TMP/r15-matrix.tsv" --verdicts "$TMP/r15-verdicts.tsv" --scope "$TMP/r25-bad.json" --repo "$MB" --out "$TMP/r25.tsv"
+python3 -c "
+import json
+d=json.load(open('$TMP/mb.md.scope.json')); d['head']['rev']=''
+json.dump(d, open('$TMP/r25-norev.json','w'))"
+chk "R-25: an empty head.rev is refused" 1 "head.rev is missing or empty" \
+  python3 "$SA" --matrix "$TMP/r15-matrix.tsv" --verdicts "$TMP/r15-verdicts.tsv" --scope "$TMP/r25-norev.json" --repo "$MB" --out "$TMP/r25.tsv"
 
 echo "deep-plan: init-plan.sh usage errors exit 2, inputs are pinned verbatim, gh failures exit 3"
 I="$DS/init-plan.sh"
@@ -1806,6 +1854,19 @@ chk "gate: pre-report"                  0 "REPORT-OK"            pgw pre-report 
 grep -q '  05-scope-attribution.tsv  pre-report  final$' "$CS/00-accepted.sha256" \
   && printf '  ok    %-42s\n' "R-13: the attribution table is accepted final" \
   || { printf '  FAIL  R-13: no final ledger row for 05-scope-attribution.tsv\n'; FAIL=1; }
+# R-26 (round-5 CX-02/CL-04): "no Phase-5 severity changes" is a claim about the run and must be
+# FROZEN, not represented by an absent file. Accepting it only when it happened to exist left the
+# common case open: a file absent at pre-resolution and created before pre-report was never hashed,
+# never compared and never required, while both the anchor rule and this accept-final table read it.
+[ -s "$CS/05-final-severity.tsv" ] \
+  && grep -q '  05-final-severity.tsv  pre-resolution  draft$' "$CS/00-accepted.sha256" \
+  && printf '  ok    %-42s\n' "R-26: the empty severity state is frozen" \
+  || { printf '  FAIL  R-26: 05-final-severity.tsv not written/accepted at pre-resolution\n'; FAIL=1; }
+cp "$CS/05-final-severity.tsv" "$TMP/fs.good"
+printf 'F-01\tP0\n' >> "$CS/05-final-severity.tsv"
+chk "R-26: a late severity edit is caught" 1 "05-final-severity.tsv" pgw pre-report "$CS"
+cp "$TMP/fs.good" "$CS/05-final-severity.tsv"
+chk "R-26: the frozen severity state passes" 0 "REPORT-OK" pgw pre-report "$CS"
 # R-04: NOT_RUN_POLICY is defined for Phase 4 alone. Phase 6 wearing it used to fall through
 # every `= SKIPPED` guard, which silently disabled the round-17 CX-02 unattempted-residual check.
 printf 'not run\nSTATUS: PHASE 6 NOT_RUN_POLICY compact-v1\n' > "$CS/06-resolution.md"

@@ -82,7 +82,10 @@ reviewer identity/count, agreement/concession state, rhetoric, transcript refere
 verdicts, or artifact paths.
 
 One `finding-verifier` per finding (pipeline, no barrier), rungs (a), (b), (d) only. The script
-returns `{ verdicts: [ { id, verdict, method, evidence, trigger, severity_note, refutation_searched } ] }`
+returns `{ verdicts: [ { id, verdict, method, evidence, trigger, severity_note, severity_final, refutation_searched } ] }`
+(`severity_final` is `unchanged` or a `P0`-`P3` token; every value other than `unchanged` becomes a
+row in `05-final-severity.tsv`, which is what the change-anchor rule keys on — a promotion carried
+only in the prose `severity_note` never reaches the gate)
 and logs the ids whose agent returned `null`; those you verify in-context. A CONFIRMED or
 REFUTED verdict whose `method` is `none`, whose `evidence` items are not citation-shaped
 (`path:line[@sha] "quote"`) or recorded commands (`cmd: ... -> ...`), or which carries no

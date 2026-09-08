@@ -946,7 +946,7 @@ validate_verdicts() {
   # severity, but the verifier reports a change as prose, so a promotion P2 -> P1 during
   # verification left the anchor rule keyed on the classification the merge decision no longer
   # uses — a confirmed blocker could reach the report with no change anchor (round-4 CX-01).
-  [ -s "$ART/05-final-severity.tsv" ] && set -- "$@" --final-severities "$ART/05-final-severity.tsv"
+  [ -e "$ART/05-final-severity.tsv" ] && set -- "$@" --final-severities "$ART/05-final-severity.tsv"
   python3 "$VERDICT_VALIDATOR" "$@" >/dev/null || return 1
 }
 # Exit 5 means "DO NOT retry: a Codex worker may still be running" per the
@@ -1317,9 +1317,16 @@ pre-resolution)
   validate_verdicts || fail "05-verdicts.tsv is missing or invalid (expected one F-nn<TAB>verdict per matrix ID, verdict = CONFIRMED|REFUTED|UNVERIFIABLE)"
   accept 05-verdicts.tsv draft
   # The Phase-5 severity record is frozen with the verdicts it belongs to: it changes the merge
-  # decision, so it cannot be edited after the gate that acted on it. Absent means Phase 5 changed
-  # no severity, which is the common case and needs no artifact.
-  [ -s "$ART/05-final-severity.tsv" ] && accept 05-final-severity.tsv draft
+  # decision, so it cannot be edited after the gate that acted on it. It is written UNCONDITIONALLY,
+  # even when Phase 5 changed nothing — "no overrides" is a claim about the run and has to be frozen
+  # like any other. Accepting it only when it happened to exist left the common case unprotected:
+  # a file absent here and created before pre-report was never hashed, never compared and never
+  # required, while both the anchor rule and the accept-final attribution table read it.
+  if [ ! -e "$ART/05-final-severity.tsv" ]; then
+    printf '# no Phase-5 severity changes: every finding keeps the severity its verifier was given\n' > "$ART/05-final-severity.tsv" \
+      || fail "could not write 05-final-severity.tsv"
+  fi
+  accept 05-final-severity.tsv draft
   residual=$(residual_count) || fail "could not count residual verdicts"
   if [ "$ST" = COMPLETE ]; then
     check_budget
@@ -1373,6 +1380,9 @@ pre-report)
   schema_repair_prompt_check 04-consultation
   schema_repair_prompt_check 06-resolution
   [ -n "$(ledger_row 05-verdicts.tsv)" ] || fail "05-verdicts.tsv is not accepted; run pre-resolution first"
+  # Same requirement, same reason: this is the highest-precedence severity source and it feeds both
+  # the change-anchor rule and an accept-final audit table, so it may not arrive unaccepted.
+  [ -n "$(ledger_row 05-final-severity.tsv)" ] || fail "05-final-severity.tsv is not accepted; run pre-resolution first (it records the Phase-5 severities, including the common case of none)"
   reject_skipped_after_accept
   phase_status 05-verification.md 5
   [ "$PST" = COMPLETE ] || fail "05-verification.md was skipped; verification is required"
@@ -1470,7 +1480,7 @@ pre-report)
       --scope "$ART/00-brief.md.scope.json" --repo "$(repo_field repo)" \
       --out "$ART/05-scope-attribution.tsv"
     [ -s "$ART/05-verifier-packets.ndjson" ] && set -- "$@" --packets "$ART/05-verifier-packets.ndjson"
-    [ -s "$ART/05-final-severity.tsv" ] && set -- "$@" --final-severities "$ART/05-final-severity.tsv"
+    [ -e "$ART/05-final-severity.tsv" ] && set -- "$@" --final-severities "$ART/05-final-severity.tsv"
     python3 "$SCOPE_ATTRIBUTION" "$@" >/dev/null || fail "could not write 05-scope-attribution.tsv"
   fi
   accept 05-scope-attribution.tsv final

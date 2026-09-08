@@ -79,5 +79,5 @@ Output only this, nothing else:
 
 When you are invoked with a structured-output schema (the workflow mode), return the same fields
 as an object: `finding` (the packet's canonical F-nn ID), `verdict`, `method`, `evidence` (array of
-citation strings), `trigger`, `severity_note`, `refutation_searched`. Every field is required by the
+citation strings), `trigger`, `severity_note`, `severity_final` (`unchanged` or a `P0`-`P3` token), `refutation_searched`. Every field is required by the
 transport schema; use `""` or `[]` only where the contract allows an empty value.

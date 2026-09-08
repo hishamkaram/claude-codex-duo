@@ -332,7 +332,16 @@ def main() -> None:
     # and this is what the verifier concluded. Same manifest restriction — a severity row can change
     # a finding's classification, never introduce a finding.
     if args.final_severities:
-        severities.update({k: v for k, v in final_severities(Path(args.final_severities)).items() if k in manifest})
+        final = final_severities(Path(args.final_severities))
+        # REJECT an unknown id rather than filter it (round-5 CX-03). This file is authored by hand
+        # and has no upstream manifest check — unlike the packets, which load_packets() already
+        # reconciles — so silently dropping a mistyped row preserves the pre-verification severity
+        # and quietly suppresses the anchor check the row was written to trigger. Omitting an id is
+        # still fine: it simply inherits its packet or matrix severity.
+        unknown = sorted(set(final) - manifest)
+        if unknown:
+            fail(f"{args.final_severities}: {', '.join(unknown)} not in the manifest 03-matrix.tsv: a final-severity row can change a finding's severity, never introduce a finding — check for a typo")
+        severities.update(final)
     seen: dict[str, str] = {}
     for number, raw in enumerate(ledger.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
