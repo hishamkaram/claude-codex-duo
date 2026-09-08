@@ -10,6 +10,9 @@ One row per 03-matrix.tsv id, tab-separated:
 
     id  severity  verdict  path  in_requested  in_effective  disposition
 
+severity      the EFFECTIVE severity: the verifier packet's when --packets is given (a consultation
+              REFINE replaces it there), otherwise 03-matrix.tsv's provisional one
+
 path          the repository path of the finding's recorded evidence citation, or "-"
 in_requested  yes|no|unknown — is that path in `git diff <requested base>..<head>`
 in_effective  yes|no|unknown — is that path in `git diff <effective base>..<head>`, the
@@ -91,6 +94,7 @@ def main() -> None:
     ap.add_argument("--matrix", required=True)
     ap.add_argument("--verdicts", required=True)
     ap.add_argument("--scope", required=True, help="00-brief.md.scope.json")
+    ap.add_argument("--packets", help="05-verifier-packets.ndjson; its severities override the matrix's provisional ones")
     ap.add_argument("--repo", required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -118,6 +122,14 @@ def main() -> None:
     eff_paths = membership(effective)
     req_paths = membership(requested)
 
+    # The matrix severity is PROVISIONAL: a validated consultation REFINE replaces every packet
+    # field, severity included, so a P1 refined to P3 would be frozen in this audit table as P1.
+    # validate-verdicts.py already treats the packet as authoritative post-consultation; the record
+    # of what was reviewed has to say the same thing the gate acted on.
+    severities: dict[str, str] = {}
+    if args.packets:
+        severities = _vv.packet_severities(Path(args.packets))
+
     verdicts: dict[str, str] = {}
     evidence: dict[str, str] = {}
     for parts in read_rows(Path(args.verdicts), 4):
@@ -135,7 +147,7 @@ def main() -> None:
         fid = parts[0].strip()
         if not ID_RE.fullmatch(fid):
             continue
-        severity = parts[2].strip() or "-"
+        severity = severities.get(fid) or parts[2].strip() or "-"
         verdict = verdicts.get(fid, "-") or "-"
         path = evidence_path(evidence.get(fid, ""))
         if path is None:

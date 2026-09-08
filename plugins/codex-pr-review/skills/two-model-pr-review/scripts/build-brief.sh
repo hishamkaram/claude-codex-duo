@@ -122,8 +122,16 @@ if [ "$MERGE_BASE_APPLIED" = yes ]; then
   # reader compares against real repository paths. (A path containing a newline still cannot be
   # represented in this line-oriented set difference; such a path is reported unquoted and the
   # comparison degrades to a false "not excluded", which is the safe direction.)
-  OLD_FILES=$(git -C "$REPO" diff --name-only -z "$REQUESTED_BSHA..$HSHA" | tr '\0' '\n' | LC_ALL=C sort)
-  NEW_FILES=$(git -C "$REPO" diff --name-only -z "$BSHA..$HSHA" | tr '\0' '\n' | LC_ALL=C sort)
+  #
+  # --no-renames on BOTH sides, for the same reason validate-verdicts.py's membership set uses it:
+  # rename detection is a per-comparison heuristic, so the two comparisons can disagree about
+  # whether the same edit is a rename. A feature that renames a.py to b.py while the trunk edits
+  # a.py heavily gives a rename in one comparison and a delete+add in the other — a.py then appears
+  # in OLD_FILES only and is frozen in the sidecar as "excluded by the merge base" when the feature
+  # itself deletes that path. --no-renames makes both sides list both endpoints, so the set
+  # difference compares like with like and agrees with the anchor rule's membership set.
+  OLD_FILES=$(git -C "$REPO" diff --name-only --no-renames -z "$REQUESTED_BSHA..$HSHA" | tr '\0' '\n' | LC_ALL=C sort)
+  NEW_FILES=$(git -C "$REPO" diff --name-only --no-renames -z "$BSHA..$HSHA" | tr '\0' '\n' | LC_ALL=C sort)
   # LC_ALL=C on comm too, not just on the two sorts: comm compares with the AMBIENT locale's
   # collation, so under en_US.UTF-8 (the macOS default) it walks two C-sorted lists it considers
   # unsorted and emits paths present in both — writing files that ARE in the reviewed diff into a

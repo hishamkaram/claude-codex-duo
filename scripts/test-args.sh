@@ -546,6 +546,42 @@ python3 "$SA" --matrix "$TMP/r11-matrix.tsv" --verdicts "$TMP/r11-verdicts.tsv" 
 [ ! -e "$TMP/r11.tsv.part" ] && printf '  ok    %-42s\n' "R-12: no .part left behind after publish" \
   || { printf '  FAIL  R-12: staging file survived the publish\n'; FAIL=1; }
 
+# R-14 (codex round-1 P2): the exclusion set must compare like with like. Rename detection is a
+# per-comparison heuristic, so the requested and effective comparisons can disagree about whether
+# one edit is a rename — and the sidecar then froze a path the FEATURE deletes as "excluded by the
+# merge base". Both sides now use --no-renames, which is also the anchor rule's membership set.
+XR="$TMP/xrepo"; mkdir -p "$XR"
+( cd "$XR" && git init -q && git config user.email t@t && git config user.name t \
+  && printf 'one\ntwo\n' > a.py && printf 'k\n' > keep.txt && git add -A && git commit -qm base \
+  && git checkout -qb feature && git mv a.py b.py && git commit -qm rename -a \
+  && git checkout -q master 2>/dev/null || git checkout -q main )
+( cd "$XR" && printf 'one\ntwo\nthree\nfour\nfive\nsix\n' > a.py && git commit -qam "trunk edits a.py" )
+XTRUNK=$(git -C "$XR" rev-parse HEAD)
+bash "$B" --repo "$XR" --base-ref trunk --base "$XTRUNK" --head-ref feature --head "$(git -C "$XR" rev-parse feature)" \
+  --intent-file "$PROMPT" --conventions-file "$PROMPT" --out "$TMP/xr.md" >/dev/null 2>&1
+python3 -c "
+import json,sys
+d=json.load(open('$TMP/xr.md.scope.json'))
+ex=d['excluded_by_merge_base']
+sys.exit(0 if 'a.py' not in ex else 1)" \
+  && printf '  ok    %-42s\n' "R-14: a renamed path is not marked excluded" \
+  || { printf '  FAIL  R-14: excluded=[%s]\n' "$(python3 -c "import json;print(json.load(open('$TMP/xr.md.scope.json'))['excluded_by_merge_base'])" 2>/dev/null)"; FAIL=1; }
+
+# R-15 (codex round-1 P3): the attribution table records the EFFECTIVE severity. A consultation
+# REFINE replaces the packet's severity, and the anchor rule acts on that — an audit table still
+# naming the matrix's provisional value misreports what was reviewed.
+printf 'F-01\tBOTH\tP1\n' > "$TMP/r15-matrix.tsv"
+printf 'F-01\tCONFIRMED\ttrace\tpr-only.txt:1 "pr"\n' > "$TMP/r15-verdicts.tsv"
+printf '{"id":"F-01","severity":"P3"}\n' > "$TMP/r15-packets.ndjson"
+python3 "$SA" --matrix "$TMP/r15-matrix.tsv" --verdicts "$TMP/r15-verdicts.tsv" --scope "$TMP/mb.md.scope.json" --repo "$MB" --out "$TMP/r15.tsv" >/dev/null 2>&1 \
+  && [ "$(awk -F'\t' '$1=="F-01"{print $2}' "$TMP/r15.tsv")" = "P1" ] \
+  && printf '  ok    %-42s\n' "R-15: without packets the matrix severity stands" \
+  || { printf '  FAIL  R-15: no-packets severity=[%s]\n' "$(awk -F'\t' '$1=="F-01"{print $2}' "$TMP/r15.tsv" 2>/dev/null)"; FAIL=1; }
+python3 "$SA" --matrix "$TMP/r15-matrix.tsv" --verdicts "$TMP/r15-verdicts.tsv" --scope "$TMP/mb.md.scope.json" --repo "$MB" --packets "$TMP/r15-packets.ndjson" --out "$TMP/r15b.tsv" >/dev/null 2>&1 \
+  && [ "$(awk -F'\t' '$1=="F-01"{print $2}' "$TMP/r15b.tsv")" = "P3" ] \
+  && printf '  ok    %-42s\n' "R-15: a REFINEd severity overrides the matrix" \
+  || { printf '  FAIL  R-15: packet severity=[%s] want P3\n' "$(awk -F'\t' '$1=="F-01"{print $2}' "$TMP/r15b.tsv" 2>/dev/null)"; FAIL=1; }
+
 echo "deep-plan: init-plan.sh usage errors exit 2, inputs are pinned verbatim, gh failures exit 3"
 I="$DS/init-plan.sh"
 for o in --repo --out --slug --rounds --issue --pr --comment --request --request-file; do chk "init $o with no value" 2 "requires a value" bash "$I" $o; done

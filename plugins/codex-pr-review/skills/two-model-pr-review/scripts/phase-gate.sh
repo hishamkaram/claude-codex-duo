@@ -1446,8 +1446,14 @@ pre-report)
   # correction followed by a re-entered pre-report would regenerate different (correct) rows and
   # turn a supported flow into a hard failure.
   if [ -z "$(ledger_row 05-scope-attribution.tsv)" ]; then
+    # --packets when they exist: post-consultation the packet severity is the one the verifier was
+    # given and the one the anchor rule acted on, so the audit table must record that, not the
+    # matrix's stale provisional value.
+    ATTRIB_ARGS=""
+    [ -s "$ART/05-verifier-packets.ndjson" ] && ATTRIB_ARGS="--packets $ART/05-verifier-packets.ndjson"
+    # shellcheck disable=SC2086  # ATTRIB_ARGS is either empty or two shell-safe words this gate built
     python3 "$SCOPE_ATTRIBUTION" --matrix "$ART/03-matrix.tsv" --verdicts "$ART/05-verdicts.tsv" \
-      --scope "$ART/00-brief.md.scope.json" --repo "$(repo_field repo)" \
+      --scope "$ART/00-brief.md.scope.json" --repo "$(repo_field repo)" $ATTRIB_ARGS \
       --out "$ART/05-scope-attribution.tsv" >/dev/null || fail "could not write 05-scope-attribution.tsv"
   fi
   accept 05-scope-attribution.tsv final
