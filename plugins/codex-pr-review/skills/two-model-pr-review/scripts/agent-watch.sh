@@ -124,18 +124,20 @@ arrived() {
   [ "$(mode "$EXPECT")" = "$WANT_MODE" ]
 }
 
-say "0s launched label=${LABEL:-unnamed} expect=$EXPECT deadline=${AFTER_SEC}s poll=${POLL}s"
+PREDICATE="non-empty"
+[ -n "$EXPECT_MODE" ] && PREDICATE="non-empty+mode=$WANT_MODE"
+say "0s launched label=${LABEL:-unnamed} expect=$EXPECT predicate=$PREDICATE deadline=${AFTER_SEC}s poll=${POLL}s"
 while :; do
   if arrived; then
-    say "$(elapsed)s status=arrived expect=$EXPECT"
+    say "$(elapsed)s status=arrived predicate=$PREDICATE expect=$EXPECT"
     echo "WATCH-OK label=${LABEL:-unnamed} elapsed=$(elapsed)s expect=$EXPECT"
     finish 0
   fi
   if [ "$(elapsed)" -ge "$AFTER_SEC" ]; then
-    say "$(elapsed)s status=overdue expect=$EXPECT"
+    say "$(elapsed)s status=overdue predicate=$PREDICATE expect=$EXPECT"
     echo "WATCH-OVERDUE label=${LABEL:-unnamed} elapsed=$(elapsed)s deadline=${AFTER_SEC}s expect=$EXPECT"
     finish 3
   fi
   sleep "$POLL"
-  say "$(elapsed)s status=waiting expect=$EXPECT"
+  say "$(elapsed)s status=waiting predicate=$PREDICATE expect=$EXPECT"
 done

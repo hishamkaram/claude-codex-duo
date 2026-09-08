@@ -50,14 +50,30 @@ if [ "$HSHA" != "WORKTREE" ]; then HSHA=$(git -C "$REPO" rev-parse --verify --qu
 # one place must make the file list, the diff command and the recorded base agree.
 # Not --fork-point: that selects via the ref's reflog, a different rule that depends on local
 # reflog state. REQUESTED_BASE keeps the caller's intent visible in the brief.
+#
+# Worktree mode gets the SAME correction. The old guard keyed on the head literal `WORKTREE`, but
+# the question is not "is the head a commit", it is "can an ancestry question be asked" — and a
+# snapshot tree has an anchor: the commit it was captured from (HEAD). --base is caller-supplied in
+# both modes (`/review-pr local <base-ref> …`), so a worktree run against a moved trunk tip had all
+# three failures this correction exists to prevent: the brief listed trunk work as changes by the
+# review target, the frozen sidecar asserted `merge_base_applicable: false` when the correction was
+# merely never attempted, and changed_paths() — hence the change-anchor rule — was computed from the
+# uncorrected base, so a CONFIRMED P0/P1 could be anchored entirely in trunk work.
 REQUESTED_BREF="$BREF"; REQUESTED_BSHA="$BSHA"; MERGE_BASE_APPLIED=no
-if [ "$HSHA" != "WORKTREE" ]; then
-  MB=$(git -C "$REPO" merge-base --all "$BSHA" "$HSHA" 2>/dev/null) || MB=""
-  [ -n "$MB" ] || die2 "no common ancestor between base $BSHA and head $HSHA: the comparison is undefined — name a base that shares history with the head"
+MB_ANCHOR="$HSHA"
+if [ "$HSHA" = "WORKTREE" ]; then
+  # The tree is uncommitted work on top of HEAD, so HEAD is its ancestry anchor. If HEAD cannot be
+  # resolved (an unborn branch) there is no anchor and the correction genuinely does not apply.
+  MB_ANCHOR=$(git -C "$REPO" rev-parse --verify --quiet "HEAD^{commit}") || MB_ANCHOR=""
+fi
+if [ -n "$MB_ANCHOR" ]; then
+  HSHA_FOR_MB="$MB_ANCHOR"
+  MB=$(git -C "$REPO" merge-base --all "$BSHA" "$HSHA_FOR_MB" 2>/dev/null) || MB=""
+  [ -n "$MB" ] || die2 "no common ancestor between base $BSHA and head $HSHA_FOR_MB: the comparison is undefined — name a base that shares history with the head"
   # Several merge bases means a criss-cross merge and no single defensible fork point. Stopping is
   # correct here: silently picking one would review a scope nobody chose.
   if [ "$(printf '%s\n' "$MB" | wc -l | tr -d ' ')" -gt 1 ]; then
-    die2 "ambiguous history: $(printf '%s\n' "$MB" | wc -l | tr -d ' ') merge bases between $BSHA and $HSHA ($(printf '%s' "$MB" | tr '\n' ' ')) — name an explicit base commit"
+    die2 "ambiguous history: $(printf '%s\n' "$MB" | wc -l | tr -d ' ') merge bases between $BSHA and $HSHA_FOR_MB ($(printf '%s' "$MB" | tr '\n' ' ')) — name an explicit base commit"
   fi
   MB=$(git -C "$REPO" rev-parse --verify --quiet "$MB^{commit}") || die2 "merge base $MB does not resolve to a commit in $REPO"
   if [ "$MB" != "$BSHA" ]; then
@@ -65,12 +81,19 @@ if [ "$HSHA" != "WORKTREE" ]; then
     # operator a round-trip otherwise, and the corrected scope is the one the rubric already asks for.
     MERGE_BASE_APPLIED=yes
     BSHA="$MB"
-    BREF="merge-base($REQUESTED_BREF, $HREF)"
+    # Name the anchor the merge base was actually computed against. In worktree mode $HREF is the
+    # literal WORKTREE, which would make the recorded ref read merge-base(main, WORKTREE) — a
+    # comparison git cannot reproduce from the brief alone.
+    if [ "$HSHA" = "WORKTREE" ]; then BREF="merge-base($REQUESTED_BREF, HEAD)"; else BREF="merge-base($REQUESTED_BREF, $HREF)"; fi
   fi
 fi
 # The Base ref field reaches an anchored parser (phase-gate.sh brief_target): backticks delimit it
 # and the 40-hex id must end the line, so a ref name may never contain a backtick.
 case "$BREF" in *'`'*) die2 "base ref name may not contain a backtick: $BREF";; esac
+# The Head ref field reaches the SAME anchored parser (phase-gate.sh brief_target reads Head, Base
+# and Requested base identically), so it needs the same guard — validating one of two fields that
+# share a parser is an accident waiting for the other input.
+case "${HREF:-}" in *'`'*) die2 "head ref name may not contain a backtick: $HREF";; esac
 case "$OUTDIR" in "$REPO"/*|"$REPO") echo "refusing: --out must be outside the repository (scratch index would leak into the snapshot)" >&2; exit 2;; esac
 HEADNOTE=""
 if [ "$HSHA" = "WORKTREE" ]; then
@@ -105,7 +128,11 @@ else
     # State the observed fact, not an inference from it: [ -z "$FILES" ] means the DIFF is empty,
     # which ancestry produces but so does a full revert or an empty commit. Naming ancestry as the
     # cause sends an operator whose branch merely nets to zero to fix a relationship that is fine.
-    echo "nothing to review: the diff $BSHA..$HSHA is empty — $BREF ($BSHA) already contains $HREF ($HSHA), or the head's tree is identical to the base's; review a head whose tree differs from the base's and that the base does not already contain" >&2
+    # Name the REQUESTED base as the thing the operator chose, and the reviewed comparison
+    # separately. By this point $BREF/$BSHA are the corrected base, so phrasing the cause in terms
+    # of them produced "merge-base(main, feature) (abc) already contains feature (abc)" — a
+    # sentence about one commit containing itself, which tells the operator nothing.
+    echo "nothing to review: the reviewed comparison $BSHA..$HSHA is empty (requested base $REQUESTED_BREF $REQUESTED_BSHA, head $HREF $HSHA) — the base already contains the head, or the head's tree is identical to the base's; review a head whose tree differs from the base's and that the base does not already contain" >&2
     exit 3
   fi
   DIFFCMD="git diff ${BSHA}..${HSHA}"
@@ -114,49 +141,54 @@ printf '%s\n' "$BSHA" > "$OUT.base"; printf '%s\n' "$HSHA" > "$OUT.head"; (cd "$
 
 # Scope sidecar: the evidence for what the merge-base correction changed. 00-run.md is never
 # hashed and no gate reads it, so the record that must survive an audit lives here, frozen with
-# the other packets. In worktree mode the head is a tree object with no commit ancestry, so the
-# correction does not apply and the sidecar says so rather than omitting the field.
+# the other packets.
+#
+# The set difference is computed in PYTHON from raw NUL-delimited bytes, never in the shell
+# (round-4 CX-04). `tr '\0' '\n'` destroys filename boundaries before the comparison: one trunk
+# path named "trunk\nname.txt" became the two phantom exclusions "trunk" and "name.txt" in a
+# hashed, accept-final audit artifact — the earlier comment claimed the degradation was toward a
+# false NOT-excluded, which is the opposite of what it does. Keeping the bytes NUL-delimited also
+# removes the LC_ALL=C `comm` collation hazard entirely, since Python compares exact byte strings.
+#
+# --no-renames on both sides: rename detection is a per-comparison heuristic, so the requested and
+# effective comparisons can disagree about whether one edit is a rename. A feature that renames
+# a.py to b.py while the trunk edits a.py heavily gives a rename in one and a delete+add in the
+# other, and a.py was then frozen as "excluded by the merge base" although the feature deletes it.
+# Both sides now list both endpoints, agreeing with the anchor rule's membership set.
+#
+# -z rather than plain --name-only: git C-quotes unusual paths ("caf\303\251.txt"), which would
+# put a quoted string in a frozen artifact every other reader compares against real paths.
+SCOPE_OLD_Z=$(mktemp "${TMPDIR:-/tmp}/build-brief.old.XXXXXX") || die2 "cannot allocate a scratch file in ${TMPDIR:-/tmp}"
+SCOPE_NEW_Z=$(mktemp "${TMPDIR:-/tmp}/build-brief.new.XXXXXX") || die2 "cannot allocate a scratch file in ${TMPDIR:-/tmp}"
+trap 'rm -f "$SCOPE_OLD_Z" "$SCOPE_NEW_Z"' EXIT
 if [ "$MERGE_BASE_APPLIED" = yes ]; then
-  # -z like every other consumer of a diff path list: plain --name-only C-quotes unusual paths
-  # ("caf\303\251.txt"), which would put a quoted string in a frozen artifact that every other
-  # reader compares against real repository paths. (A path containing a newline still cannot be
-  # represented in this line-oriented set difference; such a path is reported unquoted and the
-  # comparison degrades to a false "not excluded", which is the safe direction.)
-  #
-  # --no-renames on BOTH sides, for the same reason validate-verdicts.py's membership set uses it:
-  # rename detection is a per-comparison heuristic, so the two comparisons can disagree about
-  # whether the same edit is a rename. A feature that renames a.py to b.py while the trunk edits
-  # a.py heavily gives a rename in one comparison and a delete+add in the other — a.py then appears
-  # in OLD_FILES only and is frozen in the sidecar as "excluded by the merge base" when the feature
-  # itself deletes that path. --no-renames makes both sides list both endpoints, so the set
-  # difference compares like with like and agrees with the anchor rule's membership set.
-  OLD_FILES=$(git -C "$REPO" diff --name-only --no-renames -z "$REQUESTED_BSHA..$HSHA" | tr '\0' '\n' | LC_ALL=C sort)
-  NEW_FILES=$(git -C "$REPO" diff --name-only --no-renames -z "$BSHA..$HSHA" | tr '\0' '\n' | LC_ALL=C sort)
-  # LC_ALL=C on comm too, not just on the two sorts: comm compares with the AMBIENT locale's
-  # collation, so under en_US.UTF-8 (the macOS default) it walks two C-sorted lists it considers
-  # unsorted and emits paths present in both — writing files that ARE in the reviewed diff into a
-  # sidecar that is then hashed and frozen. GNU comm additionally diagnoses the disorder and exits
-  # non-zero, which under `set -e` would abort the builder after the sidecars were written.
-  EXCLUDED=$(LC_ALL=C comm -23 <(printf '%s\n' "$OLD_FILES") <(printf '%s\n' "$NEW_FILES"))
-else
-  OLD_FILES=""; NEW_FILES=""; EXCLUDED=""
+  git -C "$REPO" diff --name-only --no-renames -z "$REQUESTED_BSHA..$HSHA" > "$SCOPE_OLD_Z"
+  git -C "$REPO" diff --name-only --no-renames -z "$BSHA..$HSHA" > "$SCOPE_NEW_Z"
 fi
 # Plain if, not `test && assign`: under `set -e` a false test makes the whole statement non-zero
 # and aborts the script.
 if [ "$HREF" = WORKTREE ]; then MODE_LABEL=worktree; else MODE_LABEL=range; fi
-python3 - "$OUT.scope.json" "$MODE_LABEL" "$REPO" "$REQUESTED_BREF" "$REQUESTED_BSHA" "$BREF" "$BSHA" "$HREF" "$HSHA" "$MERGE_BASE_APPLIED" "$EXCLUDED" <<'PY'
+# The correction is APPLICABLE wherever an ancestry anchor exists, which is both modes now that a
+# snapshot tree is anchored at the commit it was captured from — not "mode == range" (round-4 CL-01).
+if [ -n "$MB_ANCHOR" ]; then MB_APPLICABLE=yes; else MB_APPLICABLE=no; fi
+python3 - "$OUT.scope.json" "$MODE_LABEL" "$REPO" "$REQUESTED_BREF" "$REQUESTED_BSHA" "$BREF" "$BSHA" "$HREF" "$HSHA" "$MERGE_BASE_APPLIED" "$MB_APPLICABLE" "$SCOPE_OLD_Z" "$SCOPE_NEW_Z" <<'PY'
 import json,sys
-out,mode,repo,rbref,rbsha,bref,bsha,href,hsha,applied,excluded=sys.argv[1:]
+out,mode,repo,rbref,rbsha,bref,bsha,href,hsha,applied,applicable,oldz,newz=sys.argv[1:]
+def paths(p):
+    with open(p,"rb") as fh:
+        return [x.decode("utf-8","surrogateescape") for x in fh.read().split(b"\0") if x]
+old_set,new_set=paths(oldz),paths(newz)
+excluded=sorted(set(old_set)-set(new_set))
 doc={"schema":"scope/1","mode":mode,"repository":repo,
      "requested_base":{"ref":rbref,"commit":rbsha},
      "effective_base":{"ref":bref,"commit":bsha},
      "head":{"ref":href,"rev":hsha},
      "merge_base_applied":applied=="yes",
-     "merge_base_applicable":mode=="range",
+     "merge_base_applicable":applicable=="yes",
      # The corrected base IS the fork point, so `M..H` is byte-identical to the rubric's `B...H`.
      "comparison":{"old":f"{rbsha}..{hsha}","corrected":f"{bsha}..{hsha}",
                    "equivalent_three_dot":f"{rbsha}...{hsha}" if applied=="yes" else None},
-     "excluded_by_merge_base":[p for p in excluded.split("\n") if p]}
+     "excluded_by_merge_base":excluded}
 doc["excluded_count"]=len(doc["excluded_by_merge_base"])
 open(out,"w").write(json.dumps(doc,indent=2,sort_keys=True)+"\n")
 print(f"scope sidecar: {out} (merge_base_applied={applied}, excluded={doc['excluded_count']})")

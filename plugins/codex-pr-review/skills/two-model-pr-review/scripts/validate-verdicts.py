@@ -31,7 +31,7 @@ import unicodedata
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from review_common import EVIDENCE_RE, normalize_evidence, ID_RE, PROVENANCE_RE, citation_has_provenance, location_error  # noqa: E402
+from review_common import EVIDENCE_RE, normalize_evidence, ID_RE, PROVENANCE_RE, SEVERITIES, citation_has_provenance, location_error  # noqa: E402
 
 VERDICTS = {"CONFIRMED", "REFUTED", "UNVERIFIABLE"}
 METHODS = {"repro", "trace", "suite", "history", "none"}
@@ -242,6 +242,39 @@ def citation_error(value: str, repo: str, head: str | None, base: str | None) ->
     return None
 
 
+def final_severities(path: Path) -> dict[str, str]:
+    """Severity as PHASE 5 left it — the value the merge decision is made on.
+
+    adjudication.md makes Phase-5 evidence the final word on severity, but the verifier reports a
+    change as prose (`severity_note`), so nothing structural carried it: the anchor rule keyed on
+    the pre-verification classification. A finding promoted P2 -> P1 during verification could then
+    confirm with no change anchor at all, which is exactly the case the rule exists for, and a
+    finding demoted P1 -> P2 stayed subject to a restriction that no longer applied.
+
+    Rows are `F-nn<TAB>P0|P1|P2|P3`; a `#` comment or a blank line is skipped. Absent file means
+    Phase 5 changed no severity.
+    """
+    out: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        fail(f"cannot read {path}: {exc}")
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("STATUS:"):
+            continue
+        parts = line.split("\t")
+        if len(parts) != 2 or not ID_RE.fullmatch(parts[0].strip()):
+            fail(f"{path}: row {number}: expected F-nn<TAB>P0|P1|P2|P3")
+        fid, sev = parts[0].strip(), parts[1].strip().upper()
+        if sev not in SEVERITIES:
+            fail(f"{path}: row {number}: {fid} has invalid severity '{sev}' (expected one of {', '.join(sorted(SEVERITIES))})")
+        if fid in out:
+            fail(f"{path}: row {number}: duplicate final severity for {fid}")
+        out[fid] = sev
+    return out
+
+
 def packet_severities(packets: Path) -> dict[str, str]:
     """Severity per finding as the Phase-5 verifier actually saw it.
 
@@ -276,6 +309,7 @@ def main() -> None:
     parser.add_argument("--matrix", required=True)
     parser.add_argument("--verdicts", required=True)
     parser.add_argument("--packets", help="05-verifier-packets.ndjson; its severities override the matrix's provisional ones")
+    parser.add_argument("--final-severities", help="05-final-severity.tsv; Phase-5 severities, which outrank both the matrix and the packets")
     parser.add_argument("--repo", help="resolve CONFIRMED/REFUTED citations in this repository")
     parser.add_argument("--head", help="the reviewed head (snapshot tree or head commit); citations without @sha are read here")
     parser.add_argument("--base", help="the base commit; a citation may also be pinned to it")
@@ -294,6 +328,11 @@ def main() -> None:
         # but a packet id the matrix does not carry must never become a required verdict id: in the
         # pipeline load_packets() already forbids that, and this script is also used standalone.
         severities.update({k: v for k, v in packet_severities(Path(args.packets)).items() if k in manifest})
+    # Phase 5 outranks both: the matrix is provisional, the packet is what the verifier was GIVEN,
+    # and this is what the verifier concluded. Same manifest restriction — a severity row can change
+    # a finding's classification, never introduce a finding.
+    if args.final_severities:
+        severities.update({k: v for k, v in final_severities(Path(args.final_severities)).items() if k in manifest})
     seen: dict[str, str] = {}
     for number, raw in enumerate(ledger.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()

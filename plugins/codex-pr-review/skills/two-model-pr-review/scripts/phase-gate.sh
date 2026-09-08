@@ -217,7 +217,10 @@ policy_omission_check() {  # policy_omission_check <prefix> <policy-token>
     [ "$selected" -gt 0 ] || fail "04-consultation.md is NOT_RUN_POLICY but no finding was selected for consultation: an ineligible phase is SKIPPED, not a policy omission"
     if [ -s "$ART/03-debate-selection.tsv" ]; then
       local blocking
-      blocking=$(awk -F'\t' '$4 == "INCLUDE" && ($3 == "P0" || $3 == "P1")' "$ART/03-debate-selection.tsv" | wc -l | tr -d ' ')
+      # Skip what the canonical parser skips (validate-consultation.py rows()): comment and STATUS
+      # lines are not selector rows, and counting them made a commented-out P1 block a legal
+      # omission over a P3 — two readers of one file disagreeing about which findings were selected.
+      blocking=$(awk -F'\t' '$0 !~ /^#/ && $0 !~ /^STATUS:/ && $4 == "INCLUDE" && ($3 == "P0" || $3 == "P1")' "$ART/03-debate-selection.tsv" | wc -l | tr -d ' ')
       [ "$blocking" -eq 0 ] || fail "04-consultation.md is NOT_RUN_POLICY but $blocking blocking finding(s) (P0/P1) were selected for consultation: a tier may omit an exchange over nits, never over the findings the merge decision turns on — run the consultation"
     fi
   fi
@@ -939,6 +942,11 @@ validate_verdicts() {
   # consultation REFINE may have changed it, and validate-verifier-packets.py stops enforcing
   # matrix equality for exactly that reason. The change-anchor rule must key on the same value.
   [ -s "$ART/05-verifier-packets.ndjson" ] && set -- "$@" --packets "$ART/05-verifier-packets.ndjson"
+  # And Phase 5 outranks the packets: adjudication.md makes Phase-5 evidence the final word on
+  # severity, but the verifier reports a change as prose, so a promotion P2 -> P1 during
+  # verification left the anchor rule keyed on the classification the merge decision no longer
+  # uses — a confirmed blocker could reach the report with no change anchor (round-4 CX-01).
+  [ -s "$ART/05-final-severity.tsv" ] && set -- "$@" --final-severities "$ART/05-final-severity.tsv"
   python3 "$VERDICT_VALIDATOR" "$@" >/dev/null || return 1
 }
 # Exit 5 means "DO NOT retry: a Codex worker may still be running" per the
@@ -1308,6 +1316,10 @@ pre-resolution)
   claim_in_flight_check 06-resolution 06-resolution.md  # before any draft is (re-)accepted (round-39/40 CL-01)
   validate_verdicts || fail "05-verdicts.tsv is missing or invalid (expected one F-nn<TAB>verdict per matrix ID, verdict = CONFIRMED|REFUTED|UNVERIFIABLE)"
   accept 05-verdicts.tsv draft
+  # The Phase-5 severity record is frozen with the verdicts it belongs to: it changes the merge
+  # decision, so it cannot be edited after the gate that acted on it. Absent means Phase 5 changed
+  # no severity, which is the common case and needs no artifact.
+  [ -s "$ART/05-final-severity.tsv" ] && accept 05-final-severity.tsv draft
   residual=$(residual_count) || fail "could not count residual verdicts"
   if [ "$ST" = COMPLETE ]; then
     check_budget
@@ -1458,6 +1470,7 @@ pre-report)
       --scope "$ART/00-brief.md.scope.json" --repo "$(repo_field repo)" \
       --out "$ART/05-scope-attribution.tsv"
     [ -s "$ART/05-verifier-packets.ndjson" ] && set -- "$@" --packets "$ART/05-verifier-packets.ndjson"
+    [ -s "$ART/05-final-severity.tsv" ] && set -- "$@" --final-severities "$ART/05-final-severity.tsv"
     python3 "$SCOPE_ATTRIBUTION" "$@" >/dev/null || fail "could not write 05-scope-attribution.tsv"
   fi
   accept 05-scope-attribution.tsv final

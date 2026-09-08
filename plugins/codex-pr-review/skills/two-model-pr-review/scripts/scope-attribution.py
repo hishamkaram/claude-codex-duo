@@ -10,8 +10,9 @@ One row per 03-matrix.tsv id, tab-separated:
 
     id  severity  verdict  path  in_requested  in_effective  disposition
 
-severity      the EFFECTIVE severity: the verifier packet's when --packets is given (a consultation
-              REFINE replaces it there), otherwise 03-matrix.tsv's provisional one
+severity      the EFFECTIVE severity, highest source wins: 05-final-severity.tsv (what Phase 5
+              concluded) > the verifier packet (what a consultation REFINE handed the verifier) >
+              03-matrix.tsv (provisional)
 
 path          the repository path of the finding's recorded evidence citation, or "-"
 in_requested  yes|no|unknown — is that path in `git diff <requested base>..<head>`
@@ -95,6 +96,7 @@ def main() -> None:
     ap.add_argument("--verdicts", required=True)
     ap.add_argument("--scope", required=True, help="00-brief.md.scope.json")
     ap.add_argument("--packets", help="05-verifier-packets.ndjson; its severities override the matrix's provisional ones")
+    ap.add_argument("--final-severities", help="05-final-severity.tsv; Phase-5 severities, which outrank both")
     ap.add_argument("--repo", required=True)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
@@ -129,6 +131,10 @@ def main() -> None:
     severities: dict[str, str] = {}
     if args.packets:
         severities = _vv.packet_severities(Path(args.packets))
+    # Phase 5 outranks the packet, as it does for the anchor rule: the audit table must name the
+    # severity the merge decision was made on, not the one the verifier was handed.
+    if args.final_severities:
+        severities.update(_vv.final_severities(Path(args.final_severities)))
 
     verdicts: dict[str, str] = {}
     evidence: dict[str, str] = {}

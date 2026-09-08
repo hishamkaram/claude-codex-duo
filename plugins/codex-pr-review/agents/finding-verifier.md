@@ -70,6 +70,11 @@ Output only this, nothing else:
     gate rejects a CONFIRMED P0/P1 whose recorded citation has no anchor. REFUTED and P2/P3 are exempt.
     TRIGGER: <the concrete input, state or call sequence that reproduces it, or "none established">
     SEVERITY_NOTE: <one line if the evidence changes the claimed severity, else "unchanged">
+    SEVERITY_FINAL: <P0|P1|P2|P3 if your evidence changes the claimed severity, else "unchanged">
+      Machine-readable, and the one that governs: the prose note above cannot be read by the gate,
+      so a promotion recorded only there left the change-anchor rule keyed on the severity you were
+      HANDED rather than the one you concluded — a blocker could then confirm with no anchor at all.
+      Give a bare severity token, nothing else. "unchanged" is the normal answer.
     REFUTATION_SEARCHED: <what you looked for that would have refuted it>
 
 When you are invoked with a structured-output schema (the workflow mode), return the same fields

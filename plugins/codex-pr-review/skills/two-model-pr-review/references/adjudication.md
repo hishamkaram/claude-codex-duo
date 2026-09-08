@@ -26,6 +26,18 @@ Every merged finding gets ONE canonical severity in the matrix. Provisionally
 record the highest any raiser gave; Phase 5 evidence sets the final severity. Never
 average severities and never let the last speaker decide.
 
+**Record a Phase-5 severity change, do not merely narrate it.** When a verifier returns
+`SEVERITY_FINAL:` with a severity rather than `unchanged`, write that row into
+`05-final-severity.tsv` — `F-nn<TAB>P0|P1|P2|P3`, one row per changed finding, no header —
+before `pre-resolution`. That file is the highest-precedence severity source: it outranks the
+verifier packet (what the verifier was handed after any consultation REFINE), which in turn
+outranks the matrix (provisional). The gate reads it for the change-anchor rule and
+`05-scope-attribution.tsv` reports it, so a finding promoted to P0/P1 during verification is
+held to the anchor requirement, and one demoted out of P0/P1 is released from it. Omitting the
+row leaves the gate enforcing a classification the merge decision no longer uses: the severity
+in `07-review.md` and the severity the gate checked must be the same number. No file is needed
+when Phase 5 changed nothing, which is the common case.
+
 Who raised what is recorded once, in `03-provenance.tsv` — one tab-separated row per
 raiser of each canonical ID and no header:
 

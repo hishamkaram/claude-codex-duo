@@ -266,11 +266,14 @@ stays available. `pre-resolution` requires
 Phase 5 verification; `pre-report` requires terminal residual-resolution
 status. No `07-review.md` precedes `pre-report`, and `phase-gate.sh post-join` must
 print `POST-JOIN-OK` at completion. If the lead agent returns `LEAD FAILED`,
-null, or no `01-lead.md` exists when Codex finishes — or the deadline watcher
-fired and the `TaskStop` was acknowledged — run Phase 1 yourself in-context
-BEFORE opening any Codex output file (you may have read `.exit`/`.meta` and the
-cut-down progress line: no review text), then seal the file and run the join
-gate.
+null, or no `01-lead.md` exists when Codex finishes, run Phase 1 yourself
+in-context BEFORE opening any Codex output file (you may have read `.exit`/`.meta`
+and the cut-down progress line: no review text), then seal the file and run the
+join gate. A fired DEADLINE is NOT one of those cases and has exactly one policy,
+in the join turn below: record the run INCOMPLETE and stop. Those are two
+different facts — an agent that reported failure has finished and produced
+nothing, while a deadline is evidence of silence, and at 90 minutes an in-context
+rerun spends a second full review on one that was merely slow.
 
 ## Phases
 
@@ -489,7 +492,7 @@ time; a disagreement over a blocker is the entire reason there are two models. I
 no ID is selected at all the phase is already ineligible and records SKIPPED as
 before; the two states are not interchangeable.
 
-**Phase 5 — Verification** → `05-verification.md`, `05-verdicts.tsv`
+**Phase 5 — Verification** → `05-verification.md`, `05-verdicts.tsv`, and `05-final-severity.tsv` when Phase 5 changed a severity
 This phase decides truth. Run `phase-gate.sh pre-verification`: it generates
 `05-verifier-packets.ndjson` by applying the accepted consultation dispositions
 to the frozen base packets with `build-verifier-packets.py` (MAINTAIN leaves
@@ -507,7 +510,13 @@ or reviewer provenance. Codex cannot run tests or builds in its sandbox, so all
 execution here is yours. With `--workflow`, rungs (a), (b) and (d) run per
 finding through the `finding-verifier` agent; rung (c) runs once, sequentially.
 Write `05-verdicts.tsv` with one
-`F-nn<TAB>verdict<TAB>method<TAB>evidence` line per matrix ID (see
+`F-nn<TAB>verdict<TAB>method<TAB>evidence` line per matrix ID, and — for every finding whose
+verifier returned a `SEVERITY_FINAL:` other than `unchanged` — a `F-nn<TAB>P0|P1|P2|P3` row in
+`05-final-severity.tsv`. That file is the highest-precedence severity source (above the verifier
+packet, above the matrix) and is what the change-anchor rule and `05-scope-attribution.tsv` read,
+so the severity the report states and the severity the gate enforced are the same number; it is
+accepted as a draft beside the verdicts at `pre-resolution`. No file is needed when Phase 5
+changed no severity. (See
 adjudication.md; a CONFIRMED or REFUTED row must carry a real method and a
 `path:lines@sha "quote"` citation that RESOLVES AT A REVIEWED REVISION —
 `pre-resolution` and `pre-report` check, in the repository recorded by
