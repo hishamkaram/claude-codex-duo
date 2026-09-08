@@ -125,7 +125,10 @@ def main() -> None:
         if not ID_RE.fullmatch(fid):
             continue
         verdicts[fid] = parts[1].strip()
-        evidence[fid] = parts[3].strip()
+        # Join, never index: EVIDENCE_RE allows a tab inside the quoted excerpt, so parts[3] alone
+        # truncates such a citation and CITATION_RE then fails on a string with no closing quote —
+        # recording a row as `unanchored` when it has a path. validate-verdicts.py joins here too.
+        evidence[fid] = "\t".join(parts[3:]).strip()
 
     out_lines = []
     for parts in read_rows(Path(args.matrix), 3):
@@ -152,9 +155,20 @@ def main() -> None:
             }[(in_req, in_eff)]
         out_lines.append("\t".join([fid, severity, verdict, path or "-", in_req, in_eff, disposition]))
 
+    # Publish atomically. write_text() opens and truncates the FINAL pathname before writing, so an
+    # interruption leaves an empty or partial file at the path the gate accepts — and pre-report
+    # regenerates only when the file is absent, so the partial one would be hashed `final` and the
+    # audit rows silently lost. rename(2) makes the path resolve only to absent or complete.
+    out = Path(args.out)
+    tmp = out.with_name(out.name + ".part")
     try:
-        Path(args.out).write_text("".join(l + "\n" for l in out_lines), encoding="utf-8")
+        tmp.write_text("".join(l + "\n" for l in out_lines), encoding="utf-8")
+        tmp.replace(out)
     except OSError as exc:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
         fail(f"cannot write {args.out}: {exc}")
     suppressed = sum(1 for l in out_lines if l.endswith("\ttrunk-only"))
     print(f"OK findings={len(out_lines)} trunk_only={suppressed}")

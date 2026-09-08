@@ -6,9 +6,11 @@
 #                                 --intent-file <f> --conventions-file <f> --out <file>
 #     Captures the aggregate working tree (staged + unstaged + deleted + non-ignored untracked) as a TREE
 #     object via an artifact-local scratch index, never touching the repo's index, refs, stash or files.
-#     Writes <out>.tree (the tree SHA) and <out>.baseline (NUL-separated status). Exit 3 = nothing to review.
+#     Writes <out>.tree (the tree SHA) and <out>.baseline (NUL-separated status).
 #     Both modes write <out>.repo (canonical repository path), <out>.base (base commit) and <out>.head (reviewed head: the snapshot tree or the head commit);
 #     phase-gate.sh pins Phase-5 citations to those two revisions.
+#   Exit 3 = nothing to review, in BOTH modes: worktree mode when the captured tree equals the base
+#     tree, range mode when `base..head` is empty. Exit 2 = usage error. Exit 0 = brief written.
 set -euo pipefail
 SK="$(cd "$(dirname "$0")/.." && pwd)"
 USAGE='usage: build-brief.sh --repo <path> --base-ref <name> --base <sha> (--head-ref <name> --head <sha> | --head WORKTREE) \\
@@ -100,7 +102,10 @@ else
   # No later gate catches it: repo_check compares base and head against the brief, never against
   # each other, and anchor_error cannot discriminate on an empty change set.
   if [ -z "$FILES" ]; then
-    echo "nothing to review: $BREF ($BSHA) already contains $HREF ($HSHA), so the comparison is empty — review a head that is not an ancestor of the base" >&2
+    # State the observed fact, not an inference from it: [ -z "$FILES" ] means the DIFF is empty,
+    # which ancestry produces but so does a full revert or an empty commit. Naming ancestry as the
+    # cause sends an operator whose branch merely nets to zero to fix a relationship that is fine.
+    echo "nothing to review: the diff $BSHA..$HSHA is empty — $BREF ($BSHA) already contains $HREF ($HSHA), or the head's tree is identical to the base's; review a head whose tree differs from the base's and that the base does not already contain" >&2
     exit 3
   fi
   DIFFCMD="git diff ${BSHA}..${HSHA}"

@@ -120,7 +120,9 @@ trunk moves on. It records both (`- Requested base:` and `- Base:`), writes the
 merge base to `00-brief.md.base`, and emits `00-brief.md.scope.json` naming every
 path the correction excluded. It exits 2 with an explanation when the histories
 share no common ancestor or have several merge bases — both mean the intended
-comparison is not determinable and guessing would review a scope nobody chose.
+comparison is not determinable and guessing would review a scope nobody chose —
+and 3 when the corrected comparison turns out to be empty, which is a review of
+nothing rather than a review that found nothing.
 Worktree mode is unaffected: a snapshot tree has no commit ancestry, and the
 local base (`HEAD`) is already an ancestor of the working tree.
 
@@ -157,8 +159,12 @@ immediately after it returns (`git -C "$REPO" cat-file -e <tree>^{tree}`); if
 either check fails, discard the Codex output, recapture, and rerun Phase 2.
 
 Builder exit codes: 0 brief written (`00-brief.md.base` and `00-brief.md.head` record the reviewed revisions in both modes; `00-brief.md.tree` holds the SHA,
-`00-brief.md.baseline` the NUL-separated status); 3 nothing to review (tree
-equals base tree); 2 usage error (including `--out` inside the repository).
+`00-brief.md.baseline` the NUL-separated status); 3 nothing to review — in
+worktree mode the captured tree equals the base tree, in range mode the diff
+`base..head` is empty (the base already contains the head, or the head's tree is
+identical to the base's), and the two need different remedies: recapture the tree
+for the first, name a head the base does not already contain for the second;
+2 usage error (including `--out` inside the repository).
 
 ## Join turn — Phase 2 (blind reviews) launched beside Phase 1
 

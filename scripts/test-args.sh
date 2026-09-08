@@ -482,6 +482,7 @@ sys.exit(0 if d['mode']=='worktree' and not d['merge_base_applicable'] and not d
 # 05-scope-attribution.tsv records what the correction did to each finding, so "would the old
 # two-dot scope have produced this?" is a lookup rather than archaeology across a run directory.
 SA=plugins/codex-pr-review/skills/two-model-pr-review/scripts/scope-attribution.py
+VV=plugins/codex-pr-review/skills/two-model-pr-review/scripts/validate-verdicts.py
 printf 'F-01\tCLAUDE-ONLY\tP1\nF-02\tCODEX-ONLY\tP1\nF-03\tBOTH\tP3\n' > "$TMP/sa-matrix.tsv"
 printf 'F-01\tCONFIRMED\ttrace\tpr-only.txt:1 "pr"\nF-02\tREFUTED\ttrace\ttrunk-only.txt:1 "trunk"\nF-03\tUNVERIFIABLE\tnone\t\n' > "$TMP/sa-verdicts.tsv"
 printf 'F-01\tCONFIRMED\ttrace\tb.txt:1 "b"\nF-02\tREFUTED\ttrace\ttrunk-only.txt:1 "trunk"\nF-03\tUNVERIFIABLE\tnone\t\n' > "$TMP/sa-wt-verdicts.tsv"
@@ -502,6 +503,48 @@ python3 "$SA" --matrix "$TMP/sa-matrix.tsv" --verdicts "$TMP/sa-wt-verdicts.tsv"
   && [ "$(sarow "$TMP/sa-wt.tsv" F-03)" = "-|-|-|unanchored" ] \
   && printf '  ok    %-42s\n' "worktree run still attributes membership" \
   || { printf '  FAIL  worktree attribution: rows=[%s]\n' "$(cat "$TMP/sa-wt.tsv" 2>/dev/null)"; FAIL=1; }
+
+# R-09 (round-3 CL-01/CX-01, raised independently by both models): membership must count BOTH ends
+# of a rename. `git diff --name-only` prints only the destination for a detected rename, so the
+# source the change deleted looked untouched and a CONFIRMED P0/P1 citing it at @base was rejected
+# for touching a file the change demonstrably touched — with a diagnostic advising demotion.
+RN="$TMP/renamerepo"; mkdir -p "$RN"
+( cd "$RN" && git init -q && git config user.email t@t && git config user.name t \
+  && printf 'def check_admin():\n    return True\n' > auth.py && printf 'x\n' > keep.txt \
+  && git add -A && git commit -qm base && git mv auth.py authz.py && git commit -qm rename -a )
+RNB=$(git -C "$RN" rev-parse HEAD~1); RNH=$(git -C "$RN" rev-parse HEAD)
+[ "$(git -C "$RN" diff --name-only "$RNB..$RNH")" = "authz.py" ] \
+  && printf '  ok    %-42s\n' "R-09: git hides the rename source (premise)" \
+  || { printf '  FAIL  R-09: premise — --name-only printed [%s]\n' "$(git -C "$RN" diff --name-only "$RNB..$RNH" | tr '\n' ' ')"; FAIL=1; }
+printf 'F-01\tCLAUDE-ONLY\tP1\n' > "$TMP/rn-matrix.tsv"
+printf 'F-01\tCONFIRMED\ttrace\tauth.py:1@%s "def check_admin():"\n' "$RNB" > "$TMP/rn-verdicts.tsv"
+chk "R-09: rename source anchors a CONFIRMED P1" 0 "OK verdicts=1" \
+  python3 "$VV" --matrix "$TMP/rn-matrix.tsv" --verdicts "$TMP/rn-verdicts.tsv" --repo "$RN" --head "$RNH" --base "$RNB"
+printf 'F-01\tCONFIRMED\ttrace\tkeep.txt:1@%s "x"\n' "$RNB" > "$TMP/rn-untouched.tsv"
+chk "R-09: a genuinely untouched path still rejected" 1 "which the reviewed change does not touch" \
+  python3 "$VV" --matrix "$TMP/rn-matrix.tsv" --verdicts "$TMP/rn-untouched.tsv" --repo "$RN" --head "$RNH" --base "$RNB"
+
+# R-10 (round-3 CL-07): the identity check's reference set is THE MANIFEST, which is the matrix.
+# A packet may override a severity; it may never add a required verdict id.
+printf 'F-01\tBOTH\tP2\n' > "$TMP/r10-matrix.tsv"
+printf '{"id":"F-01","severity":"P1"}\n{"id":"F-77","severity":"P1"}\n' > "$TMP/r10-packets.ndjson"
+printf 'F-01\tREFUTED\ttrace\tkeep.txt:1@%s "x"\n' "$RNB" > "$TMP/r10-verdicts.tsv"
+chk "R-10: a packet-only id is not a required verdict" 0 "OK verdicts=1" \
+  python3 "$VV" --matrix "$TMP/r10-matrix.tsv" --verdicts "$TMP/r10-verdicts.tsv" --packets "$TMP/r10-packets.ndjson" --repo "$RN" --head "$RNH" --base "$RNB"
+
+# R-11 (round-3 CL-04): the two readers of 05-verdicts.tsv must agree where EVIDENCE ends. A tab
+# inside the quoted excerpt is a valid row, and splitting on it recorded a real path as unanchored.
+printf 'F-01\tCLAUDE-ONLY\tP1\n' > "$TMP/r11-matrix.tsv"
+printf 'F-01\tCONFIRMED\ttrace\tpr-only.txt:1 "pr\ttabbed"\n' > "$TMP/r11-verdicts.tsv"
+python3 "$SA" --matrix "$TMP/r11-matrix.tsv" --verdicts "$TMP/r11-verdicts.tsv" --scope "$TMP/mb.md.scope.json" --repo "$MB" --out "$TMP/r11.tsv" >/dev/null 2>&1 \
+  && [ "$(sarow "$TMP/r11.tsv" F-01)" = "pr-only.txt|yes|yes|in-scope" ] \
+  && printf '  ok    %-42s\n' "R-11: a tab-bearing citation still anchors" \
+  || { printf '  FAIL  R-11: tab-bearing citation rows=[%s]\n' "$(cat "$TMP/r11.tsv" 2>/dev/null)"; FAIL=1; }
+
+# R-12 (round-3 CX-02, producer half): the output is published atomically, so the final path never
+# holds a partial table. The gate half is asserted at pre-report below.
+[ ! -e "$TMP/r11.tsv.part" ] && printf '  ok    %-42s\n' "R-12: no .part left behind after publish" \
+  || { printf '  FAIL  R-12: staging file survived the publish\n'; FAIL=1; }
 
 echo "deep-plan: init-plan.sh usage errors exit 2, inputs are pinned verbatim, gh failures exit 3"
 I="$DS/init-plan.sh"
@@ -1572,7 +1615,24 @@ chk "CX-04r14: non-manifest residual .ids rejected when SKIPPED" 1 "06-resolutio
 rm -f "$CS/06-resolution.md" "$CS/06-resolution-selection.ids"; pgw pre-resolution "$CS" >/dev/null 2>&1
 [ -z "$(grep ' 06-resolution-selection.ids ' "$CS/00-accepted.sha256")" ] && printf '  ok    %-42s\n' "ledger: removed draft selector retired by pre-resolution" || { printf '  FAIL  ledger: retired draft row still present\n'; FAIL=1; }
 printf 'resolution skipped\nSTATUS: PHASE 6 COMPLETE (SKIPPED — no residual conflicts)\n' > "$CS/06-resolution.md"
+# R-12 (round-3 CX-02, gate half): existence is not completeness. scope-attribution.py used to write
+# straight to the final path, so an interrupted run left a partial table there — and pre-report
+# generated only when the path was ABSENT, so the next call accepted the partial file `final`.
+# Seed exactly that state before the FIRST pre-report: a leftover empty table, not yet in the ledger.
+# (After the ledger row exists, accepted_check is what protects the file; the table derives from
+# 05-verdicts.tsv, a DRAFT until Phase 6, so re-deriving and comparing on every entry would turn a
+# legal verdict correction into a hard failure.)
+: > "$CS/05-scope-attribution.tsv"
 chk "gate: pre-report"                  0 "REPORT-OK"            pgw pre-report "$CS"
+[ -s "$CS/05-scope-attribution.tsv" ] \
+  && printf '  ok    %-42s\n' "R-12: a partial table is regenerated, not frozen" \
+  || { printf '  FAIL  R-12: pre-report accepted an empty attribution table\n'; FAIL=1; }
+# R-13 (round-3 CL-06): nothing asserted that pre-report produced the attribution table or froze it,
+# so deleting the `accept` line left the suite green and turned a final audit artifact into an
+# unfrozen one.
+grep -q '  05-scope-attribution.tsv  pre-report  final$' "$CS/00-accepted.sha256" \
+  && printf '  ok    %-42s\n' "R-13: the attribution table is accepted final" \
+  || { printf '  FAIL  R-13: no final ledger row for 05-scope-attribution.tsv\n'; FAIL=1; }
 # R-04: NOT_RUN_POLICY is defined for Phase 4 alone. Phase 6 wearing it used to fall through
 # every `= SKIPPED` guard, which silently disabled the round-17 CX-02 unattempted-residual check.
 printf 'not run\nSTATUS: PHASE 6 NOT_RUN_POLICY compact-v1\n' > "$CS/06-resolution.md"

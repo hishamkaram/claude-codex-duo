@@ -88,8 +88,18 @@ def changed_paths(repo: str, base: str, head: str) -> set[str] | None:
         # `src/café.py` comes back as `"src/caf\303\251.py"` while the citation parser yields the
         # real path. Comparing those two strings would reject a valid blocking finding for
         # touching a file the change demonstrably touched. NUL-delimited output is never quoted.
+        #
+        # --no-renames, because this set answers "did the change touch this path", and rename
+        # detection answers a different question. For a detected rename git prints ONLY the
+        # destination (verified: a pure R100 rename yields `authz.py` alone under --name-only,
+        # with or without -z), so the source path — which the change removed, and which no longer
+        # exists at head — looked untouched. A CONFIRMED P0/P1 whose strongest evidence is the
+        # base-side line a rename deleted ("this rename dropped an authorization check") was then
+        # rejected for citing a file the change demonstrably touched, and the diagnostic advised
+        # demoting it to the non-blocking list. --no-renames contributes both endpoints.
         proc = subprocess.run(
-            ["git", "-C", repo, "diff", "--name-only", "-z", f"{base}..{head}"], capture_output=True
+            ["git", "-C", repo, "diff", "--name-only", "--no-renames", "-z", f"{base}..{head}"],
+            capture_output=True,
         )
         _changed[key] = (
             {p for p in proc.stdout.decode("utf-8", errors="replace").split("\0") if p}
@@ -278,8 +288,12 @@ def main() -> None:
     # Read once, before the row loop: the anchor rule needs each finding's severity — the one the
     # verifier was given, which a consultation REFINE may have changed from the matrix's.
     severities = manifest_rows(matrix)
+    manifest = set(severities)   # the identity check below names "the manifest", so it must stay the matrix
     if args.packets:
-        severities.update(packet_severities(Path(args.packets)))
+        # A packet severity OVERRIDES the matrix's (post-consultation the packet is authoritative),
+        # but a packet id the matrix does not carry must never become a required verdict id: in the
+        # pipeline load_packets() already forbids that, and this script is also used standalone.
+        severities.update({k: v for k, v in packet_severities(Path(args.packets)).items() if k in manifest})
     seen: dict[str, str] = {}
     for number, raw in enumerate(ledger.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()
@@ -320,7 +334,7 @@ def main() -> None:
                     if err:
                         fail(f"row {number}: {fid} is CONFIRMED {severities[fid]} but its {err}")
         seen[fid] = verdict
-    ids = set(severities)
+    ids = manifest
     if set(seen) != ids:
         fail(f"verdict IDs differ from manifest (missing={sorted(ids - set(seen)) or 'none'} extra={sorted(set(seen) - ids) or 'none'})")
     print(f"OK verdicts={len(seen)}")

@@ -194,6 +194,11 @@ policy_omission_check() {  # policy_omission_check <prefix> <policy-token>
   # launch_records_check reconciles against the claims.
   [ "$(runner_count "$prefix")" -eq 0 ] || fail "$prefix.md is NOT_RUN_POLICY but $(runner_count "$prefix") attempt(s) were recorded: a phase that ran and failed is SKIPPED, not a policy omission"
   [ ! -e "$ART/$prefix.exit" ] || fail "$prefix.md is NOT_RUN_POLICY but $prefix.exit records an attempt's outcome: a phase that ran is COMPLETE or SKIPPED, never a policy omission"
+  # The two tests above read files an operator can delete; this one reads the ledger, which is
+  # tamper-evident. reject_skipped_after_accept already guards SKIPPED this way — without the
+  # counterpart, deleting the sidecars relabels a consultation whose response is accepted as a
+  # deliberate omission, which is the "bypass wearing a policy label" this function exists to stop.
+  [ -z "$(ledger_row "$prefix.stdout")" ] || fail "$prefix.md is NOT_RUN_POLICY but the response was already accepted (see 00-accepted.sha256): an accepted exchange cannot be a policy omission"
   # A tier may buy latency out of nits, never out of the merge decision. Consultation is the only
   # place the two models reconcile a disagreement, and the findings it is worth running for are
   # precisely the blocking ones: in the production run that motivated this work, the selected
@@ -1427,9 +1432,20 @@ pre-report)
   # 05-scope-attribution.tsv: per finding, whether its evidence path was in the requested
   # base's comparison, the reviewed one, or neither — so "would the old two-dot scope have
   # produced this finding?" is a lookup instead of archaeology. Descriptive only: it never
-  # fails a run (anchor_error in validate-verdicts.py is the blocking rule), and it is written
-  # once from inputs the ledger already froze, so a re-entered pre-report reuses it.
-  if [ ! -e "$ART/05-scope-attribution.tsv" ]; then
+  # fails a run (anchor_error in validate-verdicts.py is the blocking rule).
+  #
+  # Regenerate whenever the table is NOT yet in the ledger, and overwrite whatever is at the path
+  # (round-3 CX-02). The old "write it only if absent" test trusted existence to mean completeness:
+  # an interrupted write left a partial file that the next pre-report accepted `final`, freezing a
+  # truncated audit table under a hash asserting it was authoritative. Regenerating first means the
+  # bytes that get accepted were produced by this gate, in full, from the current inputs.
+  #
+  # Once the row IS in the ledger, leave the file alone: accepted_check has already proved it is
+  # byte-identical to what was frozen, and that is the tamper-evident record. Do NOT re-derive and
+  # compare here — 05-verdicts.tsv is a DRAFT until Phase 6 has an artifact, so a legal verdict
+  # correction followed by a re-entered pre-report would regenerate different (correct) rows and
+  # turn a supported flow into a hard failure.
+  if [ -z "$(ledger_row 05-scope-attribution.tsv)" ]; then
     python3 "$SCOPE_ATTRIBUTION" --matrix "$ART/03-matrix.tsv" --verdicts "$ART/05-verdicts.tsv" \
       --scope "$ART/00-brief.md.scope.json" --repo "$(repo_field repo)" \
       --out "$ART/05-scope-attribution.tsv" >/dev/null || fail "could not write 05-scope-attribution.tsv"

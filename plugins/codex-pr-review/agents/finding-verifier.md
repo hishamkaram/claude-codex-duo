@@ -59,7 +59,9 @@ Output only this, nothing else:
     another commit: the review gate resolves it in the repository and rejects the verdict otherwise. A cmd: line documents what you ran; on its
     own it cannot confirm or refute, because nobody can re-verify output after the fact.
     For a CONFIRMED P0 or P1, at least one citation must be a CHANGE ANCHOR: a path the reviewed
-    change actually touches (`git diff <base> <head> --name-only`). Confirming a blocking finding
+    change actually touches (`git diff --name-only --no-renames <base>..<head>` — --no-renames
+    matters: for a detected rename plain --name-only prints only the destination, so the source the
+    change deleted looks untouched, and the gate uses the same flag). Confirming a blocking finding
     asserts this change is unsafe to merge, so the evidence must point at something the change did.
     If the defect is in unchanged code that a changed caller newly reaches, cite the changed line
     that reaches it — that is the anchor — and give the unchanged site as a further citation. If the
