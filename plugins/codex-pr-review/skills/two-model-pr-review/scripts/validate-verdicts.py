@@ -23,6 +23,7 @@ CONFIRMED or REFUTED verdict on its own. Exit 0 and print `OK verdicts=N`.
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -129,17 +130,18 @@ def anchor_error(value: str, repo: str, head: str | None, base: str | None) -> s
     changed = changed_paths(repo, base, head)
     if changed is None:
         return None  # git could not answer; citation_error already proved the revisions resolve
-    if not changed:
-        # An empty comparison makes every path "untouched", so the test has no discriminating
-        # power and would reject every blocking finding on no evidence. It means base == head:
-        # `git diff A..B` takes two ENDPOINTS, not a revision range, so a snapshot tree diffs
-        # against a commit perfectly well and worktree mode reaches this function with a real
-        # change set. A run whose diff is genuinely empty is refused far earlier — build-brief.sh
-        # exits 3 rather than build a brief for it — so in practice this guard only covers
-        # fixtures and a base that was pinned to the head by hand.
-        return None
     if path in changed:
         return None
+    if not changed:
+        # An empty comparison does not make the rule vacuous — it makes it total: nothing was
+        # changed, so no path can be an anchor. Passing here would disable attribution exactly
+        # when every candidate finding is necessarily about code outside the reviewed change.
+        # build-brief.sh refuses to build a brief for an empty comparison in either mode, so
+        # reaching this line means the recorded revisions were pinned by hand.
+        return (
+            f"the reviewed comparison {base[:12]}..{head[:12]} is empty, so no path can anchor a "
+            f"blocking finding: this run has no reviewed change and should not have been built"
+        )
     return (
         f"evidence cites {path}, which the reviewed change does not touch: a blocking finding "
         f"must anchor its evidence in a path inside {base[:12]}..{head[:12]}. If the defect is in "
@@ -230,10 +232,40 @@ def citation_error(value: str, repo: str, head: str | None, base: str | None) ->
     return None
 
 
+def packet_severities(packets: Path) -> dict[str, str]:
+    """Severity per finding as the Phase-5 verifier actually saw it.
+
+    A consultation disposition of REFINE replaces every packet field, severity included, and
+    validate-verifier-packets.py stops enforcing equality with the matrix for exactly that reason.
+    So once packets exist, the matrix's severity is a stale provisional value: reading it would
+    (a) let a finding REFINEd UP to P1 confirm with no anchor, defeating the rule, and (b) block a
+    run where a finding REFINEd DOWN to P3 was confirmed on an unchanged consumer, which the
+    verifier was correctly told is exempt.
+    """
+    out: dict[str, str] = {}
+    try:
+        text = packets.read_text(encoding="utf-8")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        fid, sev = obj.get("id"), obj.get("severity")
+        if isinstance(fid, str) and isinstance(sev, str):
+            out[fid] = sev.strip().upper()
+    return out
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--matrix", required=True)
     parser.add_argument("--verdicts", required=True)
+    parser.add_argument("--packets", help="05-verifier-packets.ndjson; its severities override the matrix's provisional ones")
     parser.add_argument("--repo", help="resolve CONFIRMED/REFUTED citations in this repository")
     parser.add_argument("--head", help="the reviewed head (snapshot tree or head commit); citations without @sha are read here")
     parser.add_argument("--base", help="the base commit; a citation may also be pinned to it")
@@ -243,8 +275,11 @@ def main() -> None:
         fail("--matrix and --verdicts must be readable files")
     if args.repo and subprocess.run(["git", "-C", args.repo, "rev-parse", "--git-dir"], capture_output=True).returncode != 0:
         fail(f"--repo {args.repo} is not a git repository")
-    # Read once, before the row loop: the anchor rule needs each finding's severity.
+    # Read once, before the row loop: the anchor rule needs each finding's severity — the one the
+    # verifier was given, which a consultation REFINE may have changed from the matrix's.
     severities = manifest_rows(matrix)
+    if args.packets:
+        severities.update(packet_severities(Path(args.packets)))
     seen: dict[str, str] = {}
     for number, raw in enumerate(ledger.read_text(encoding="utf-8").splitlines(), 1):
         line = raw.strip()

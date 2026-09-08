@@ -92,6 +92,17 @@ if [ "$HSHA" = "WORKTREE" ]; then
   DIFFCMD="git diff ${BSHA} ${TREE}"
 else
   FILES=$(git -C "$REPO" diff --name-only "$BSHA..$HSHA" | LC_ALL=C sort | sed 's/^/  - /')
+  # Range mode needs the same "nothing to review" refusal worktree mode has at :86. When the head
+  # is already an ancestor of the requested base — a merged or stale branch — merge-base returns
+  # the HEAD, the correction sets base = head, and `git diff H..H` is empty. Before the correction
+  # that input produced a wrong-but-visible two-dot diff; without this guard it produces an
+  # invisible empty one, and both reviewers spend a full review on a brief naming zero files.
+  # No later gate catches it: repo_check compares base and head against the brief, never against
+  # each other, and anchor_error cannot discriminate on an empty change set.
+  if [ -z "$FILES" ]; then
+    echo "nothing to review: $BREF ($BSHA) already contains $HREF ($HSHA), so the comparison is empty — review a head that is not an ancestor of the base" >&2
+    exit 3
+  fi
   DIFFCMD="git diff ${BSHA}..${HSHA}"
 fi
 printf '%s\n' "$BSHA" > "$OUT.base"; printf '%s\n' "$HSHA" > "$OUT.head"; (cd "$REPO" && pwd -P) > "$OUT.repo"
@@ -101,9 +112,19 @@ printf '%s\n' "$BSHA" > "$OUT.base"; printf '%s\n' "$HSHA" > "$OUT.head"; (cd "$
 # the other packets. In worktree mode the head is a tree object with no commit ancestry, so the
 # correction does not apply and the sidecar says so rather than omitting the field.
 if [ "$MERGE_BASE_APPLIED" = yes ]; then
-  OLD_FILES=$(git -C "$REPO" diff --name-only "$REQUESTED_BSHA..$HSHA" | LC_ALL=C sort)
-  NEW_FILES=$(git -C "$REPO" diff --name-only "$BSHA..$HSHA" | LC_ALL=C sort)
-  EXCLUDED=$(comm -23 <(printf '%s\n' "$OLD_FILES") <(printf '%s\n' "$NEW_FILES"))
+  # -z like every other consumer of a diff path list: plain --name-only C-quotes unusual paths
+  # ("caf\303\251.txt"), which would put a quoted string in a frozen artifact that every other
+  # reader compares against real repository paths. (A path containing a newline still cannot be
+  # represented in this line-oriented set difference; such a path is reported unquoted and the
+  # comparison degrades to a false "not excluded", which is the safe direction.)
+  OLD_FILES=$(git -C "$REPO" diff --name-only -z "$REQUESTED_BSHA..$HSHA" | tr '\0' '\n' | LC_ALL=C sort)
+  NEW_FILES=$(git -C "$REPO" diff --name-only -z "$BSHA..$HSHA" | tr '\0' '\n' | LC_ALL=C sort)
+  # LC_ALL=C on comm too, not just on the two sorts: comm compares with the AMBIENT locale's
+  # collation, so under en_US.UTF-8 (the macOS default) it walks two C-sorted lists it considers
+  # unsorted and emits paths present in both — writing files that ARE in the reviewed diff into a
+  # sidecar that is then hashed and frozen. GNU comm additionally diagnoses the disorder and exits
+  # non-zero, which under `set -e` would abort the builder after the sidecars were written.
+  EXCLUDED=$(LC_ALL=C comm -23 <(printf '%s\n' "$OLD_FILES") <(printf '%s\n' "$NEW_FILES"))
 else
   OLD_FILES=""; NEW_FILES=""; EXCLUDED=""
 fi

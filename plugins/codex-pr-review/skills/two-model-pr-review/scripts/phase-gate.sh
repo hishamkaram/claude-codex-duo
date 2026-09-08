@@ -199,10 +199,22 @@ policy_omission_check() {  # policy_omission_check <prefix> <policy-token>
   # precisely the blocking ones: in the production run that motivated this work, the selected
   # candidates WERE the two genuine P1s. So a policy omission is legal only when nothing blocking
   # was selected — otherwise the tier would be trading away the answer, not the prose.
-  if [ "$prefix" = 04-consultation ] && [ -s "$ART/03-debate-selection.tsv" ]; then
-    local blocking
-    blocking=$(awk -F'\t' '$4 == "INCLUDE" && ($3 == "P0" || $3 == "P1")' "$ART/03-debate-selection.tsv" | wc -l | tr -d ' ')
-    [ "$blocking" -eq 0 ] || fail "04-consultation.md is NOT_RUN_POLICY but $blocking blocking finding(s) (P0/P1) were selected for consultation: a tier may omit an exchange over nits, never over the findings the merge decision turns on — run the consultation"
+  if [ "$prefix" = 04-consultation ]; then
+    # ELIGIBILITY, the thing that actually separates the two states. NOT_RUN_POLICY claims the
+    # phase COULD have run and the tier chose not to; SKIPPED covers both "it tried and failed"
+    # and "it could not run". Without these two assertions the states are interchangeable in the
+    # direction that flatters the run: a consultation that was never possible — no completed
+    # participant to consult, or nothing selected to consult about — gets filed as a deliberate
+    # cost saving, and the report says "NOT RUN BY POLICY" for a phase that was ineligible.
+    [ "$ST" = COMPLETE ] || fail "04-consultation.md is NOT_RUN_POLICY but Phase 2 is $ST: with no completed participant the consultation was ineligible, not omitted by choice — record SKIPPED"
+    local selected
+    selected=$(selection_count) || fail "could not count selected findings"
+    [ "$selected" -gt 0 ] || fail "04-consultation.md is NOT_RUN_POLICY but no finding was selected for consultation: an ineligible phase is SKIPPED, not a policy omission"
+    if [ -s "$ART/03-debate-selection.tsv" ]; then
+      local blocking
+      blocking=$(awk -F'\t' '$4 == "INCLUDE" && ($3 == "P0" || $3 == "P1")' "$ART/03-debate-selection.tsv" | wc -l | tr -d ' ')
+      [ "$blocking" -eq 0 ] || fail "04-consultation.md is NOT_RUN_POLICY but $blocking blocking finding(s) (P0/P1) were selected for consultation: a tier may omit an exchange over nits, never over the findings the merge decision turns on — run the consultation"
+    fi
   fi
 }
 # participants_status: every participant's 02-p<k>.md is terminal. ST = COMPLETE when at
@@ -918,6 +930,10 @@ validate_verdicts() {
   # repository path is recorded by pre-codex and accepted at the join.
   [ -s "$ART/00-repo.txt" ] || { printf '00-repo.txt missing: verdict citations cannot be resolved without the recorded repository\n' >&2; return 1; }
   set -- --matrix "$matrix" --verdicts "$verdicts" --repo "$(repo_field repo)" --head "$(repo_field head)" --base "$(repo_field base)"
+  # Once the packets exist they, not the matrix, carry the severity the verifier was given: a
+  # consultation REFINE may have changed it, and validate-verifier-packets.py stops enforcing
+  # matrix equality for exactly that reason. The change-anchor rule must key on the same value.
+  [ -s "$ART/05-verifier-packets.ndjson" ] && set -- "$@" --packets "$ART/05-verifier-packets.ndjson"
   python3 "$VERDICT_VALIDATOR" "$@" >/dev/null || return 1
 }
 # Exit 5 means "DO NOT retry: a Codex worker may still be running" per the

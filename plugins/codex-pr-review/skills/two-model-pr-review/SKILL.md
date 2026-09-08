@@ -477,8 +477,12 @@ for is a `BOTH` or `CONFLICT` row at P2/P3 — the two reviewers disagreeing abo
 a nit. When the tier is `compact-v1` and every selected candidate is non-blocking
 (no P0 or P1 among the `INCLUDE` rows of `03-debate-selection.tsv`), omit the
 exchange: write `04-consultation.md` ending
-`STATUS: PHASE 4 NOT_RUN_POLICY compact-v1`, launch no runner, take no claim, and
-let Phase 5 verify the unchanged base packets. When ANY selected candidate is a
+`STATUS: PHASE 4 NOT_RUN_POLICY compact-v1` and launch no runner. Do NOT try to avoid
+or delete the launch claim: `pre-consultation` mints `04-consultation.claim` as its
+last step and you must still run that gate (it is what accepts the `03-*` artifacts
+that `pre-verification` requires), so an unused reservation is present on every legal
+omission and the gate is written to tolerate it — deleting a claim directory is never
+recoverable. Then let Phase 5 verify the unchanged base packets. When ANY selected candidate is a
 P0 or P1, run the consultation regardless of tier — the gate refuses the omission
 and it is right to. A disagreement over a nit is worth 6 minutes of nobody's
 time; a disagreement over a blocker is the entire reason there are two models. If

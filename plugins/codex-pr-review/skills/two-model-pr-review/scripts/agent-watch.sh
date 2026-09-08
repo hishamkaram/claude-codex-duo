@@ -51,13 +51,13 @@ case "${1:-}" in
   -* ) die2 "the first argument must be an out-prefix, not an option";;
 esac
 PREFIX="$1"; shift
-EXPECT=""; AFTER_SEC=""; LABEL=""; POLL=15; EXPECT_MODE=""
+EXPECT=""; AFTER_SEC=""; LABEL=""; POLL=15; EXPECT_MODE=""; EXPECT_MODE_GIVEN=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --expect)      need "$@"; EXPECT="$2";;
     --after)       need "$@"; AFTER_MIN="$2";;
     --after-sec)   need "$@"; AFTER_SEC="$2";;
-    --expect-mode) need "$@"; EXPECT_MODE="$2";;
+    --expect-mode) need "$@"; EXPECT_MODE="$2"; EXPECT_MODE_GIVEN=1;;
     --label)       need "$@"; LABEL="$2";;
     --poll-sec)    need "$@"; POLL="$2";;
     *) die2 "unknown arg $1";;
@@ -78,7 +78,11 @@ num() {
 # A permission mode is three octal digits and is NOT a number: num() strips leading zeros, which
 # would turn the mode 000 we actually wait for into "0" and 040 into "40". Validate it as a
 # literal instead, and compare it the same way stat renders it (see mode() below).
-if [ -n "$EXPECT_MODE" ]; then
+# Validate on the FLAG being given, not on the value being non-empty: `--expect-mode "$MODE"` with
+# MODE unset would otherwise pass silently and restore the arrival predicate this option exists to
+# replace — and that failure looks like "watcher exits 0 in seconds", the exact defect being fixed,
+# which nobody notices because the signal is green.
+if [ "$EXPECT_MODE_GIVEN" = 1 ]; then
   case "$EXPECT_MODE" in
     [0-7][0-7][0-7]) ;;
     *) die2 "--expect-mode requires three octal digits (got '$EXPECT_MODE')";;

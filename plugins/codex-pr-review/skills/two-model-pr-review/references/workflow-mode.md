@@ -114,7 +114,8 @@ per shard with the per-shard coverage table the rubric already requires, add a "
 section with anything you see spanning shards, publish `01-lead.md` the same atomic way
 (`01-lead.md.part`, `chmod 000`, rename), `chmod 000` every shard file again, and only then run
 `phase-gate.sh pre-phase3`. `pre-codex` refuses a
-resumed run while any `01-lead*.md` is readable. The shard files are never sent to Codex. Shard
+resumed run while any `01-lead*.md` or `01-lead*.md.part` is readable — the staging file of the
+atomic publish is a readable copy of a review and is held to the same rule. The shard files are never sent to Codex. Shard
 names must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,63}`; file lists reach each agent JSON-encoded, so
 a path with a newline or quote stays one token.
 

@@ -13,7 +13,10 @@ One row per 03-matrix.tsv id, tab-separated:
 path          the repository path of the finding's recorded evidence citation, or "-"
 in_requested  yes|no|unknown — is that path in `git diff <requested base>..<head>`
 in_effective  yes|no|unknown — is that path in `git diff <effective base>..<head>`, the
-              reviewed comparison (the merge base in range mode)
+              reviewed comparison (the merge base in range mode). In worktree mode the two bases
+              are the same commit and the head is a snapshot tree; there is no correction to
+              attribute, but membership is still a fact, so both columns agree rather than say
+              "unknown"
 disposition   in-scope           both comparisons contain it — the correction changed nothing
               trunk-only         the requested base saw it, the reviewed comparison did not:
                                  the correction is what kept this finding out of the diff
@@ -23,7 +26,7 @@ disposition   in-scope           both comparisons contain it — the correction 
                                  rubric's repo-wide consumer search
               unanchored         no path to attribute: command evidence, an empty verdict
                                  row, or evidence that is not a citation
-              unknown            git could not answer for this repository
+              unknown            git could not answer, or the run recorded no usable revisions
 
 The file is descriptive, never a gate: nothing here fails a run. The blocking rule lives in
 validate-verdicts.py's anchor_error(), which refuses a CONFIRMED P0/P1 whose evidence is not
@@ -102,12 +105,13 @@ def main() -> None:
     head = (scope.get("head") or {}).get("rev", "")
     effective = (scope.get("effective_base") or {}).get("commit", "")
     requested = (scope.get("requested_base") or {}).get("commit", "")
-    # Worktree mode compares a snapshot tree, which has no ancestry: there is no second
-    # comparison to attribute against, so every row is reported against the one that ran.
-    applicable = bool(scope.get("merge_base_applicable")) and bool(head) and bool(effective)
-
+    # Membership is not the same question as merge-base applicability. Worktree mode cannot compute
+    # commit ancestry for a snapshot tree, so no CORRECTION is possible there — but `git diff
+    # <base> <tree>` still answers "is this path in the reviewed change", which is all a row needs.
+    # Reporting `unknown` there threw away the record this file exists to provide; in that mode the
+    # requested and effective bases are the same commit, so both columns simply agree.
     def membership(base: str) -> set[str] | None:
-        if not applicable or not base:
+        if not head or not base:
             return None
         return _vv.changed_paths(args.repo, base, head)
 
