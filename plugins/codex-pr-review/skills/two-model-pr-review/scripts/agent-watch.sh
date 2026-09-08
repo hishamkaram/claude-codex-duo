@@ -2,7 +2,12 @@
 # agent-watch.sh — supervise ONE asynchronous review unit.
 #
 #   agent-watch.sh <out-prefix> --expect <file> (--after <minutes> | --after-sec <seconds>) \
-#                  [--label <name>] [--poll-sec <n>]
+#                  [--expect-mode <octal>] [--label <name>] [--poll-sec <n>]
+#
+#   --expect-mode <octal>  also require that mode, so the predicate tests COMPLETION and not mere
+#                          arrival. Callers watching a sealed artifact pass 000. Omit it and the
+#                          success test is "exists and is non-empty", which a producer satisfies
+#                          the instant it creates the file.
 #
 # Why this exists. The join turn launches units in the background and then waits. Before this
 # script the only supervised unit was the Codex job, which has codex-run.sh's progress sidecar,

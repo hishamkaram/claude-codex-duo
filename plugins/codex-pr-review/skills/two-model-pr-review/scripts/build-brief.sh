@@ -171,9 +171,9 @@ if [ "$HREF" = WORKTREE ]; then MODE_LABEL=worktree; else MODE_LABEL=range; fi
 # The correction is APPLICABLE wherever an ancestry anchor exists, which is both modes now that a
 # snapshot tree is anchored at the commit it was captured from — not "mode == range" (round-4 CL-01).
 if [ -n "$MB_ANCHOR" ]; then MB_APPLICABLE=yes; else MB_APPLICABLE=no; fi
-python3 - "$OUT.scope.json" "$MODE_LABEL" "$REPO" "$REQUESTED_BREF" "$REQUESTED_BSHA" "$BREF" "$BSHA" "$HREF" "$HSHA" "$MERGE_BASE_APPLIED" "$MB_APPLICABLE" "$SCOPE_OLD_Z" "$SCOPE_NEW_Z" <<'PY'
+python3 - "$OUT.scope.json" "$MODE_LABEL" "$REPO" "$REQUESTED_BREF" "$REQUESTED_BSHA" "$BREF" "$BSHA" "$HREF" "$HSHA" "$MERGE_BASE_APPLIED" "$MB_APPLICABLE" "$MB_ANCHOR" "$SCOPE_OLD_Z" "$SCOPE_NEW_Z" <<'PY'
 import json,sys
-out,mode,repo,rbref,rbsha,bref,bsha,href,hsha,applied,applicable,oldz,newz=sys.argv[1:]
+out,mode,repo,rbref,rbsha,bref,bsha,href,hsha,applied,applicable,anchor,oldz,newz=sys.argv[1:]
 def paths(p):
     with open(p,"rb") as fh:
         return [x.decode("utf-8","surrogateescape") for x in fh.read().split(b"\0") if x]
@@ -186,8 +186,13 @@ doc={"schema":"scope/1","mode":mode,"repository":repo,
      "merge_base_applied":applied=="yes",
      "merge_base_applicable":applicable=="yes",
      # The corrected base IS the fork point, so `M..H` is byte-identical to the rubric's `B...H`.
+     # equivalent_three_dot only where both endpoints are COMMITS. A snapshot tree has no ancestry,
+     # so `<commit>...<tree>` is an expression git rejects (exit 128) — and extending the correction
+     # to worktree mode is what made that reachable. The ancestry anchor the merge base was actually
+     # computed against is recorded separately, so the calculation stays replayable there.
      "comparison":{"old":f"{rbsha}..{hsha}","corrected":f"{bsha}..{hsha}",
-                   "equivalent_three_dot":f"{rbsha}...{hsha}" if applied=="yes" else None},
+                   "equivalent_three_dot":f"{rbsha}...{hsha}" if applied=="yes" and mode!="worktree" else None},
+     "ancestry_anchor":anchor or None,
      "excluded_by_merge_base":excluded}
 doc["excluded_count"]=len(doc["excluded_by_merge_base"])
 open(out,"w").write(json.dumps(doc,indent=2,sort_keys=True)+"\n")

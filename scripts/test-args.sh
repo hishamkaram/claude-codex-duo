@@ -767,6 +767,50 @@ json.dump(d, open('$TMP/r25-norev.json','w'))"
 chk "R-25: an empty head.rev is refused" 1 "head.rev is missing or empty" \
   python3 "$SA" --matrix "$TMP/r15-matrix.tsv" --verdicts "$TMP/r15-verdicts.tsv" --scope "$TMP/r25-norev.json" --repo "$MB" --out "$TMP/r25.tsv"
 
+# R-27 (round-6 CL-01/CX-01, both models): a three-dot expression needs two COMMITS. Extending the
+# correction to worktree mode made `<commit>...<tree>` reachable in the frozen sidecar — an
+# "equivalent" comparison git exits 128 on. The ancestry anchor is recorded instead, so the
+# calculation stays replayable.
+python3 -c "
+import json,sys
+d=json.load(open('$TMP/wt.md.scope.json'))
+sys.exit(0 if d['merge_base_applied'] and d['comparison']['equivalent_three_dot'] is None and d.get('ancestry_anchor') else 1)" \
+  && printf '  ok    %-42s\n' "R-27: no three-dot for a snapshot-tree head" \
+  || { printf '  FAIL  R-27: worktree sidecar comparison=%s\n' "$(python3 -c "import json;d=json.load(open('$TMP/wt.md.scope.json'));print(d['comparison'],d.get('ancestry_anchor'))" 2>/dev/null)"; FAIL=1; }
+git -C "$WT" rev-parse --verify --quiet "$(python3 -c "import json;print(json.load(open('$TMP/wt.md.scope.json'))['ancestry_anchor'])")^{commit}" >/dev/null \
+  && printf '  ok    %-42s\n' "R-27: the recorded anchor is a real commit" \
+  || { printf '  FAIL  R-27: ancestry_anchor does not resolve\n'; FAIL=1; }
+# Range mode still gets the three-dot form, and git accepts it.
+python3 -c "
+import json,sys
+d=json.load(open('$TMP/nl.md.scope.json'))
+sys.exit(0 if d['comparison']['equivalent_three_dot'] else 1)" \
+  && git -C "$NL" rev-parse --verify --quiet "$(python3 -c "import json;print(json.load(open('$TMP/nl.md.scope.json'))['comparison']['equivalent_three_dot'].split('...')[0])")^{commit}" >/dev/null \
+  && printf '  ok    %-42s\n' "R-27: range mode keeps a usable three-dot" \
+  || { printf '  FAIL  R-27: range-mode three-dot missing or unusable\n'; FAIL=1; }
+
+# R-28 (round-6 CX-02): a quoted citation path may hold a literal tab, and writing it raw made a
+# seven-column table emit eight columns, which pre-report then froze `final`.
+printf 'F-01\tCLAUDE-ONLY\tP1\n' > "$TMP/r28-matrix.tsv"
+printf 'F-01\tCONFIRMED\ttrace\t"tab\tname.py":1 "x"\n' > "$TMP/r28-verdicts.tsv"
+python3 "$SA" --matrix "$TMP/r28-matrix.tsv" --verdicts "$TMP/r28-verdicts.tsv" --scope "$TMP/mb.md.scope.json" --repo "$MB" --out "$TMP/r28.tsv" >/dev/null 2>&1
+cols=$(awk -F'\t' 'NR==1{print NF}' "$TMP/r28.tsv" 2>/dev/null)
+[ "$cols" = 7 ] && grep -q 'tab\\tname.py' "$TMP/r28.tsv" \
+  && printf '  ok    %-42s\n' "R-28: a tab in the path keeps 7 columns" \
+  || { printf '  FAIL  R-28: columns=%s row=[%s]\n' "$cols" "$(cat "$TMP/r28.tsv" 2>/dev/null)"; FAIL=1; }
+
+# R-29 (round-6 CL-02/CL-03/CL-05): the docs that describe behaviour this release changed. Each of
+# these was already fixed once elsewhere and reintroduced by omission in another shipped file.
+grep -q 'merge-base correction not applicable: local snapshot-tree review' plugins/codex-pr-review/skills/two-model-pr-review/templates/REVIEW.md \
+  && { printf '  FAIL  R-29: REVIEW.md still offers the stale worktree fill-in\n'; FAIL=1; } \
+  || printf '  ok    %-42s\n' "R-29: no stale worktree fill-in in REVIEW.md"
+grep -q 'expect-mode' "$AW" && head -20 "$AW" | grep -q 'expect-mode' \
+  && printf '  ok    %-42s\n' "R-29: the watcher usage header lists --expect-mode" \
+  || { printf '  FAIL  R-29: --expect-mode missing from the usage header\n'; FAIL=1; }
+grep -q 'publishes ATOMICALLY' README.md && grep -q 'compact-v1' README.md \
+  && printf '  ok    %-42s\n' "R-29: README describes the tier and the publish" \
+  || { printf '  FAIL  R-29: README still describes the superseded lead behaviour\n'; FAIL=1; }
+
 echo "deep-plan: init-plan.sh usage errors exit 2, inputs are pinned verbatim, gh failures exit 3"
 I="$DS/init-plan.sh"
 for o in --repo --out --slug --rounds --issue --pr --comment --request --request-file; do chk "init $o with no value" 2 "requires a value" bash "$I" $o; done

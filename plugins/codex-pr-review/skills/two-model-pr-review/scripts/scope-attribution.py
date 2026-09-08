@@ -14,7 +14,9 @@ severity      the EFFECTIVE severity, highest source wins: 05-final-severity.tsv
               concluded) > the verifier packet (what a consultation REFINE handed the verifier) >
               03-matrix.tsv (provisional)
 
-path          the repository path of the finding's recorded evidence citation, or "-"
+path          the repository path of the finding's recorded evidence citation, or "-".
+              Tabs, newlines and backslashes are backslash-escaped (\\t, \\n, \\r, \\\\) so the row
+              always has exactly seven tab-separated columns
 in_requested  yes|no|unknown — is that path in `git diff <requested base>..<head>`
 in_effective  yes|no|unknown — is that path in `git diff <effective base>..<head>`, the
               reviewed comparison (the merge base, in BOTH modes — a snapshot tree is anchored at
@@ -187,7 +189,12 @@ def main() -> None:
                 ("no", "yes"): "introduced-by-fix",
                 ("no", "no"): "outside-both",
             }[(in_req, in_eff)]
-        out_lines.append("\t".join([fid, severity, verdict, path or "-", in_req, in_eff, disposition]))
+        # Escape the PATH before joining: a quoted citation may legally contain a literal tab (or a
+        # newline), and writing it raw produced an eight-column row in a seven-column table that
+        # every positional reader then misparsed. Reversible and greppable: backslash escapes, with
+        # the backslash itself escaped first so the encoding round-trips.
+        safe = (path or "-").replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+        out_lines.append("\t".join([fid, severity, verdict, safe, in_req, in_eff, disposition]))
 
     # Publish atomically. write_text() opens and truncates the FINAL pathname before writing, so an
     # interruption leaves an empty or partial file at the path the gate accepts — and pre-report

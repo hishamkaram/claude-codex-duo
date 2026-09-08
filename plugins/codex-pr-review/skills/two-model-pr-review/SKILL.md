@@ -49,7 +49,7 @@ You produce exactly one merge decision, backed by artifacts on disk.
 |---|---|
 | PR / branch | user's message → `gh pr view` → current branch |
 | Local changes | user says "my changes", "working tree", "uncommitted", or the tree is dirty and no PR/branch was named → head = `WORKTREE` (snapshot tree, see codex-protocol.md); base defaults to `HEAD` |
-| Base ref | user's message → PR base → `origin/main` / `origin/master` (range mode) · `HEAD` (local mode). This is the REQUESTED base; in range mode `build-brief.sh` replaces it with `merge-base(requested, head)` and records both, so the diff is what the change introduces rather than what the trunk did meanwhile. Do not compute a merge base yourself. |
+| Base ref | user's message → PR base → `origin/main` / `origin/master` (range mode) · `HEAD` (local mode). This is the REQUESTED base; `build-brief.sh` replaces it with the merge base and records both, so the diff is what the change introduces rather than what the trunk did meanwhile. This happens in BOTH modes — a snapshot tree is anchored at the commit it was captured from, and `--base` is caller-supplied in local mode too, so a local review against a moved trunk tip would otherwise inherit the trunk's work. With the default local base (`HEAD`) the merge base is `HEAD`, so the correction applies and simply does not fire. Do not compute a merge base yourself. |
 | Stated intent | PR body, linked issue, or spec file the user names |
 | Conventions | `CLAUDE.md`, `CONTRIBUTING.md`, `docs/adr/*`, nearby code |
 | Test/lint commands | `Makefile`, `package.json` scripts, CI config |
@@ -556,7 +556,7 @@ mandatory.
 `pre-report` also writes `05-scope-attribution.tsv` and accepts it as final: one row per
 finding — `id severity verdict path in_requested in_effective disposition` — recording whether
 the finding's evidence path was inside the requested base's comparison, the reviewed one
-(the merge base, in range mode), or neither. It is descriptive, never a gate: it makes
+(the merge base, in both modes), or neither. It is descriptive, never a gate: it makes
 "would the old two-dot scope have produced this finding?" a lookup instead of archaeology
 across the run directory. A `trunk-only` row is a finding the merge-base correction kept out
 of scope. Cite it in §8 when any row is `trunk-only`.
