@@ -582,6 +582,22 @@ python3 "$SA" --matrix "$TMP/r15-matrix.tsv" --verdicts "$TMP/r15-verdicts.tsv" 
   && printf '  ok    %-42s\n' "R-15: a REFINEd severity overrides the matrix" \
   || { printf '  FAIL  R-15: packet severity=[%s] want P3\n' "$(awk -F'\t' '$1=="F-01"{print $2}' "$TMP/r15b.tsv" 2>/dev/null)"; FAIL=1; }
 
+# R-16 (codex round-2 P2): $ART is caller-supplied and may contain spaces. The gate builds the
+# attribution command's optional --packets as positional parameters for that reason; an unquoted
+# word list split the pathname and argparse rejected it, failing pre-report AFTER verification.
+# Assert the producer end to end through a spaced directory, and that the gate builds no such list.
+SPD="$TMP/spaced dir"; mkdir -p "$SPD"
+printf 'F-01\tBOTH\tP1\n' > "$SPD/m.tsv"
+printf 'F-01\tCONFIRMED\ttrace\tpr-only.txt:1 "pr"\n' > "$SPD/v.tsv"
+printf '{"id":"F-01","severity":"P3"}\n' > "$SPD/p.ndjson"
+python3 "$SA" --matrix "$SPD/m.tsv" --verdicts "$SPD/v.tsv" --scope "$TMP/mb.md.scope.json" --repo "$MB" --packets "$SPD/p.ndjson" --out "$SPD/out.tsv" >/dev/null 2>&1 \
+  && [ "$(awk -F'\t' '$1=="F-01"{print $2}' "$SPD/out.tsv")" = "P3" ] \
+  && printf '  ok    %-42s\n' "R-16: spaced paths survive the attribution call" \
+  || { printf '  FAIL  R-16: spaced-path attribution failed\n'; FAIL=1; }
+grep -q 'ATTRIB_ARGS' "$PG" \
+  && { printf '  FAIL  R-16: the gate rebuilt an unquoted argument word list\n'; FAIL=1; } \
+  || printf '  ok    %-42s\n' "R-16: no unquoted argument list in the gate"
+
 echo "deep-plan: init-plan.sh usage errors exit 2, inputs are pinned verbatim, gh failures exit 3"
 I="$DS/init-plan.sh"
 for o in --repo --out --slug --rounds --issue --pr --comment --request --request-file; do chk "init $o with no value" 2 "requires a value" bash "$I" $o; done
