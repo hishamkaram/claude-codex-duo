@@ -27,7 +27,9 @@ ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe --via ccr:<alias> --record-di
 Prints `PROBE SUCCEEDED backend=codex ready=True loggedIn=True codex=…` or
 `PROBE SUCCEEDED backend=ccr alias=… provider=… model=… compatibility=… tools=true readonly=verified ccr=…`
 followed by the alias's `ccr model show` JSON (exit 0), or `PROBE UNAVAILABLE …` /
-`PROBE FAILED …` (exit 1). Record every line verbatim in `00-scope.md`, and the JSON
+`PROBE FAILED …` (exit 1), or `PROBE UNDETERMINED …` (exit 0 — the companion could not determine
+authentication; NOT a refusal, record it and proceed to the launch, which settles it; never record
+the participant UNAVAILABLE and never degrade to a single-model review on it). Record every line verbatim in `00-scope.md`, and the JSON
 in a fenced block after it. On failure tell the user `/codex:setup` exists (codex)
 or `ccr model list` / `ccr model show <alias>` (ccr); do not improvise auth. If the
 repo may not be sent to a participant's provider, record DECLINED for that

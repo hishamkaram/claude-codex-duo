@@ -54,7 +54,10 @@ ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe                              
 ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe --via ccr:<alias> --record-dir "$ART"    # each ccr alias
 ```
 
-`PROBE SUCCEEDED …` (exit 0) or `PROBE UNAVAILABLE/FAILED …` (exit 1); record
+`PROBE SUCCEEDED …` (exit 0), `PROBE UNAVAILABLE/FAILED …` (exit 1), or `PROBE UNDETERMINED …`
+(exit 0 — the companion could not determine authentication, which is not an authoritative
+negative: record the line and proceed to the launch, which settles it; never treat it as
+unavailable and never stamp the run SOLO on it); record
 the line verbatim in `00-frame.md`, and for a ccr alias also the `ccr model show`
 JSON the probe prints after it. On failure tell the user `/codex:setup` exists
 (codex) or `ccr model list` / `ccr model show <alias>` (ccr); do not improvise

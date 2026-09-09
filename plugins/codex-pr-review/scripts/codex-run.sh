@@ -70,6 +70,11 @@
 
 set -u
 CCR_MIN_VERSION="0.4.11"
+# These are assigned inside ccr_preflight, past its early-return failures. The attach path is
+# allowed to run without a successful preflight (the child is already going), so under `set -u`
+# every reader below would abort the collector mid-publication. Declare them empty up front: an
+# empty value is a fact the route check already knows how to report, an unbound one is a crash.
+CCR_VER=""; PROVIDER=""; PROVIDER_MODEL=""; CLAUDE_MODEL=""; COMPAT=""; TOOLS=""
 CCR_MAX_TURNS_DEFAULT=100
 # The exact read-only launch line for the ccr backend. It is the one line every ccr participant
 # runs and the one line the probe's smoke verifies; its digest is part of the smoke record so a
@@ -177,11 +182,21 @@ sys.exit(rc)
 # an attach reads it, so a number is never acted on alone: it is paired with the start time the
 # kernel reports for it, and the pair must still match. `ps -o lstart=` is the one field both BSD
 # and GNU ps agree on for this; whitespace is squeezed so the recorded and live forms compare.
-proc_identity() {  # <pid> -> start-time string, empty when the pid is gone
-  ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//'
+# TZ=UTC is not cosmetic: `ps -o lstart=` renders the start time in the OBSERVING shell's local
+# time, so the same live process yields a different string under a different TZ or across a DST
+# transition (measured: `Wed Sep 9 16:06:58 2026` local, `09:06:58` under TZ=UTC, `18:06:58` under
+# Asia/Tokyo). The whole point of the record is that a DIFFERENT process re-proves it later, and
+# that process may have any TZ, so the identity must not be a property of who is looking.
+proc_identity() {  # <pid> -> start-time string, empty when the pid is gone or cannot be read
+  TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//'
 }
-# 0 = same execution · 1 = gone (it finished) · 2 = a different execution now holds the number.
-# The caller must treat 1 and 2 differently: 1 means collect the result, 2 means touch nothing.
+# 0 = same execution · 1 = the number is gone · 2 = it is held by a different execution.
+# NONE of these is proof that the job ended. Only the supervisor's receipt is that, which is why
+# the collector below refuses to publish a terminal outcome without one: an empty `ps` may mean
+# process inspection failed rather than the process exited, and a mismatch may mean the recorded
+# string was written by an observer we cannot reproduce. Ambiguity re-detaches; it never
+# terminates. What identity IS authoritative for is the opposite direction: nothing may be
+# signalled unless state 0 says the number still names our execution.
 identity_state() {  # <pid> <recorded identity>
   local live; live=$(proc_identity "$1")
   [ -n "$live" ] || return 1
@@ -342,6 +357,7 @@ raise SystemExit(rc)'
 fi
 USAGE='usage: codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>] [--max-turns N]
        codex-run.sh <out-prefix> --attach [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>]
+       codex-run.sh <out-prefix> --attach --cancel
        codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]'
 # Every invocation error exits 4 (LAUNCH-ERROR). Never exit 1 for a bad command line:
 # 1 means "the second model failed, retry once" in the documented contract, and a typo must not look like that.
@@ -356,10 +372,14 @@ if stat --version >/dev/null 2>&1; then fmtime() { stat -c %Y "$1" 2>/dev/null; 
 else fmtime() { stat -f %m "$1" 2>/dev/null; }; fsig() { stat -f '%z:%m' "$1" 2>/dev/null; }; fi
 CLAIM_MODE=0; CLAIM_TOKEN=""; for _a in "$@"; do [ "$_a" = "--claim" ] && CLAIM_MODE=1; done  # exact argument, never a substring of a value (round-33 CX-03)
 # An argument error writes <prefix>.exit only for the claim-less sibling plugins: with --claim, or when a launch claim exists for the prefix (a gate-issued prefix), nothing is written (round-42 CL-04).
-# .exit is terminal: once an attempt has published one, no later invocation may rewrite it. A
-# refused --attach on a finished prefix would otherwise overwrite a COMPLETED 0 with a 4 and
-# destroy the very result this runner exists to preserve.
-die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || [ -e "${PREFIX:-/nonexistent}.exit" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
+# .exit is terminal in BOTH directions: an attempt that has published one must not have it
+# rewritten (a refused --attach would otherwise overwrite a COMPLETED 0 with a 4 and destroy the
+# result this runner exists to preserve), and an attempt that is still in flight must not have one
+# invented (a detached attempt's missing .exit is deliberate — it is what keeps the review gate
+# closed, and writing 4 there frees the claim and makes every later --attach refuse a job that is
+# still running). The claim-less plugins are the exposed case: they pass neither --claim nor a
+# claim directory, so those two disjuncts never save them.
+die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || [ -e "${PREFIX:-/nonexistent}.exit" ] || [ -e "${PREFIX:-/nonexistent}.detached" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
 need() { [ $# -ge 2 ] || die4 "$1 requires a value"; case "$2" in -*) die4 "$1 requires a value (got option $2)";; esac; }
 MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""; ATTACH=0; VIA_SET=0; CANCEL_ONLY=0
 while [ $# -gt 0 ]; do
@@ -432,6 +452,10 @@ prompt_digest() { { shasum -a 256 "$1" 2>/dev/null || sha256sum "$1" 2>/dev/null
 # step — receipt, .stdout, .meta, removing .detached, writing .exit — so no reader ever sees a
 # half-published attempt. A lock older than a minute belongs to a dead process, exactly as
 # stamp_claim treats it.
+# Released on every exit path, including a die4 or a `set -e`-style abort inside the publish
+# window: a lock leaked by a crashed collector would otherwise block every later attach and the
+# review gate's own release for a full minute (F-04's abort was exactly this shape).
+trap 'publish_unlock' EXIT INT TERM
 publish_lock() {
   local lock="$PREFIX.claim.lock" i=0 now m
   while ! mkdir "$lock" 2>/dev/null; do
@@ -451,7 +475,10 @@ rotate_previous_attempt() {
   # orphaned attempt is rotated as a unit, never truncated.
   if [ -e "$PREFIX.meta" ] || [ -e "$PREFIX.exit" ] || [ -e "$PREFIX.progress" ]; then
     N=1; while ls "$PREFIX.attempt$N."* >/dev/null 2>&1; do N=$((N+1)); done
-    for ext in stdout stderr progress joblog meta exit; do [ -e "$PREFIX.$ext" ] && mv "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
+    # .detached and .childexit belong to the attempt too: a record left behind would make a bogus
+    # --attach admissible against the NEXT, live attempt, and a stale receipt would let it publish
+    # a terminal outcome from the previous run's exit status.
+    for ext in stdout stderr progress joblog meta exit detached childexit; do [ -e "$PREFIX.$ext" ] && mv "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
     echo "codex-run.sh: previous attempt rotated to $PREFIX.attempt$N.*"
   fi
 }
@@ -518,6 +545,11 @@ START=$(date +%s); now() { date +%s; }; elapsed() { echo $(( $(now) - START )); 
 # spent, and `mode=` keeps the original launch mode so the review gates' thread anchoring is
 # untouched. Attachment is recorded separately, in `attached=`.
 if [ "$ATTACH" = 1 ]; then
+  # Admission is decided under the publication lock and HELD for the whole attach, so a second
+  # attach cannot pass the same guard and end up as a concurrent collector of one job. Testing
+  # `.exit` outside the lock only proved it was absent at some moment in the past; by the time
+  # this process published, another collector could already have finished.
+  publish_lock
   [ -e "$PREFIX.detached" ] || die4 "--attach: no $PREFIX.detached — nothing detached from this prefix (a launch that finished wrote .exit; a launch that never ran wrote nothing)"
   [ ! -e "$PREFIX.exit" ] || die4 "--attach: $PREFIX.exit exists, so that attempt already finished; re-read its sidecars instead of attaching"
   BACKEND=$(detached_field backend); JOB=$(detached_field job); MODE=$(detached_field mode)
@@ -526,18 +558,23 @@ if [ "$ATTACH" = 1 ]; then
   ATTEMPTS=$(awk -F= '$1=="attached"{print $2; exit}' "$PREFIX.meta" 2>/dev/null); ATTEMPTS=$(( ${ATTEMPTS:-0} + 1 ))
   case "$BACKEND" in codex|ccr) ;; *) die4 "--attach: $PREFIX.detached names no usable backend (backend='$BACKEND')";; esac
   ATTACH_CMD=$(detached_field attach_command); CANCEL_CMD=$(detached_field cancel_command)
-  echo "$(elapsed)s ATTACH #$((ATTEMPTS+1)) backend=$BACKEND ${JOB:+job=$JOB}${DPID:+pid=$DPID pgid=$PGID}" >> "$PREFIX.progress"
+  echo "$(elapsed)s ATTACH #$ATTEMPTS backend=$BACKEND ${JOB:+job=$JOB}${DPID:+pid=$DPID pgid=$PGID}" >> "$PREFIX.progress"
 
   # ---- identity, before anything is observed or signalled -------------------
   # 0 = the recorded number still names our execution · 1 = it is gone · 2 = it now names
   # something else. 1 and 2 both mean our execution ended — a live pid is never reused — so both
   # collect; what neither may do is signal, which is why the state is resolved before the loop.
-  ALIVE=1; IDENT_NOTE=""
+  # ALIVE gates SIGNALLING only. Whether the job ENDED is a separate question, and identity cannot
+  # answer it: an empty `ps` may be a failed inspection rather than an exit, and an unequal string
+  # may be an identity we cannot reproduce rather than a reused pid. Only the supervisor receipt
+  # settles that, so an ambiguous state with no receipt re-detaches instead of publishing.
+  ALIVE=1; IDENT_NOTE=""; IDENT_STATE=0
   if [ "$BACKEND" = ccr ]; then
-    identity_state "$DPID" "$IDENT"; case $? in
+    identity_state "$DPID" "$IDENT"; IDENT_STATE=$?
+    case "$IDENT_STATE" in
       0) ALIVE=1;;
-      1) ALIVE=0; IDENT_NOTE="the recorded process is gone; collecting its result";;
-      2) ALIVE=0; IDENT_NOTE="pid $DPID now names a different execution (start time differs); nothing signalled, collecting what the launch left";;
+      1) ALIVE=0; IDENT_NOTE="the recorded process id is not readable; only the supervisor receipt can say whether the job ended";;
+      2) ALIVE=0; IDENT_NOTE="pid $DPID does not match the recorded start time; nothing will be signalled, and only the receipt can end this attempt";;
     esac
     [ -z "$IDENT_NOTE" ] || echo "$(elapsed)s IDENTITY: $IDENT_NOTE" >> "$PREFIX.progress"
   fi
@@ -611,10 +648,15 @@ if [ "$BACKEND" = ccr ]; then
       # Not our child: `kill -0` would answer for whatever holds the number now, so the pid is
       # paired with its start time. A number that is gone, or that has been reused, both mean our
       # execution ended — and neither may be signalled.
-      identity_state "$CHILD" "$IDENT"; case $? in
+      identity_state "$CHILD" "$IDENT"; IDENT_STATE=$?
+      case "$IDENT_STATE" in
         0) STATUS=running;;
-        1) STATUS=exited;;
-        2) STATUS=exited; ALIVE=0; IDENT_NOTE="pid $CHILD was reused by another execution; nothing signalled";;
+        # The number is gone or contested. That is not proof the job finished — only the receipt
+        # is. With a receipt the execution is genuinely over and we collect; without one the
+        # attempt stays in flight and this watch re-detaches at the bound (see below).
+        1|2) ALIVE=0
+             if [ -s "$RECEIPT" ]; then STATUS=exited
+             else STATUS=running; IDENT_NOTE="identity unresolved (state $IDENT_STATE) and no supervisor receipt yet; not concluding the job ended"; fi;;
       esac
     elif kill -0 "$CHILD" 2>/dev/null; then STATUS=running; else STATUS=exited; fi
     echo "$(elapsed)s status=$STATUS idle=${IDLE}s | $LASTLINE" >> "$PREFIX.progress"
@@ -630,6 +672,7 @@ if [ "$BACKEND" = ccr ]; then
     write_detached <<EOD
 backend=ccr
 alias=$ALIAS
+claude_model_id=$CLAUDE_MODEL
 pid=$CHILD
 pgid=$PGID
 identity=$(proc_identity "$CHILD")
@@ -671,12 +714,35 @@ EOD
     # exactly why it exists: the success predicate below keeps its exit-status condition.
     CHILD_RC=$(awk -F= '$1=="child_exit"{print $2; exit}' "$RECEIPT" 2>/dev/null)
     if [ -z "$CHILD_RC" ]; then
-      CHILD_RC=1
-      echo "$(elapsed)s no supervisor receipt at $RECEIPT: the owner did not publish a child exit status" >> "$PREFIX.progress"
-      echo "codex-run.sh: supervisor receipt missing ($RECEIPT); treating the attempt as failed rather than assuming success" >> "$PREFIX.stderr"
+      # No receipt means the owner has not reaped the child, so this attempt has NOT ended —
+      # whatever the pid looks like. Publishing a terminal failure here would delete .detached,
+      # free the claim and let a second job be launched against the one still running: the exact
+      # failure this change exists to prevent, reintroduced one level up.
+      OUTCOME=DETACHED
+      echo "$(elapsed)s no supervisor receipt at $RECEIPT; the attempt has not ended — re-detaching rather than publishing a terminal outcome" >> "$PREFIX.progress"
+      REDETACH_REASON="no supervisor receipt; identity state ${IDENT_STATE:-0}"
     fi
   else
     wait "$CHILD" 2>/dev/null; CHILD_RC=$?
+  fi
+  # A collector that cannot prove the attempt ended publishes nothing terminal. It refreshes the
+  # detached record and leaves with exit 6, so .exit stays absent, the claim stays closed, and the
+  # documented recovery is still an attach.
+  if [ "$OUTCOME" = DETACHED ]; then
+    ATTEMPTS=${ATTEMPTS:-0}
+    ATTACH_CMD=$(detached_field attach_command); CANCEL_CMD=$(detached_field cancel_command)
+    echo "$(elapsed)s DETACHED (re-detached): $REDETACH_REASON" >> "$PREFIX.progress"
+    {
+      echo "outcome=DETACHED"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "detached=yes"; echo "attached=$ATTEMPTS"
+      echo "pid=$DPID"; echo "pgid=$PGID"; echo "elapsed_sec=$(elapsed)"
+      echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "mode=$MODE"; echo "prompt_file=$PROMPT_FILE"
+      echo "command=$CMD"; echo "redetach_reason=$REDETACH_REASON"
+      echo "attach_command=$ATTACH_CMD"; echo "cancel_command=$CANCEL_CMD"
+    } > "$PREFIX.meta"
+    publish_unlock
+    echo "codex-run.sh: DETACHED backend=ccr alias=$ALIAS elapsed=$(elapsed)s — $REDETACH_REASON; the attempt is still open."
+    echo "  attach: $ATTACH_CMD"
+    exit 6
   fi
   SESSION_ID=$(stream_field "$PREFIX.joblog" init-session); ROUTED_MODEL=$(stream_field "$PREFIX.joblog" init-model)
   HAS_RESULT=$(stream_field "$PREFIX.joblog" has-result)
@@ -693,6 +759,13 @@ EOD
   # another alias. This comparison is local metadata only — no extra ccr call.
   ROUTE_OK=unknown
   if [ "$OUTCOME" = COMPLETED ]; then
+    # On an attach, the expected model is the one recorded at launch. Judging a finished execution
+    # by whatever the alias resolves to NOW would turn an ordinary config change into UNAVAILABLE
+    # for an answer that was already produced correctly.
+    if [ "$ATTACH" = 1 ]; then
+      WANT_MODEL=$(detached_field claude_model_id); [ -n "$WANT_MODEL" ] || WANT_MODEL="$CLAUDE_MODEL"
+      CLAUDE_MODEL="$WANT_MODEL"
+    fi
     if [ -z "$CLAUDE_MODEL" ] || [ -z "$ROUTED_MODEL" ] || [ "$ROUTED_MODEL" != "$CLAUDE_MODEL" ]; then
       OUTCOME=UNAVAILABLE; ROUTE_OK=no
       echo "$(elapsed)s ROUTE-UNAVAILABLE alias=$ALIAS expected_child_model=${CLAUDE_MODEL:-unknown} got_child_model=${ROUTED_MODEL:-unknown}" >> "$PREFIX.progress"
@@ -701,9 +774,8 @@ EOD
       ROUTE_OK=yes
     fi
   fi
-  # One publication at a time: a second attach, or the review gate's release, takes this same
-  # lock, so no reader can see a half-published attempt and no two collectors can race.
-  publish_lock
+  # The attach path already holds this lock from admission; a launch takes it here.
+  [ "$ATTACH" = 1 ] || publish_lock
   [ "$OUTCOME" != COMPLETED ] || [ -z "$SESSION_ID" ] || printf '%s\n' "$SESSION_ID" > "$DIR/.ccr-last-session"
   {
     echo "outcome=$OUTCOME"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "detached=no"; echo "attached=${ATTEMPTS:-0}"
@@ -798,6 +870,7 @@ if [ "$OUTCOME" = "DETACHED" ]; then
   write_detached <<EOD
 backend=codex
 job=$JOB
+thread=$(awk -F= '$1=="thread"{print $2; exit}' "$PREFIX.meta" 2>/dev/null)
 joblog=${LOGFILE:-}
 mode=$MODE
 prompt_sha256=$(prompt_digest "$PROMPT_FILE")
@@ -862,7 +935,7 @@ if [ "$MODE" = "--resume-last" ] && [ "$OUTCOME" = COMPLETED ] && [ -n "$THREAD"
     echo "codex-run.sh: $THREAD_NOTE" >> "$PREFIX.stderr"
   fi
 fi
-publish_lock
+[ "$ATTACH" = 1 ] || publish_lock
 {
   echo "outcome=$OUTCOME"; echo "backend=codex"; echo "job=$JOB"; echo "thread=${THREAD:-unknown}"
   echo "detached=no"; echo "attached=${ATTEMPTS:-0}"; [ -z "$THREAD_NOTE" ] || echo "thread_note=$THREAD_NOTE"

@@ -368,6 +368,41 @@ shopt -s nullglob; ROT_AFTER=( "$CP".attempt* ); shopt -u nullglob
   && printf '  ok    %-42s\n' "T-15: attach collects it, mode kept, no rotation" \
   || { printf '  FAIL  T-15(attach): rc=%s attached=%s rotated_delta=%s\n' "$rc" "$(awk -F= '$1=="attached"{print $2}' "$CP.meta")" "$(( ${#ROT_AFTER[@]} - ${#ROT_BEFORE[@]} ))"; FAIL=1; }
 
+# T-19 (review F-01): the recorded identity must not depend on who is observing it. `ps -o lstart=`
+# renders in the caller's local time, so without TZ pinning the same live process compares unequal
+# across a TZ or DST boundary — and an "unequal" identity used to publish a terminal outcome.
+IDENT_PY=$(sed -n '/^proc_identity() {/,/^}/p' "$R")
+i_local=$(bash -c "$IDENT_PY"$'\n''proc_identity $$')
+i_tokyo=$(TZ=Asia/Tokyo bash -c "$IDENT_PY"$'\n''proc_identity $$')
+[ -n "$i_local" ] && [ "$i_local" = "$i_tokyo" ] && printf '  ok    %-42s\n' "T-19: identity is observer-independent" \
+  || { printf '  FAIL  T-19: local=%s tokyo=%s\n' "$i_local" "$i_tokyo"; FAIL=1; }
+
+# T-20 (review F-02): an argument error against a LIVE detached attempt must not invent a
+# terminal .exit. Writing one frees the claim and makes every later attach refuse a running job.
+CP3="$CCRD/p-detached"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=slowok FAKE_CCR_SLEEP=75 bash "$R" "$CP3" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 5 --poll-sec 5 --max-min 1 2>&1); rc=$?
+PG3=$(awk -F= '$1=="pgid"{print $2}' "$CP3.meta")
+bash "$R" "$CP3" --attach --prompt-file "$CCRD/prompt.md" >/dev/null 2>&1; rc2=$?
+[ "$rc" = 6 ] && [ "$rc2" = 4 ] && [ ! -e "$CP3.exit" ] && [ -e "$CP3.detached" ] \
+  && printf '  ok    %-42s\n' "T-20: bad attach args leave a live attempt open" \
+  || { printf '  FAIL  T-20: detach_rc=%s attach_rc=%s exit_written=%s\n' "$rc" "$rc2" "$([ -e "$CP3.exit" ] && echo yes || echo no)"; FAIL=1; }
+
+# T-21 (review F-01b): with no supervisor receipt the attempt has NOT ended, whatever the pid
+# looks like. The collector must re-detach, never publish a terminal outcome and free the claim.
+# The child must still be running for the whole attach window, or the receipt legitimately appears
+# and publishing becomes the correct behaviour (which is what the first draft of this test caught).
+CP4="$CCRD/p-nofinish"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=slowok FAKE_CCR_SLEEP=600 bash "$R" "$CP4" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 5 --poll-sec 5 --max-min 1 2>&1); rc=$?
+PG4=$(awk -F= '$1=="pgid"{print $2}' "$CP4.meta")
+sed -i.bak 's/^identity=.*/identity=IMPOSSIBLE-NEVER-MATCHES/' "$CP4.detached" && rm -f "$CP4.detached.bak"
+[ ! -e "$CP4.childexit" ] || { printf '  FAIL  T-21 setup: receipt already present\n'; FAIL=1; }
+out=$(PATH="$CCRBIN:$PATH" bash "$R" "$CP4" --attach --poll-sec 2 --max-min 1 2>&1); rc2=$?
+[ "$rc" = 6 ] && [ "$rc2" = 6 ] && [ ! -e "$CP4.exit" ] && [ -e "$CP4.detached" ] && grep -q '^outcome=DETACHED' "$CP4.meta" \
+  && printf '  ok    %-42s\n' "T-21: unresolved identity re-detaches, never terminates" \
+  || { printf '  FAIL  T-21: detach_rc=%s attach_rc=%s exit_written=%s detached=%s\n' "$rc" "$rc2" "$([ -e "$CP4.exit" ] && echo yes || echo no)" "$([ -e "$CP4.detached" ] && echo yes || echo no)"; FAIL=1; }
+kill -- "-$PG4" 2>/dev/null
+kill -- "-$PG3" 2>/dev/null
+
 # T-16: a refused attach must never rewrite a terminal .exit — the result it would destroy is the
 # whole point of the change.
 out=$(bash "$R" "$CP" --attach 2>&1); rc=$?
