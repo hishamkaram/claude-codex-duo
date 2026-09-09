@@ -371,11 +371,21 @@ shopt -s nullglob; ROT_AFTER=( "$CP".attempt* ); shopt -u nullglob
 # T-19 (review F-01): the recorded identity must not depend on who is observing it. `ps -o lstart=`
 # renders in the caller's local time, so without TZ pinning the same live process compares unequal
 # across a TZ or DST boundary — and an "unequal" identity used to publish a terminal outcome.
+# The two readings must be of the SAME process: two freshly started shells have their own start
+# times, and `ps -o lstart=` has one-second granularity, so comparing them passes by coincidence
+# and fails whenever the pair straddles a second boundary (cycle 2: CL-08). One long-lived
+# process is observed from two zones instead, and the unpinned form is asserted to differ so the
+# test cannot pass because the pinning has quietly stopped mattering.
 IDENT_PY=$(sed -n '/^proc_identity() {/,/^}/p' "$R")
-i_local=$(bash -c "$IDENT_PY"$'\n''proc_identity $$')
-i_tokyo=$(TZ=Asia/Tokyo bash -c "$IDENT_PY"$'\n''proc_identity $$')
-[ -n "$i_local" ] && [ "$i_local" = "$i_tokyo" ] && printf '  ok    %-42s\n' "T-19: identity is observer-independent" \
-  || { printf '  FAIL  T-19: local=%s tokyo=%s\n' "$i_local" "$i_tokyo"; FAIL=1; }
+sleep 60 & IDPID=$!
+i_local=$(bash -c "$IDENT_PY"$'\n'"proc_identity $IDPID")
+i_tokyo=$(TZ=Asia/Tokyo bash -c "$IDENT_PY"$'\n'"proc_identity $IDPID")
+n_utc=$(TZ=UTC ps -o lstart= -p "$IDPID" 2>/dev/null | tr -s ' ')
+n_tokyo=$(TZ=Asia/Tokyo ps -o lstart= -p "$IDPID" 2>/dev/null | tr -s ' ')
+kill "$IDPID" 2>/dev/null; wait "$IDPID" 2>/dev/null
+[ -n "$i_local" ] && [ "$i_local" = "$i_tokyo" ] && [ "$n_utc" != "$n_tokyo" ] \
+  && printf '  ok    %-42s\n' "T-19: identity is observer-independent" \
+  || { printf '  FAIL  T-19: pinned local=%s tokyo=%s | unpinned utc=%s tokyo=%s\n' "$i_local" "$i_tokyo" "$n_utc" "$n_tokyo"; FAIL=1; }
 
 # T-20 (review F-02): an argument error against a LIVE detached attempt must not invent a
 # terminal .exit. Writing one frees the claim and makes every later attach refuse a running job.
@@ -388,18 +398,108 @@ bash "$R" "$CP3" --attach --prompt-file "$CCRD/prompt.md" >/dev/null 2>&1; rc2=$
   || { printf '  FAIL  T-20: detach_rc=%s attach_rc=%s exit_written=%s\n' "$rc" "$rc2" "$([ -e "$CP3.exit" ] && echo yes || echo no)"; FAIL=1; }
 
 # T-21 (review F-01b): with no supervisor receipt the attempt has NOT ended, whatever the pid
-# looks like. The collector must re-detach, never publish a terminal outcome and free the claim.
+# looks like — so the WATCH BOUND on such an attach re-detaches instead of publishing a terminal
+# outcome and freeing the claim. (The other route into that refusal, a STALL bound on the same
+# unresolved identity, is T-22 below; this test never reaches it, the bound fires first.)
 # The child must still be running for the whole attach window, or the receipt legitimately appears
 # and publishing becomes the correct behaviour (which is what the first draft of this test caught).
 CP4="$CCRD/p-nofinish"
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=slowok FAKE_CCR_SLEEP=600 bash "$R" "$CP4" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 5 --poll-sec 5 --max-min 1 2>&1); rc=$?
 PG4=$(awk -F= '$1=="pgid"{print $2}' "$CP4.meta")
-sed -i.bak 's/^identity=.*/identity=IMPOSSIBLE-NEVER-MATCHES/' "$CP4.detached" && rm -f "$CP4.detached.bak"
+sed -i.bak -e 's/^identity=.*/identity=IMPOSSIBLE-NEVER-MATCHES/' -e 's/^claude_model_id=.*/claude_model_id=pinned-by-the-launch/' "$CP4.detached" && rm -f "$CP4.detached.bak"
 [ ! -e "$CP4.childexit" ] || { printf '  FAIL  T-21 setup: receipt already present\n'; FAIL=1; }
 out=$(PATH="$CCRBIN:$PATH" bash "$R" "$CP4" --attach --poll-sec 2 --max-min 1 2>&1); rc2=$?
 [ "$rc" = 6 ] && [ "$rc2" = 6 ] && [ ! -e "$CP4.exit" ] && [ -e "$CP4.detached" ] && grep -q '^outcome=DETACHED' "$CP4.meta" \
   && printf '  ok    %-42s\n' "T-21: unresolved identity re-detaches, never terminates" \
   || { printf '  FAIL  T-21: detach_rc=%s attach_rc=%s exit_written=%s detached=%s\n' "$rc" "$rc2" "$([ -e "$CP4.exit" ] && echo yes || echo no)" "$([ -e "$CP4.detached" ] && echo yes || echo no)"; FAIL=1; }
+# T-21b (cycle 2, CL-04): that re-detach REWROTE the record. Every field it carries is the
+# launch's, and this process is not the launch: re-deriving identity= would write down whoever
+# holds the number now — laundering an identity this very run refused to act on — and re-deriving
+# claude_model_id= would erase what the launch pinned with a value an attach cannot know.
+grep -qx 'identity=IMPOSSIBLE-NEVER-MATCHES' "$CP4.detached" && grep -qx 'claude_model_id=pinned-by-the-launch' "$CP4.detached" \
+  && printf '  ok    %-42s\n' "T-21b: re-detach preserves launch-owned fields" \
+  || { printf '  FAIL  T-21b: %s\n' "$(grep -E '^(identity|claude_model_id)=' "$CP4.detached" | tr '\n' ' ')"; FAIL=1; }
+
+# T-22 (cycle 2, CL-01/CX-01 — P0): the STALL bound reached on an attach whose identity is
+# unresolved. The runner has already logged that nothing will be signalled; TERM/KILLing the
+# recorded process group anyway would break the one rule identity is authoritative for, against a
+# process there is no reason to believe is ours. Nothing is signalled, nothing terminal is
+# published, and the still-live group is proof of both.
+out=$(PATH="$CCRBIN:$PATH" bash "$R" "$CP4" --attach --stall-min 1 --poll-sec 5 --max-min 9 2>&1); rc3=$?
+[ "$rc3" = 6 ] && [ ! -e "$CP4.exit" ] && [ -e "$CP4.detached" ] && kill -0 -- "-$PG4" 2>/dev/null \
+  && grep -q 'refusing to signal' "$CP4.progress" && grep -q '^outcome=DETACHED' "$CP4.meta" \
+  && printf '  ok    %-42s\n' "T-22: stall on unproven identity signals nothing" \
+  || { printf '  FAIL  T-22: rc=%s exit_written=%s group_alive=%s\n' "$rc3" "$([ -e "$CP4.exit" ] && echo yes || echo no)" "$(kill -0 -- "-$PG4" 2>/dev/null && echo yes || echo no)"; FAIL=1; }
+
+# T-23 (cycle 2, CL-03/CX-03): a group cancel signals every member, the supervisor included.
+# Dying without a receipt would leave the attempt uncollectable forever — .detached kept, claim
+# closed, every attach re-detaching — so the supervisor catches the signal and still publishes.
+SUP_PY=$(sed -n '/^start_supervised_group() {/,/^}/p' "$R")
+RCPT="$TMP/sup.receipt"; rm -f "$RCPT"
+bash -c "$SUP_PY"$'\n'"start_supervised_group '$RCPT' sleep 600" >/dev/null 2>&1 &
+SUPPID=$!; sleep 1
+SUPPG=$(ps -o pgid= -p "$SUPPID" 2>/dev/null | tr -d ' ')
+kill -TERM -- "-${SUPPG:-0}" 2>/dev/null; sleep 3
+[ -n "$SUPPG" ] && [ -s "$RCPT" ] && grep -q '^child_exit=' "$RCPT" && ! grep -q '^child_exit=0$' "$RCPT" \
+  && ! kill -0 -- "-$SUPPG" 2>/dev/null \
+  && printf '  ok    %-42s\n' "T-23: a cancelled supervisor still publishes" \
+  || { printf '  FAIL  T-23: pgid=%s receipt=%s\n' "$SUPPG" "$(cat "$RCPT" 2>/dev/null || echo none)"; kill -KILL -- "-${SUPPG:-0}" 2>/dev/null; FAIL=1; }
+
+# T-24 (cycle 2, CL-02): the publication lock is mutual exclusion, and an --attach legitimately
+# holds it for its whole watch — up to --max-min. Reclaiming it on age would admit a second
+# collector into a healthy holder, so staleness is a property of the HOLDER: a lock older than any
+# clock threshold is still respected while its recorded holder is running, and released when it
+# is not.
+CP7="$CCRD/p-lockheld"
+sleep 300 & HOLDER=$!
+mkdir -p "$CP7.claim.lock"
+printf 'pid=%s\nidentity=%s\n' "$HOLDER" "$(TZ=UTC ps -o lstart= -p "$HOLDER" | tr -s ' ' | sed 's/^ *//;s/ *$//')" > "$CP7.claim.lock/holder"
+touch -t 200001010000 "$CP7.claim.lock"
+out=$(bash "$R" "$CP7" --attach 2>&1); rc=$?
+[ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'held by another attach' && [ -d "$CP7.claim.lock" ] && [ ! -e "$CP7.exit" ] \
+  && printf '  ok    %-42s\n' "T-24: an aged lock with a live holder is kept" \
+  || { printf '  FAIL  T-24(held): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+kill "$HOLDER" 2>/dev/null; wait "$HOLDER" 2>/dev/null
+out=$(bash "$R" "$CP7" --attach 2>&1); rc=$?
+[ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'nothing detached from this prefix' && [ ! -d "$CP7.claim.lock" ] \
+  && printf '  ok    %-42s\n' "T-24: a lock whose holder is gone is reclaimed" \
+  || { printf '  FAIL  T-24(dead): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+rm -f "$CP7.exit"
+
+# T-25 (cycle 2, CL-05): an --attach that arrives BEFORE the launch has detached. .claim, .exit
+# and .detached are all absent in that window and .progress is the only marker of the live
+# attempt, so an argument error here used to publish .exit=4 against a running job — freeing its
+# claim for a second launch, the exact failure this change exists to prevent.
+CP8="$CCRD/p-prelaunch"
+PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=slowok FAKE_CCR_SLEEP=600 bash "$R" "$CP8" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 5 --poll-sec 5 --max-min 9 >/dev/null 2>&1 &
+LAUNCHER=$!; sleep 4
+out=$(bash "$R" "$CP8" --attach 2>&1); rc=$?
+PG8=$(sed -n 's/.*launched backend=ccr pid=[0-9]* pgid=\([0-9]*\).*/\1/p' "$CP8.progress" 2>/dev/null | head -1)
+[ "$rc" = 4 ] && [ -e "$CP8.progress" ] && [ ! -e "$CP8.exit" ] && [ ! -e "$CP8.detached" ] \
+  && printf '  ok    %-42s\n' "T-25: attach before detach leaves the launch alone" \
+  || { printf '  FAIL  T-25: rc=%s exit_written=%s\n' "$rc" "$([ -e "$CP8.exit" ] && cat "$CP8.exit" || echo no)"; FAIL=1; }
+kill "$LAUNCHER" 2>/dev/null; kill -KILL -- "-${PG8:-0}" 2>/dev/null; wait "$LAUNCHER" 2>/dev/null
+
+# T-26 (cycle 2, CL-07): a launch against a prefix whose detached job is still running. Rotating
+# that record to .attemptN.* would strand the job — nothing could attach to it or cancel it again
+# — while a second job started against the same prefix. The launch is refused instead, and the
+# refusal prints the recorded attach and cancel commands.
+CP9="$CCRD/p-livedetached"
+sleep 300 & LIVE=$!
+{ printf 'backend=ccr\nalias=x\npid=%s\npgid=%s\nidentity=%s\n' "$LIVE" "$LIVE" "$(TZ=UTC ps -o lstart= -p "$LIVE" | tr -s ' ' | sed 's/^ *//;s/ *$//')"
+  printf 'attach_command=ATTACH-ME\ncancel_command=CANCEL-ME\n'; } > "$CP9.detached"
+printf '0s launched backend=ccr pid=%s pgid=%s alias=x\n' "$LIVE" "$LIVE" > "$CP9.progress"
+out=$(PATH="$CCRBIN:$PATH" bash "$R" "$CP9" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'still running' && printf '%s' "$out" | grep -q 'ATTACH-ME' && printf '%s' "$out" | grep -q 'CANCEL-ME' \
+  && [ -e "$CP9.detached" ] && [ ! -e "$CP9.attempt1.detached" ] && [ ! -e "$CP9.exit" ] \
+  && printf '  ok    %-42s\n' "T-26: a launch never rotates a live detached job" \
+  || { printf '  FAIL  T-26: rc=%s rotated=%s out=%s\n' "$rc" "$([ -e "$CP9.attempt1.detached" ] && echo yes || echo no)" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+kill "$LIVE" 2>/dev/null; wait "$LIVE" 2>/dev/null
+# ... and once that job is gone, the same launch proceeds and rotates the dead record normally.
+out=$(PATH="$CCRBIN:$PATH" bash "$R" "$CP9" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 0 ] && [ -e "$CP9.attempt1.detached" ] && [ ! -e "$CP9.detached" ] \
+  && printf '  ok    %-42s\n' "T-26: a dead detached record never deadlocks the prefix" \
+  || { printf '  FAIL  T-26(dead): rc=%s rotated=%s\n' "$rc" "$([ -e "$CP9.attempt1.detached" ] && echo yes || echo no)"; FAIL=1; }
 kill -- "-$PG4" 2>/dev/null
 kill -- "-$PG3" 2>/dev/null
 

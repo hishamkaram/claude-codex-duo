@@ -4,6 +4,10 @@ All notable changes to this repository are documented here. Versions follow [Sem
 
 ## [shared runner — detach on the watch bound; tri-state availability] - 2026-09-09
 
+`codex-pr-review` 5.1.0 · `codex-deep-plan` 2.4.0 · `codex-debate` 1.3.0 — the runner is shipped
+byte-identically by all three, and its caller-visible exit contract gains a state (**6**), so all
+three are released together.
+
 Two defects in `scripts/codex-run.sh`, the runner all three plugins ship byte-identically. Both
 have the same shape: a state the runner could not determine, or had merely stopped observing, was
 reported as a terminal negative. Planned with a blind second-model diagnosis and a three-round
@@ -61,6 +65,34 @@ debate (artifacts: `runner-hard-negatives-20260909-140134`, termination T1).
   list from the script itself, so the documentation cannot drift from it.
 - `.exit` is never rewritten once written. A refused `--attach` on a finished prefix previously
   overwrote a COMPLETED `0` with a `4`, destroying the very result this change exists to preserve.
+  Nor is it invented for somebody else's live attempt: an argument error against a prefix that has
+  a claim, an `.exit`, a `.detached` **or a `.progress`** is reported and publishes nothing — the
+  last of those is the only marker present in the window between a launch starting and its first
+  outcome, which is where an early `--attach` lands.
+- **`<prefix>.claim.lock` is reclaimed from a dead holder, never on age.** Both the runner and
+  `phase-gate.sh` used "older than sixty seconds"; that was true while every hold lasted
+  milliseconds, and false the moment an `--attach` began holding the lock for its whole watch —
+  up to twenty-five minutes — so the gate or a second attach would take the lock from a healthy
+  collector and admit exactly the concurrency the lock exists to exclude. The holder now records
+  its pid and start-time identity inside the lock and the lock is released only once that
+  execution is provably gone. The clock still decides one case: a lock with no holder record.
+- **The supervisor publishes a receipt even when it is cancelled.** A group cancel signals every
+  member, the supervisor included; dying before writing `child_exit=` would leave the attempt
+  permanently uncollectable — `.detached` kept, the claim closed, and every later attach finding
+  no receipt and re-detaching forever. SIGTERM/SIGINT/SIGHUP are caught, the child gets a bounded
+  chance to land, and a receipt is published either way.
+- **A launch never rotates a live detached job away.** Rotating `<prefix>.detached` to
+  `.attemptN.*` would strand a running job — nothing could attach to it or cancel it again — while
+  a second job started against the same prefix. The launch is refused (exit 4) while the recorded
+  identity is provably still running, and prints the record's own attach and cancel commands. An
+  identity that cannot be proved is allowed to rotate, so a dead record can never deadlock a prefix.
+- **Nothing that identity could not prove is ever signalled, or written down as proven.** The
+  stall path used to TERM/KILL the recorded process group even on an attach that had already
+  logged that the identity was unresolved; it now re-detaches instead. And a re-detaching attach
+  copies `identity=`, `claude_model_id=` and `prompt_sha256=` forward verbatim rather than
+  re-deriving them: re-deriving would record whoever holds the number now — laundering an identity
+  this very run refused to act on into one a later attach would signal on — and would erase what
+  the launch pinned with values an attach cannot know.
 - `scripts/test-args.sh`: the timeout case asserted `rc = 3` with `cancel_confirmed=yes` — it
   encoded the defect, so it is **replaced**, not extended around (the second model's X-4). New
   fixtures cover detach, attach and collection, refusal paths, terminal-`.exit` preservation, and

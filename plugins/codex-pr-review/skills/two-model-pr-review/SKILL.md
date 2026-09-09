@@ -172,11 +172,13 @@ whose owner file carries that token (`<prefix>.claim/runner`, an atomic mkdir)
 before it writes anything at all, and a missing, replaced or already-taken
 claim, or an invalid argument, exits 4 with a stderr message and no sidecar.
 Creating or rotating a claim and taking one are serialized by
-`<prefix>.claim.lock` (an atomic mkdir held for milliseconds by the gate, and by
-the runner until it has rotated the previous attempt's sidecars away; one older
-than a minute is reclaimed), so a runner can never take a claim the gate is
-rotating out from under it, and a stale `.exit` can never make a gate treat a
-just-started runner's claim as finished.
+`<prefix>.claim.lock` (an atomic mkdir held for milliseconds by the gate, by the
+runner until it has rotated the previous attempt's sidecars away, and by an
+`--attach` for its whole watch while it collects a detached job), so a runner can
+never take a claim the gate is rotating out from under it, and a stale `.exit`
+can never make a gate treat a just-started runner's claim as finished. The lock
+is reclaimed when its recorded holder is no longer running, never on age alone —
+an attach may hold it for twenty-five minutes and still be healthy.
 While a runner holds a claim and has not written `<prefix>.exit`, every later
 gate refuses to advance, whatever the phase's `.md` says. **The claim a runner took is the one record of
 a launch.** The four-launch budget counts runner-taken claims (the live one
@@ -188,8 +190,15 @@ deleted claim). A claim is in flight while its runner has started
 younger than the ten-minute handoff grace window
 (`PHASE_GATE_CLAIM_GRACE_SEC`; a directory with no owner file yet counts).
 There are no process-liveness heuristics in the launch gates. Past the grace
-window an unstarted claim is reclaimed; a started claim whose runner died
-without writing `.exit` is recovered only by
+window an unstarted claim is reclaimed. A claim whose attempt is DETACHED —
+`<prefix>.detached` present and no `.exit`, the runner's exit 6 — is in flight
+whatever its age: the job is still running and still spending tokens, so the
+gate refuses to advance, `release` refuses it, and the only recovery is the
+`attach_command` the record carries (never a relaunch, which would start a
+second job against the live one). An attach either publishes the terminal
+outcome or re-detaches with exit 6; it never frees the claim on a guess. A
+started claim whose runner died without writing `.exit` and that is NOT detached
+is recovered only by
 `phase-gate.sh release "$ART" <prefix>` (prefix `02-p<k>`, `04-consultation` or
 `06-resolution`), which refuses while the runner pid or any descendant is alive; for a
 finished exit-5 attempt, `phase-gate.sh confirm-terminated "$ART" <prefix>` is the separate

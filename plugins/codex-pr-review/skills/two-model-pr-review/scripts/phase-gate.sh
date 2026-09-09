@@ -48,7 +48,7 @@ PST=""              # terminal state of the phase last parsed by phase_status
 PST_POLICY=""       # the tier token a NOT_RUN_POLICY line cited, empty for every other state
 HELD_LOCK=""        # claim lock held by claim_lock, released by claim_unlock or on_exit
 PKT_TMP=""          # packet build/recheck scratch file, removed by on_exit on any failure
-on_exit() { rm -f "$SCRATCH" "$PKT_TMP" 2>/dev/null; [ -z "$HELD_LOCK" ] || rmdir "$HELD_LOCK" 2>/dev/null; [ "$LEAD_WAS_SEALED" = 1 ] && chmod 000 "$ART/01-lead.md" 2>/dev/null; :; }
+on_exit() { rm -f "$SCRATCH" "$PKT_TMP" 2>/dev/null; [ -z "$HELD_LOCK" ] || { rm -f "$HELD_LOCK/holder" 2>/dev/null; rmdir "$HELD_LOCK" 2>/dev/null; }; [ "$LEAD_WAS_SEALED" = 1 ] && chmod 000 "$ART/01-lead.md" 2>/dev/null; :; }
 trap on_exit EXIT
 # A launch claim whose runner has not yet written .progress is still in flight
 # for this long (the gate -> runner handoff is seconds, but a consent prompt can
@@ -790,20 +790,41 @@ CLAIM_SPENT_MAX=9
 # Rotating or creating a claim and a runner taking one are serialized by
 # <prefix>.claim.lock (an atomic mkdir held for milliseconds), so a runner can
 # never take a claim the gate is rotating out from under it (round-38 CX-03).
-# The runner uses the same lock. A lock older than CLAIM_LOCK_STALE_SEC belongs
-# to a dead process and is reclaimed.
+# The runner uses the same lock, and it does NOT hold it for milliseconds: an --attach holds it
+# for its whole watch, up to twenty-five minutes, so that the collection of one job cannot be
+# interleaved with a second collector or a release. That makes "older than a minute" the wrong
+# test — it would reclaim the lock out from under a perfectly healthy attach and admit exactly the
+# concurrency this lock exists to exclude (review cycle 2: CL-02). Staleness is a property of the
+# HOLDER: the holder records its pid and start-time identity inside the lock, and the lock is
+# reclaimed only once that execution is provably no longer running. The clock decides one case
+# only — a lock with no holder record, which is either a pre-change lock or the millisecond window
+# between the mkdir and the record being written.
 CLAIM_LOCK_STALE_SEC=60
+lock_identity() {  # <pid> -> start time, pinned to UTC so it does not depend on who is looking
+  TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//'
+}
 claim_lock() {  # claim_lock <prefix>
-  local lock="$ART/$1.claim.lock" i=0 now
+  local lock="$ART/$1.claim.lock" i=0 now hpid hident hlive
   while ! mkdir "$lock" 2>/dev/null; do
-    now=$(date +%s)
-    if [ $(( now - $(mtime "$lock" || echo "$now") )) -ge "$CLAIM_LOCK_STALE_SEC" ] && rmdir "$lock" 2>/dev/null; then continue; fi  # an unremovable stale lock is retried like a held one (bounded)
-    i=$((i+1)); [ "$i" -lt 50 ] || fail "$1.claim.lock is held by another launcher or runner (a claim is being taken or rotated right now), or is stale and cannot be removed (is it empty?); retry in a moment"
+    hpid=$(awk -F= '$1=="pid"{print $2; exit}' "$lock/holder" 2>/dev/null)
+    hident=$(awk -F= '$1=="identity"{sub(/^[^=]*=/,""); print; exit}' "$lock/holder" 2>/dev/null)
+    if [ -n "$hpid" ]; then
+      hlive=$(lock_identity "$hpid")
+      if [ -z "$hlive" ] || [ "$hlive" != "$hident" ]; then
+        rm -f "$lock/holder" 2>/dev/null
+        rmdir "$lock" 2>/dev/null && continue
+      fi
+    else
+      now=$(date +%s)
+      if [ $(( now - $(mtime "$lock" || echo "$now") )) -ge "$CLAIM_LOCK_STALE_SEC" ] && rmdir "$lock" 2>/dev/null; then continue; fi  # an unremovable stale lock is retried like a held one (bounded)
+    fi
+    i=$((i+1)); [ "$i" -lt 50 ] || fail "$1.claim.lock is held by a live launcher, runner or attach (a claim is being taken or rotated, or a detached job is being collected — an attach holds it for its whole watch); retry in a moment"
     sleep 0.1
   done
+  printf 'pid=%s\nidentity=%s\n' "$$" "$(lock_identity "$$")" > "$lock/holder" 2>/dev/null || true
   HELD_LOCK="$lock"
 }
-claim_unlock() { [ -z "$HELD_LOCK" ] || rmdir "$HELD_LOCK" 2>/dev/null; HELD_LOCK=""; }
+claim_unlock() { [ -z "$HELD_LOCK" ] || { rm -f "$HELD_LOCK/holder" 2>/dev/null; rmdir "$HELD_LOCK" 2>/dev/null; }; HELD_LOCK=""; }
 rotate_claim() {  # rotate_claim <prefix>: <prefix>.claim -> <prefix>.claim.spentN (never deleted; a runner-taken one stays a counted launch)
   local prefix="$1" claim="$ART/$1.claim" n=1
   while [ -e "$claim.spent$n" ]; do n=$((n+1)); done
@@ -854,7 +875,10 @@ release_claim() {
     d_pid=$(awk -F= '$1=="pid"{print $2; exit}' "$ART/$prefix.detached" 2>/dev/null)
     d_ident=$(awk -F= '$1=="identity"{sub(/^[^=]*=/,""); print; exit}' "$ART/$prefix.detached" 2>/dev/null)
     if [ "$d_backend" = ccr ] && [ -n "$d_pid" ]; then
-      d_live=$(ps -o lstart= -p "$d_pid" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//')
+      # TZ=UTC, exactly as the runner records it: `ps -o lstart=` renders the start time in the
+      # OBSERVING shell's local time, so without it this gate would read a live, matching process
+      # as unidentifiable whenever it runs under a different TZ than the launcher did.
+      d_live=$(TZ=UTC ps -o lstart= -p "$d_pid" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//')
       if [ -n "$d_live" ] && [ "$d_live" = "$d_ident" ]; then
         fail "release: $prefix is detached and its job is still alive (pid $d_pid, identity verified); attach to collect it, or cancel it — never release a running job"
       fi

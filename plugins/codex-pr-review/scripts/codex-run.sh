@@ -161,21 +161,40 @@ start_in_own_group() { exec python3 -c 'import os,sys; os.setpgrp(); os.execvp(s
 # tightened on purpose. The supervisor never signals the child; only kill_group does, on a stall.
 start_supervised_group() {  # <receipt> <argv...>
   exec python3 -c '
-import os, subprocess, sys
+import os, signal, subprocess, sys
 os.setpgrp()                       # pgid == this pid, so the runner is auditing one number
 receipt, argv = sys.argv[1], sys.argv[2:]
+
+def publish(rc):
+    tmp = receipt + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            f.write("child_exit=%d\n" % rc); f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, receipt)   # atomic: an attach never reads a half-written receipt
+    except OSError as e:
+        sys.stderr.write("supervisor: cannot publish receipt: %s\n" % e)
+
 try:
-    rc = subprocess.call(argv)     # stdin/stdout/stderr inherited from the shell redirections
+    child = subprocess.Popen(argv) # stdin/stdout/stderr inherited from the shell redirections
 except OSError as e:
-    sys.stderr.write("supervisor: cannot start child: %s\n" % e); rc = 127
-tmp = receipt + ".tmp"
-try:
-    with open(tmp, "w") as f:
-        f.write("child_exit=%d\n" % rc); f.flush(); os.fsync(f.fileno())
-    os.replace(tmp, receipt)       # atomic: an attach never reads a half-written receipt
-except OSError as e:
-    sys.stderr.write("supervisor: cannot publish receipt: %s\n" % e)
-sys.exit(rc)
+    sys.stderr.write("supervisor: cannot start child: %s\n" % e); publish(127); sys.exit(127)
+
+# A group cancel signals every member, the supervisor included. Dying here without a receipt
+# would leave the attempt permanently uncollectable: .detached would stay, the claim would stay
+# closed, and every later attach would find no receipt and re-detach forever (cycle 2: CL-03,
+# CX-03). So the terminating signal is caught, the child is given a bounded chance to land
+# (shorter than kill_groups escalation to KILL), and a receipt is published either way.
+def on_signal(signum, frame):
+    try: child.wait(timeout=3)
+    except Exception: pass
+    publish(child.returncode if child.returncode is not None else -signum)
+    os._exit(128 + signum)
+for _s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(_s, on_signal)
+
+rc = child.wait()
+publish(rc)
+sys.exit(rc if rc >= 0 else 128 - rc)
 ' "$@"
 }
 # Process identity. A pid or pgid recorded minutes ago may name an unrelated process by the time
@@ -379,7 +398,12 @@ CLAIM_MODE=0; CLAIM_TOKEN=""; for _a in "$@"; do [ "$_a" = "--claim" ] && CLAIM_
 # closed, and writing 4 there frees the claim and makes every later --attach refuse a job that is
 # still running). The claim-less plugins are the exposed case: they pass neither --claim nor a
 # claim directory, so those two disjuncts never save them.
-die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || [ -e "${PREFIX:-/nonexistent}.exit" ] || [ -e "${PREFIX:-/nonexistent}.detached" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
+# Never turn somebody else's live attempt into a terminal failure. .claim, .exit and .detached
+# each say "an attempt owns this prefix"; so does .progress, and it is the ONLY one of the four
+# present in the window between a launch starting and its first outcome — the window an --attach
+# that arrives too early lands in (cycle 2: CL-05). An argument error is a fact about THIS
+# invocation, so when any of them is present it is reported and nothing is published.
+die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || [ -e "${PREFIX:-/nonexistent}.exit" ] || [ -e "${PREFIX:-/nonexistent}.detached" ] || [ -e "${PREFIX:-/nonexistent}.progress" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
 need() { [ $# -ge 2 ] || die4 "$1 requires a value"; case "$2" in -*) die4 "$1 requires a value (got option $2)";; esac; }
 MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""; ATTACH=0; VIA_SET=0; CANCEL_ONLY=0
 while [ $# -gt 0 ]; do
@@ -456,19 +480,52 @@ prompt_digest() { { shasum -a 256 "$1" 2>/dev/null || sha256sum "$1" 2>/dev/null
 # window: a lock leaked by a crashed collector would otherwise block every later attach and the
 # review gate's own release for a full minute (F-04's abort was exactly this shape).
 trap 'publish_unlock' EXIT INT TERM
+# Staleness here is a property of the HOLDER, never of the clock. An --attach holds this lock for
+# its whole watch — up to --max-min, twenty-five minutes by default — so an age-based reclaim
+# would time out against a perfectly healthy holder and admit a second collector into the same
+# job, which is exactly the mutual exclusion this lock exists to provide (cycle 2: CL-02). The
+# holder records its pid and start-time identity inside the lock; the lock is reclaimed only when
+# that execution is provably no longer running. The clock is used for one case only: a lock
+# directory with no holder record, which is either a pre-change lock or the millisecond window
+# between mkdir and the record being written — a grace far longer than that window settles it.
 publish_lock() {
-  local lock="$PREFIX.claim.lock" i=0 now m
+  local lock="$PREFIX.claim.lock" i=0 now m hpid hident
   while ! mkdir "$lock" 2>/dev/null; do
-    now=$(date +%s); m=$(fmtime "$lock" || echo "$now"); m=${m:-$now}
-    if [ $(( now - m )) -ge 60 ] && rmdir "$lock" 2>/dev/null; then continue; fi
+    hpid=$(awk -F= '$1=="pid"{print $2; exit}' "$lock/holder" 2>/dev/null)
+    hident=$(awk -F= '$1=="identity"{sub(/^[^=]*=/, ""); print; exit}' "$lock/holder" 2>/dev/null)
+    if [ -n "$hpid" ]; then
+      if ! identity_state "$hpid" "$hident"; then
+        rm -f "$lock/holder" 2>/dev/null
+        rmdir "$lock" 2>/dev/null && continue
+      fi
+    else
+      now=$(date +%s); m=$(fmtime "$lock" || echo "$now"); m=${m:-$now}
+      if [ $(( now - m )) -ge 60 ] && rmdir "$lock" 2>/dev/null; then continue; fi
+    fi
     i=$((i+1)); [ "$i" -lt 50 ] || { echo "codex-run.sh: $lock is held by another attach, a launch gate or a release; retry in a moment (nothing was published)" >&2; exit 4; }
     sleep 0.1
   done
+  printf 'pid=%s\nidentity=%s\n' "$$" "$(proc_identity "$$")" > "$lock/holder" 2>/dev/null || true
   HELD_LOCK="$lock"
 }
-publish_unlock() { [ -z "${HELD_LOCK:-}" ] || rmdir "$HELD_LOCK" 2>/dev/null; HELD_LOCK=""; }
+publish_unlock() { [ -z "${HELD_LOCK:-}" ] || { rm -f "$HELD_LOCK/holder" 2>/dev/null; rmdir "$HELD_LOCK" 2>/dev/null; }; HELD_LOCK=""; }
 
 rotate_previous_attempt() {
+  # A detached attempt with no .exit is IN FLIGHT. Rotating its record away would strand the job:
+  # nothing could attach to it or cancel it again, and its process group would keep running
+  # unowned while a second job started against the same prefix (cycle 2: CL-07). Refuse while the
+  # recorded identity is provably still running; an unprovable one is allowed to rotate so a dead
+  # record can never deadlock the prefix.
+  if [ -e "$PREFIX.detached" ] && [ ! -e "$PREFIX.exit" ]; then
+    local dpid dident
+    dpid=$(detached_field pid); dident=$(detached_field identity)
+    if [ -n "$dpid" ] && identity_state "$dpid" "$dident"; then
+      echo "codex-run.sh: $PREFIX.detached names a job that is still running (pid $dpid); launching here would strand it. Attach to it or cancel it first:" >&2
+      echo "  $(detached_field attach_command)" >&2
+      echo "  $(detached_field cancel_command)" >&2
+      exit 4
+    fi
+  fi
   # never clobber a previous attempt: rotate its sidecars to <prefix>.attemptN.*
   # A launch error leaves .exit without .meta, and a runner killed mid-flight
   # leaves .progress without either, so all three are attempt markers and an
@@ -667,20 +724,34 @@ if [ "$BACKEND" = ccr ]; then
     if [ "$(elapsed)" -ge $(( MAX_MIN * 60 )) ]; then OUTCOME=DETACHED; break; fi
   done
   if [ "$OUTCOME" = DETACHED ]; then
-    ATTACH_CMD="$0 $PREFIX --attach --stall-min $STALL_MIN --max-min $MAX_MIN --poll-sec $POLL"
-    CANCEL_CMD="$0 $PREFIX --attach --cancel   # identity-checked; never kill -$PGID directly, that number may name something else by now"
+    # Every field of this record is owned by the LAUNCH, and a re-detaching attach is not it.
+    # Re-deriving identity= would write down whatever holds the number NOW — laundering an
+    # identity this very run refused to act on into one a later attach would signal on — and
+    # re-deriving claude_model_id= or prompt_sha256= would erase what the launch pinned with
+    # values this process cannot know (cycle 2: CL-04). So an attach copies them forward
+    # verbatim; only a launch writes them.
+    if [ "$ATTACH" = 1 ]; then
+      D_IDENT="$IDENT"; D_MODEL=$(detached_field claude_model_id); D_SHA=$(detached_field prompt_sha256)
+      D_AT=$(detached_field detached_at); D_JOBLOG="${LOGFILE:-$PREFIX.joblog}"; D_RECEIPT="${RECEIPT:-$PREFIX.childexit}"
+      ATTACH_CMD=$(detached_field attach_command); CANCEL_CMD=$(detached_field cancel_command)
+    else
+      D_IDENT=$(proc_identity "$CHILD"); D_MODEL="$CLAUDE_MODEL"; D_SHA=$(prompt_digest "$PROMPT_FILE")
+      D_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ); D_JOBLOG="$PREFIX.joblog"; D_RECEIPT="$PREFIX.childexit"
+      ATTACH_CMD="$0 $PREFIX --attach --stall-min $STALL_MIN --max-min $MAX_MIN --poll-sec $POLL"
+      CANCEL_CMD="$0 $PREFIX --attach --cancel   # identity-checked; never kill -$PGID directly, that number may name something else by now"
+    fi
     write_detached <<EOD
 backend=ccr
 alias=$ALIAS
-claude_model_id=$CLAUDE_MODEL
+claude_model_id=$D_MODEL
 pid=$CHILD
 pgid=$PGID
-identity=$(proc_identity "$CHILD")
-joblog=$PREFIX.joblog
-receipt=$PREFIX.childexit
+identity=$D_IDENT
+joblog=$D_JOBLOG
+receipt=$D_RECEIPT
 mode=$MODE
-prompt_sha256=$(prompt_digest "$PROMPT_FILE")
-detached_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+prompt_sha256=$D_SHA
+detached_at=$D_AT
 attach_command=$ATTACH_CMD
 cancel_command=$CANCEL_CMD
 EOD
@@ -700,7 +771,17 @@ EOD
     exit 6
   fi
   UNCONFIRMED_CANCEL=0
-  if [ "$OUTCOME" = STALLED ]; then
+  if [ "$OUTCOME" = STALLED ] && [ "$ATTACH" = 1 ] && [ "${ALIVE:-1}" != 1 ]; then
+    # The stall bound elapsed on an attach that has already logged that the recorded identity is
+    # unresolved — the pid is unreadable, or it now names a different execution. The one rule
+    # identity IS authoritative for is that nothing may be signalled unless the number still names
+    # our execution, and TERM/KILLing the recorded group here would break it against a process we
+    # have no reason to believe is ours (cycle 2: CL-01, CX-01). Nothing is signalled and nothing
+    # terminal is published: the attempt stays in flight and the recovery is another attach.
+    OUTCOME=DETACHED
+    REDETACH_REASON="stall bound reached but the recorded identity is unresolved (state ${IDENT_STATE:-?}); nothing was signalled"
+    echo "$(elapsed)s STALLED → identity unresolved (state ${IDENT_STATE:-?}); refusing to signal pgid $PGID — re-detaching instead" >> "$PREFIX.progress"
+  elif [ "$OUTCOME" = STALLED ]; then
     if kill_group "$PGID"; then
       echo "$(elapsed)s $OUTCOME → process group $PGID terminated (confirmed: no member left)" >> "$PREFIX.progress"
     else
@@ -720,7 +801,8 @@ EOD
       # failure this change exists to prevent, reintroduced one level up.
       OUTCOME=DETACHED
       echo "$(elapsed)s no supervisor receipt at $RECEIPT; the attempt has not ended — re-detaching rather than publishing a terminal outcome" >> "$PREFIX.progress"
-      REDETACH_REASON="no supervisor receipt; identity state ${IDENT_STATE:-0}"
+      # A more specific reason already set upstream (a refused stall signal) is the one to keep.
+      REDETACH_REASON="${REDETACH_REASON:-no supervisor receipt; identity state ${IDENT_STATE:-0}}"
     fi
   else
     wait "$CHILD" 2>/dev/null; CHILD_RC=$?
@@ -803,7 +885,18 @@ fi
 # codex backend (the Codex CLI plugin's companion)
 # =============================================================================================
 CODEX_ROOT=$(codex_root)
-[ -n "$CODEX_ROOT" ] && [ -f "$CODEX_ROOT/scripts/codex-companion.mjs" ] || launch_error "cannot locate the codex plugin (installed_plugins.json or ~/.claude/plugins/cache/openai-codex/codex/*)" "task $MODE --background --prompt-file $PROMPT_FILE"
+if [ -z "$CODEX_ROOT" ] || [ ! -f "$CODEX_ROOT/scripts/codex-companion.mjs" ]; then
+  if [ "$ATTACH" = 1 ]; then
+    # Not finding the companion says something about THIS process, not about the job it owns.
+    # Publishing a terminal launch error would delete .detached and free the claim for a second
+    # launch against a job that is still running (cycle 2: CX-06). Leave the attempt as found.
+    echo "$(elapsed)s ATTACH: cannot locate the codex plugin; nothing was observed and the attempt stays open" >> "$PREFIX.progress"
+    echo "codex-run.sh: --attach: cannot locate the codex plugin (installed_plugins.json or ~/.claude/plugins/cache/openai-codex/codex/*); job $JOB is untouched and still detached." >&2
+    echo "  attach: ${ATTACH_CMD:-$0 $PREFIX --attach}"
+    exit 6
+  fi
+  launch_error "cannot locate the codex plugin (installed_plugins.json or ~/.claude/plugins/cache/openai-codex/codex/*)" "task $MODE --background --prompt-file $PROMPT_FILE"
+fi
 cc() { node "$CODEX_ROOT/scripts/codex-companion.mjs" "$@"; }
 jobfield() { python3 -c "import sys,json;d=json.load(sys.stdin);j=d.get('job') or {};print(j.get('$1') or '')" 2>/dev/null; }
 
@@ -870,7 +963,7 @@ if [ "$OUTCOME" = "DETACHED" ]; then
   write_detached <<EOD
 backend=codex
 job=$JOB
-thread=$(awk -F= '$1=="thread"{print $2; exit}' "$PREFIX.meta" 2>/dev/null)
+thread=$(grep -oE 'Codex session ID: [0-9a-f-]+' "${LOGFILE:-/dev/null}" 2>/dev/null | head -1 | awk '{print $4}')
 joblog=${LOGFILE:-}
 mode=$MODE
 prompt_sha256=$(prompt_digest "$PROMPT_FILE")
