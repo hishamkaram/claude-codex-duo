@@ -2,6 +2,70 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [shared runner — detach on the watch bound; tri-state availability] - 2026-09-09
+
+Two defects in `scripts/codex-run.sh`, the runner all three plugins ship byte-identically. Both
+have the same shape: a state the runner could not determine, or had merely stopped observing, was
+reported as a terminal negative. Planned with a blind second-model diagnosis and a three-round
+debate (artifacts: `runner-hard-negatives-20260909-140134`, termination T1).
+
+### Fixed
+- **The watch bound killed healthy jobs.** `--max-min` bounds the *runner's monitoring loop*, but
+  it was implemented as a kill: TIMEOUT entered the same branch as STALLED and cancelled the
+  companion job or signalled the ccr child's group. Reproduced at `09543ad`: a job logging
+  progress on every poll was cancelled at 63 s and its `.stdout` held 306 bytes whose only content
+  was `Cancelled by user.` — a whole turn spent and discarded, with every caller contract telling
+  the caller not to retry. The bound now **detaches**: nothing is signalled, the job keeps
+  running, the runner exits **6**, and `codex-run.sh <prefix> --attach` resumes the watch and
+  publishes the real outcome. `--stall-min` keeps its cancel unchanged — no log activity for
+  minutes is a determination that the job is wedged; the bound elapsing is not a determination
+  about the job at all.
+- **The probe reported the second model unusable while it was usable.** Availability was
+  `ready and loggedIn` read as plain booleans, so a companion that could not reach its runtime to
+  *answer* the auth question returned `loggedIn: false` (with `authMethod: null, verified: null`
+  and a connect-ENOENT detail) and the run was refused — while `codex login status` said
+  `Logged in using ChatGPT` and a real launch through the same runner completed in 11 s. Since a
+  participant recorded UNAVAILABLE is never launched, a false negative silently dropped a
+  reviewer. UNAVAILABLE is now reserved for an authoritative negative about the launch path;
+  anything the companion did not determine is **`PROBE UNDETERMINED`**, which never refuses a run.
+  No model call is spent to predict a launch: the authorized task is itself the determination.
+  Nothing infers meaning from undocumented `verified` / `authMethod` values — they distinguish
+  only "it answered" from "it never got to answer".
+
+### Added
+- **A durable execution owner for the ccr backend.** The runner no longer execs the child
+  directly: a minimal supervisor leads the job's process group, forks the child, waits for it, and
+  atomically publishes `child_exit=` to `<prefix>.childexit`. This is what lets an attach preserve
+  the success predicate — child exit zero **and** a successful `result` event — because an
+  attaching process is not the child's parent and can never `wait()` for it. Raised by the second
+  model (X-6) against a draft that would have dropped the exit-status condition while claiming to
+  preserve the contract. The codex backend needs no supervisor: the companion already is that owner.
+- **`--attach`, an operation rather than a launch mode.** It takes no prompt, no `--via` and no
+  claim, spends no launch budget, rotates no sidecar, and leaves `mode=` as the original launch
+  mode so every review gate anchors its thread exactly as before; attachment is recorded in
+  `attached=<n>`. `--attach --cancel` ends the job instead.
+- **`<prefix>.detached`**, and `.exit` becomes terminal-only. A detached attempt must not write
+  `.exit`, because `phase-gate.sh` reads an existing `.exit` as a finished attempt and would
+  rotate the claim and authorize a **second concurrent launch against the still-running job** —
+  the second model's X-2, confirmed against the code. The gate now reads `.detached` with no
+  `.exit` as still in flight, and `release` refuses a detached prefix until an attach has
+  published an outcome.
+- **Identity before action.** A recorded pid or pgid is never signalled on the strength of the
+  record alone: it is paired with the process's start time and re-proved first. A start-time
+  mismatch means the number now names a different execution — nothing is signalled; a matching
+  identity that is gone means the execution finished — its receipt and log are collected.
+
+### Changed
+- Exit **6** (DETACHED) is documented in all three protocol files and the README, and the exit-3
+  row no longer tells callers a timeout is terminal. `scripts/validate.sh` derives the exit-code
+  list from the script itself, so the documentation cannot drift from it.
+- `.exit` is never rewritten once written. A refused `--attach` on a finished prefix previously
+  overwrote a COMPLETED `0` with a `4`, destroying the very result this change exists to preserve.
+- `scripts/test-args.sh`: the timeout case asserted `rc = 3` with `cancel_confirmed=yes` — it
+  encoded the defect, so it is **replaced**, not extended around (the second model's X-4). New
+  fixtures cover detach, attach and collection, refusal paths, terminal-`.exit` preservation, and
+  the probe's three states; a new fake-gateway mode outlives the bound and then completes.
+
 ## [codex-pr-review 5.0.0] - 2026-09-08
 
 Four defects reported after three rounds of live use, each fixed and each proven by a check that fails before the change and passes after. Major, because the run-directory contract changes: the schema marker is now `codex-pr-review/5`, the brief carries a `- Tier:` line, and Phase 4 has a third terminal state — a `/4` directory is refused rather than reinterpreted.

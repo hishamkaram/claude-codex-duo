@@ -187,7 +187,7 @@ chk "oversized --max-min rejected" 4 "between 1 and"  bash "$R" "$PFX" --max-min
 
 echo "runner: ccr backend (hermetic fake ccr on PATH)"
 # The fake gateway: `version`, `model show <alias> --json`, `launch …`. Behaviour is chosen by
-# FAKE_CCR_MODE (ok|write|fail|noresult|sleep|grandchild); argv and stdin are recorded so a test
+# FAKE_CCR_MODE (ok|write|fail|noresult|sleep|slowok|grandchild); argv and stdin are recorded so a test
 # can assert the exact read-only launch line the runner is required to use.
 CCRBIN="$TMP/ccrbin"; mkdir -p "$CCRBIN"
 cat > "$CCRBIN/ccr" <<'FAKE'
@@ -214,6 +214,9 @@ case "${1:-}" in
       fail) printf '{"type":"assistant","message":{"content":[{"type":"text","text":"boom"}]}}\n'; echo "waiting for Claude Code: exit status 1" >&2; exit 1;;
       noresult) printf '{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}\n'; exit 0;;
       sleep) sleep 600; exit 0;;
+      # Outlives a short watch bound and then finishes on its own, so a detached job can be
+      # attached to and collected — the whole point of exit 6.
+      slowok) sleep "${FAKE_CCR_SLEEP:-75}";;
       grandchild) sleep 600 & sleep 600; exit 0;;
     esac
     printf '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}\n'
@@ -343,9 +346,57 @@ out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=noresult bash "$R" "$CP" --via ccr:x --
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=grandchild bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 1 --poll-sec 5 --max-min 5 2>&1); rc=$?
 PG=$(awk -F= '$1=="pgid"{print $2}' "$CP.meta")
 [ "$rc" = 2 ] && [ "$(cat "$CP.exit")" = 2 ] && grep -q '^outcome=STALLED' "$CP.meta" && grep -q 'terminated (confirmed: no member left)' "$CP.progress" && [ -n "$PG" ] && ! kill -0 -- "-$PG" 2>/dev/null && printf '  ok    %-42s\n' "T-10b: stall → group (with grandchild) killed, exit 2" || { printf '  FAIL  T-10b: rc=%s pgid=%s\n' "$rc" "$PG"; pkill -g "$PG" 2>/dev/null; FAIL=1; }
-out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=sleep bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 5 --poll-sec 5 --max-min 1 2>&1); rc=$?
+# T-14: the watch bound no longer ends the job. This REPLACES the old assertion that a timeout
+# exits 3 with the cancel confirmed: that expectation encoded the defect (a healthy job destroyed
+# because the watcher's clock ran out), so it is not kept alongside the fix.
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=slowok FAKE_CCR_SLEEP=75 bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 5 --poll-sec 5 --max-min 1 2>&1); rc=$?
 PG=$(awk -F= '$1=="pgid"{print $2}' "$CP.meta")
-[ "$rc" = 3 ] && grep -q '^outcome=TIMEOUT' "$CP.meta" && grep -q '^cancel_confirmed=yes' "$CP.meta" && printf '  ok    %-42s\n' "T-10: timeout → exit 3, cancel confirmed" || { printf '  FAIL  T-10(timeout): rc=%s\n' "$rc"; pkill -g "$PG" 2>/dev/null; FAIL=1; }
+DPID=$(awk -F= '$1=="pid"{print $2}' "$CP.detached")
+shopt -s nullglob; ROT_BEFORE=( "$CP".attempt* ); shopt -u nullglob
+[ "$rc" = 6 ] && grep -q '^outcome=DETACHED' "$CP.meta" && grep -q '^detached=yes' "$CP.meta" && [ ! -e "$CP.exit" ] \
+  && grep -q '^backend=ccr' "$CP.detached" && grep -q '^attach_command=' "$CP.detached" && grep -q '^cancel_command=' "$CP.detached" \
+  && [ -n "$PG" ] && kill -0 -- "-$PG" 2>/dev/null \
+  && printf '  ok    %-42s\n' "T-14: watch bound → exit 6, job alive, no .exit" \
+  || { printf '  FAIL  T-14(detach): rc=%s pgid=%s exit_present=%s\n' "$rc" "$PG" "$([ -e "$CP.exit" ] && echo yes || echo no)"; FAIL=1; }
+
+# T-15: attaching to that detached job collects it — same job, one execution, nothing rotated.
+out=$(PATH="$CCRBIN:$PATH" bash "$R" "$CP" --attach --stall-min 5 --poll-sec 1 --max-min 5 2>&1); rc=$?
+shopt -s nullglob; ROT_AFTER=( "$CP".attempt* ); shopt -u nullglob
+[ "$rc" = 0 ] && [ "$(cat "$CP.exit")" = 0 ] && grep -q '^outcome=COMPLETED' "$CP.meta" && grep -q '^attached=1' "$CP.meta" \
+  && grep -q '^mode=--fresh' "$CP.meta" && grep -q '^child_exit=0' "$CP.meta" && [ ! -e "$CP.detached" ] \
+  && [ "${#ROT_AFTER[@]}" = "${#ROT_BEFORE[@]}" ] \
+  && printf '  ok    %-42s\n' "T-15: attach collects it, mode kept, no rotation" \
+  || { printf '  FAIL  T-15(attach): rc=%s attached=%s rotated_delta=%s\n' "$rc" "$(awk -F= '$1=="attached"{print $2}' "$CP.meta")" "$(( ${#ROT_AFTER[@]} - ${#ROT_BEFORE[@]} ))"; FAIL=1; }
+
+# T-16: a refused attach must never rewrite a terminal .exit — the result it would destroy is the
+# whole point of the change.
+out=$(bash "$R" "$CP" --attach 2>&1); rc=$?
+[ "$rc" = 4 ] && [ "$(cat "$CP.exit")" = 0 ] && printf '  ok    %-42s\n' "T-16: refused attach preserves terminal .exit" \
+  || { printf '  FAIL  T-16: rc=%s exit=%s\n' "$rc" "$(cat "$CP.exit" 2>/dev/null)"; FAIL=1; }
+
+# T-17: --attach argument surface — it is an operation, not a launch mode.
+chk "T-17: --attach with --fresh"        4 "exclusive"        bash "$R" "$CP" --attach --fresh
+chk "T-17: --attach with --prompt-file"  4 "takes no --prompt-file" bash "$R" "$CP" --attach --prompt-file "$CCRD/prompt.md"
+chk "T-17: --attach with --via"          4 "takes no --via"   bash "$R" "$CP" --attach --via ccr:x
+chk "T-17: --cancel without --attach"    4 "only valid with --attach" bash "$R" "$CCRD/nope" --cancel --prompt-file "$CCRD/prompt.md"
+
+# T-18: the probe's three states. UNAVAILABLE is reserved for an authoritative negative; a
+# companion that could not reach its runtime to answer is UNDETERMINED and never refuses a run.
+probe_case() {  # <name> <expect-label> <expect-rc> <json>
+  local out rc
+  out=$(printf '%s' "$4" | python3 -c "$PROBE_PY" 2>&1); rc=$?
+  printf '%s' "$out" | grep -q "$2" && [ "$rc" = "$3" ] && printf '  ok    %-42s\n' "$1" || { printf '  FAIL  %s: rc=%s out=%s\n' "$1" "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+}
+PROBE_PY=$(sed -n "/^      printf '%s' \"\$OUT\" | python3 -c '/,/^raise SystemExit(rc)'/p" "$R" | sed "1s/.*python3 -c '//" | sed "\$s/'$//")
+probe_case "T-18: runtime unreachable → UNDETERMINED" "PROBE UNDETERMINED" 0 \
+  '{"ready":false,"codex":{"available":true,"detail":"cli"},"auth":{"available":true,"loggedIn":false,"detail":"connect ENOENT /tmp/x/broker.sock","authMethod":null,"verified":null}}'
+probe_case "T-18: genuinely logged out → UNAVAILABLE" "PROBE UNAVAILABLE" 1 \
+  '{"ready":false,"codex":{"available":true,"detail":"cli"},"auth":{"available":true,"loggedIn":false,"authMethod":"chatgpt","verified":false}}'
+probe_case "T-18: cli absent → UNAVAILABLE" "PROBE UNAVAILABLE" 1 \
+  '{"ready":false,"codex":{"available":false,"detail":"not found"},"auth":{"available":false,"loggedIn":false,"authMethod":null,"verified":null}}'
+probe_case "T-18: healthy → SUCCEEDED" "PROBE SUCCEEDED" 0 \
+  '{"ready":true,"codex":{"available":true,"detail":"cli"},"auth":{"available":true,"loggedIn":true,"authMethod":"chatgpt","verified":true}}'
+
 # T-10: exit 5 — the process group cannot be read (stub ps), so the child is killed and nothing is retried
 PSBIN="$TMP/psbin"; mkdir -p "$PSBIN"; printf '#!/bin/sh\necho ""\n' > "$PSBIN/ps"; chmod +x "$PSBIN/ps"
 out=$(PATH="$PSBIN:$CCRBIN:$PATH" FAKE_CCR_MODE=sleep bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?

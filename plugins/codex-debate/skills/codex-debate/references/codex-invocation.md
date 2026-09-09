@@ -13,6 +13,7 @@ mid-round on 2026-09-02 and left a phantom "running" job.
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/<name>" [--via codex|ccr:<alias>] --fresh|--resume-last|--resume-session <id> --prompt-file "$ART/<name>.prompt.md" [--stall-min 6] [--max-min 25] [--poll-sec 15]
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/<name>" --attach [--max-min 25]   # after exit 6: resume the watch, never relaunch
 ```
 
 "Codex" in the rest of this file means the opponent whichever backend runs it,
@@ -36,7 +37,8 @@ Exit codes and what to do:
 | 0 | COMPLETED | rule on the reply |
 | 1 | FAILED (plugin failure or worker died) | retry the same call once; then apply the mid-debate failure rule |
 | 2 | STALLED (cancel confirmed) | retry once with a `<time_budget>` block tightened; then failure rule |
-| 3 | TIMEOUT | do not retry; failure rule, keep any partial `.stdout` |
+| 3 | TIMEOUT — the watch bound elapsed and the job is confirmed gone | do not retry; failure rule, keep any partial `.stdout` |
+| 6 | DETACHED — the watch bound elapsed while the job was still running. The runner did NOT cancel it: the job is alive and `.exit` is deliberately absent | **attach again, never relaunch.** Run the `attach_command` the runner printed (also in `.meta` and `<prefix>.detached`) to resume the watch; it publishes the real outcome and exit code when the job lands. To abandon the round instead, run the `cancel_command` first |
 | 4 | LAUNCH-ERROR, or any invalid invocation (missing option value, unknown argument, unreadable prompt file, `--write`) | record UNAVAILABLE with `.stderr`; a usage message means fix the call, not retry |
 | 5 | STALLED or TIMEOUT **and the cancel could not be confirmed** — a Codex worker may still be running | DO NOT retry: a second job would run alongside the first. Report the job id, quote `.progress`, and treat the phase as failed. |
 

@@ -473,6 +473,12 @@ live_claim_check() {
   local prefix
   for prefix in $(all_prefixes); do
     if [ -d "$ART/$prefix.claim/runner" ] && [ ! -e "$ART/$prefix.exit" ]; then
+      if [ -e "$ART/$prefix.detached" ]; then
+        # The runner exited on its watch bound (exit 6) and left the job running. The phase is
+        # still in flight — the job is — and the recovery is to resume the watch, never to launch
+        # a second job against the same claim.
+        fail "$prefix is detached and its job may still be running ($prefix.detached exists, $prefix.exit does not): resume the watch with $(awk -F= '$1=="attach_command"{sub(/^[^=]*=/,""); print; exit}' "$ART/$prefix.detached" 2>/dev/null), or end the job with $(awk -F= '$1=="cancel_command"{sub(/^[^=]*=/,""); print; exit}' "$ART/$prefix.detached" 2>/dev/null) — never relaunch, and never release a live job"
+      fi
       fail "$prefix runner is still in flight ($prefix.claim/runner exists and $prefix.exit does not): wait for it, or if it is dead run phase-gate.sh release $ART $prefix — a phase cannot be recorded or advanced past while its runner may still write"
     fi
   done
@@ -839,6 +845,28 @@ release_claim() {
   claim_lock "$prefix"
   [ -d "$claim" ] || fail "release: no live claim for $prefix (nothing to release)"
   [ ! -e "$ART/$prefix.exit" ] || fail "release: $prefix.exit exists, so that attempt finished; the next launch gate rotates the claim itself"
+  # A detached attempt has no .exit by design, so it would otherwise look exactly like a runner
+  # that died — and releasing it would free the claim while the job is still spending tokens.
+  # Releasing is only safe once the job is known to be over, and that is the attach's job to
+  # establish, not this gate's to assume.
+  if [ -e "$ART/$prefix.detached" ]; then
+    d_backend=$(awk -F= '$1=="backend"{print $2; exit}' "$ART/$prefix.detached" 2>/dev/null)
+    d_pid=$(awk -F= '$1=="pid"{print $2; exit}' "$ART/$prefix.detached" 2>/dev/null)
+    d_ident=$(awk -F= '$1=="identity"{sub(/^[^=]*=/,""); print; exit}' "$ART/$prefix.detached" 2>/dev/null)
+    if [ "$d_backend" = ccr ] && [ -n "$d_pid" ]; then
+      d_live=$(ps -o lstart= -p "$d_pid" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//')
+      if [ -n "$d_live" ] && [ "$d_live" = "$d_ident" ]; then
+        fail "release: $prefix is detached and its job is still alive (pid $d_pid, identity verified); attach to collect it, or cancel it — never release a running job"
+      fi
+      # Either the process is gone or the number now names something else. Both mean this
+      # attempt's execution ended, but neither means its RESULT was collected: an attach must
+      # publish the outcome first, so that the claim is released against a finished record.
+      fail "release: $prefix is detached and its execution is no longer identifiable (pid $d_pid); run its attach command first so the outcome is published, then release"
+    fi
+    fail "release: $prefix is detached (backend=$d_backend); run its attach command to publish an outcome before releasing the claim"
+  fi
+  # A publication in progress holds the same lock this function took, so reaching here means no
+  # attach is mid-publish for this prefix.
   pid=$(cat "$claim/runner/pid" 2>/dev/null || true)
   if [ -d "$claim/runner" ] && [ -z "$pid" ]; then
     # The runner records its pid right after the atomic mkdir; a runner/ with

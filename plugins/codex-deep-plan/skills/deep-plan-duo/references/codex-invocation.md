@@ -12,6 +12,10 @@ shell limit killed one mid-round on 2026-09-02 and left a phantom job.
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/debate/r<n>-codex" [--via codex|ccr:<alias>] --fresh|--resume-last \
     --prompt-file "$ART/debate/r<n>-prompt.md" [--stall-min 8] [--max-min 30] [--poll-sec 15]
+
+# exit 6: the watch bound elapsed while the round was still running. Resume the watch — do not
+# relaunch, which would start a second round against the same prompt.
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/debate/r<n>-codex" --attach [--max-min 30]
 ```
 
 `--via` comes from `meta.json` (`via`, recorded by `init-plan.sh`); pass the same value on every
@@ -32,7 +36,8 @@ Exit codes and what to do:
 | 0 | COMPLETED | run `validate-verdict.py` on `.stdout` |
 | 1 | FAILED (plugin failure or worker died) | retry the same call once; then T5 |
 | 2 | STALLED (cancel confirmed) | retry once with `--budget` lowered; then T5 |
-| 3 | TIMEOUT | do not retry; T5, keep any partial `.stdout` |
+| 3 | TIMEOUT — the watch bound elapsed and the job is confirmed gone | do not retry; T5, keep any partial `.stdout` |
+| 6 | DETACHED — the watch bound elapsed while the job was still running. The runner did NOT cancel it: the job is alive and `.exit` is deliberately absent | **attach again, never relaunch.** Run the `attach_command` the runner printed (also in `.meta` and `<prefix>.detached`) to resume the watch; it publishes the real outcome and exit code when the job lands. Relaunching would run a second job against the same round. To abandon the round instead, run the `cancel_command` first |
 | 4 | LAUNCH-ERROR, or any invalid invocation (missing option value, unknown argument, unreadable prompt file, `--write`) | record UNAVAILABLE with `.stderr`; a usage message means fix the call, not retry |
 | 5 | STALLED or TIMEOUT **and the cancel could not be confirmed** — a Codex worker may still be running | DO NOT retry: a second job would run alongside the first. Report the job id, quote `.progress`, treat the round as failed (T5). |
 

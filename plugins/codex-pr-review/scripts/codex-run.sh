@@ -5,12 +5,19 @@
 #   codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file>
 #                [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>]
 #                [--max-turns N]                                  (--max-turns and --resume-session: ccr backend only)
+#   codex-run.sh <out-prefix> --attach [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>]
 #   codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]
+#
+#   --attach: resume the WATCH on a job this process did not launch, after a previous
+#   invocation detached from it (exit 6). It is an operation, not a launch mode: no prompt is
+#   submitted, no claim is taken, no launch budget is spent, no sidecar is rotated, and `mode=`
+#   in .meta keeps the original launch mode so the review gates' thread anchoring is unchanged.
+#   It requires <out-prefix>.detached with no <out-prefix>.exit; anything else is exit 4.
 #
 #   --via codex (default): the Codex CLI plugin's companion (task/status/result/cancel).
 #   --via ccr:<alias>: a headless Claude Code launched through the claude-code-router gateway
 #   (`ccr launch --model <alias>`), routed to whatever provider the alias names on this machine.
-#   Both backends honour the same contract: prompt file in, the six sidecars out, exit 0-5, the
+#   Both backends honour the same contract: prompt file in, the six sidecars out, exit 0-6, the
 #   claim directory, and the refusal of --write. The ccr backend is kept read-only by
 #   `--permission-mode plan` (Claude Code's own permission engine), an empty strict MCP config,
 #   and the disallowed edit tools — a disallow-list alone does not stop Bash from writing.
@@ -35,12 +42,29 @@
 #   <out-prefix>.joblog     copy of the plugin's job log (codex) or the raw stream-json (ccr)
 #   <out-prefix>.meta       backend, job/session ids, thread id, outcome, timings, exact command
 #   <out-prefix>.exit       0 COMPLETED · 1 FAILED · 2 STALLED · 3 TIMEOUT · 4 LAUNCH-ERROR · 5 UNCONFIRMED-CANCEL
+#                           TERMINAL ONLY: written when an outcome can no longer change, never at
+#                           detach. A review gate reads an existing .exit as a finished attempt and
+#                           rotates the claim, so a detached-but-live attempt must not write one.
+#   <out-prefix>.detached   present only while a detached job may still be running (exit 6): the
+#                           backend, the job or process identity and its start time, the original
+#                           launch mode, the prompt digest, and the verbatim attach and cancel
+#                           commands. Removed when an attach publishes the terminal outcome.
+#   <out-prefix>.childexit  ccr only: the supervisor's receipt, `child_exit=<rc>`, published
+#                           atomically when the child is reaped. An attaching process is not the
+#                           child's parent and cannot wait() for it, so the success predicate
+#                           (child exit 0 AND a successful result event) reads the receipt.
 #   Exit 4 with NO sidecar written: another runner already took <out-prefix>.claim/, or (--claim)
 #   no claim exists / the arguments are invalid.
 #   ccr backend also writes <dir>/.ccr-last-session (the session id --resume-last resumes).
 #
-# Safety: refuses --write. Cancels the job on STALLED/TIMEOUT so nothing is left running; a ccr
-# child runs in its own process group so the whole tree is signalled and its pgid is recorded.
+# Safety: refuses --write. Cancels the job on STALLED — no log activity for --stall-min is a
+# determination that the job is wedged — but NOT when --max-min elapses: that bound is the
+# watcher's own, and says nothing about the job. The watch then detaches (exit 6) and leaves the
+# job running to be re-attached. A ccr child runs in its own process group, under a supervisor
+# that owns it and publishes its exit status, so the whole tree is still signalled on a stall and
+# its pgid and start time are recorded. A recorded pid or pgid is never signalled on the strength
+# of the record alone: identity is proved against the live process's start time first, because a
+# number recorded minutes ago may name something else entirely.
 # Run it with the caller's background execution (Claude Code: run_in_background) so a foreground
 # shell limit can never kill the worker mid-turn.
 
@@ -124,6 +148,46 @@ ccr_smoke_check() {  # <dir> <alias>  (needs ccr_preflight first)
 # Start a command in its own process group; echoes nothing, sets CHILD (pid) — pgid == pid.
 # exec, so that when it is called as `start_in_own_group … &` the background pid IS the child (and its pgid).
 start_in_own_group() { exec python3 -c 'import os,sys; os.setpgrp(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"; }
+# The ccr backend's durable owner. The supervisor leads the job's process group, forks the child
+# that execs the gateway (inheriting the redirections the caller set up), waits for it, and
+# publishes `child_exit=<rc>` atomically. It exists because an attaching process is NOT the
+# child's parent and can never wait() for it: without this receipt the success predicate below
+# would have to drop its exit-status condition, silently weakening a contract an earlier review
+# tightened on purpose. The supervisor never signals the child; only kill_group does, on a stall.
+start_supervised_group() {  # <receipt> <argv...>
+  exec python3 -c '
+import os, subprocess, sys
+os.setpgrp()                       # pgid == this pid, so the runner is auditing one number
+receipt, argv = sys.argv[1], sys.argv[2:]
+try:
+    rc = subprocess.call(argv)     # stdin/stdout/stderr inherited from the shell redirections
+except OSError as e:
+    sys.stderr.write("supervisor: cannot start child: %s\n" % e); rc = 127
+tmp = receipt + ".tmp"
+try:
+    with open(tmp, "w") as f:
+        f.write("child_exit=%d\n" % rc); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, receipt)       # atomic: an attach never reads a half-written receipt
+except OSError as e:
+    sys.stderr.write("supervisor: cannot publish receipt: %s\n" % e)
+sys.exit(rc)
+' "$@"
+}
+# Process identity. A pid or pgid recorded minutes ago may name an unrelated process by the time
+# an attach reads it, so a number is never acted on alone: it is paired with the start time the
+# kernel reports for it, and the pair must still match. `ps -o lstart=` is the one field both BSD
+# and GNU ps agree on for this; whitespace is squeezed so the recorded and live forms compare.
+proc_identity() {  # <pid> -> start-time string, empty when the pid is gone
+  ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//'
+}
+# 0 = same execution · 1 = gone (it finished) · 2 = a different execution now holds the number.
+# The caller must treat 1 and 2 differently: 1 means collect the result, 2 means touch nothing.
+identity_state() {  # <pid> <recorded identity>
+  local live; live=$(proc_identity "$1")
+  [ -n "$live" ] || return 1
+  [ "$live" = "$2" ] || return 2
+  return 0
+}
 pgid_of() { ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
 group_alive() { kill -0 -- "-$1" 2>/dev/null; }
 # TERM then KILL the whole group; return 0 when nothing in it is left, 1 when something survives.
@@ -176,11 +240,38 @@ if [ "${1:-}" = "--probe" ]; then
       CODEX_ROOT=$(codex_root)
       [ -n "$CODEX_ROOT" ] || { echo "PROBE UNAVAILABLE: codex plugin not found"; exit 1; }
       OUT=$(node "$CODEX_ROOT/scripts/codex-companion.mjs" setup --json 2>&1) || { echo "PROBE FAILED: setup exited non-zero"; printf '%s\n' "$OUT" | tail -5; exit 1; }
-      printf '%s' "$OUT" | python3 -c 'import sys,json
-d=json.load(sys.stdin); ok=bool(d.get("ready")) and bool(d.get("auth",{}).get("loggedIn"))
-label="PROBE SUCCEEDED" if ok else "PROBE UNAVAILABLE"
-print(label, "backend=codex ready=%s loggedIn=%s codex=%s" % (d.get("ready"), d.get("auth",{}).get("loggedIn"), d.get("codex",{}).get("detail")))
-raise SystemExit(0 if ok else 1)'
+      printf '%s' "$OUT" | python3 -c 'import sys, json
+# Availability has three states, not two. The old predicate was `ready and loggedIn`, read as
+# plain booleans, so a companion that could not REACH its runtime to answer the auth question
+# returned loggedIn=false and the whole run was refused while a launch would have succeeded.
+# UNAVAILABLE is now reserved for an authoritative negative about the launch path; anything the
+# companion did not actually determine is UNDETERMINED, which never refuses a run: the caller
+# records it and proceeds to the task it is already authorized to run, and that task IS the
+# determination. No model call is spent here to predict one.
+d = json.load(sys.stdin)
+auth = d.get("auth") or {}
+codex = d.get("codex") or {}
+detail = str(auth.get("detail") or "")
+# Only an affirmative reading is affirmative. The meaning of `verified` and `authMethod` is not
+# documented by the companion, so nothing is inferred from a particular value of them; they are
+# used only to tell "it answered" from "it never got to answer".
+answered = auth.get("authMethod") is not None or auth.get("verified") is not None
+usable = bool(d.get("ready")) and bool(auth.get("loggedIn"))
+# An authoritative negative: the CLI or the auth subsystem is reported absent, or auth answered
+# and the answer was no.
+unusable = (codex.get("available") is False) or (auth.get("available") is False) or (answered and not auth.get("loggedIn"))
+if usable:
+    label, rc = "PROBE SUCCEEDED", 0
+elif unusable:
+    label, rc = "PROBE UNAVAILABLE", 1
+else:
+    label, rc = "PROBE UNDETERMINED", 0
+print(label, "backend=codex ready=%s loggedIn=%s codex=%s" % (d.get("ready"), auth.get("loggedIn"), codex.get("detail")))
+if label == "PROBE UNDETERMINED":
+    print("  the companion did not determine authentication (authMethod=%r verified=%r detail=%r);"
+          % (auth.get("authMethod"), auth.get("verified"), detail[:160]))
+    print("  this is NOT a refusal: record the line and proceed to the launch, which settles it.")
+raise SystemExit(rc)'
       exit $?;;
     ccr:?*)
       ALIAS="${VIA#ccr:}"
@@ -250,6 +341,7 @@ raise SystemExit(0 if ok else 1)'
   esac
 fi
 USAGE='usage: codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>] [--max-turns N]
+       codex-run.sh <out-prefix> --attach [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>]
        codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]'
 # Every invocation error exits 4 (LAUNCH-ERROR). Never exit 1 for a bad command line:
 # 1 means "the second model failed, retry once" in the documented contract, and a typo must not look like that.
@@ -264,13 +356,18 @@ if stat --version >/dev/null 2>&1; then fmtime() { stat -c %Y "$1" 2>/dev/null; 
 else fmtime() { stat -f %m "$1" 2>/dev/null; }; fsig() { stat -f '%z:%m' "$1" 2>/dev/null; }; fi
 CLAIM_MODE=0; CLAIM_TOKEN=""; for _a in "$@"; do [ "$_a" = "--claim" ] && CLAIM_MODE=1; done  # exact argument, never a substring of a value (round-33 CX-03)
 # An argument error writes <prefix>.exit only for the claim-less sibling plugins: with --claim, or when a launch claim exists for the prefix (a gate-issued prefix), nothing is written (round-42 CL-04).
-die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
+# .exit is terminal: once an attempt has published one, no later invocation may rewrite it. A
+# refused --attach on a finished prefix would otherwise overwrite a COMPLETED 0 with a 4 and
+# destroy the very result this runner exists to preserve.
+die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || [ -e "${PREFIX:-/nonexistent}.exit" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
 need() { [ $# -ge 2 ] || die4 "$1 requires a value"; case "$2" in -*) die4 "$1 requires a value (got option $2)";; esac; }
-MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""
+MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""; ATTACH=0; VIA_SET=0; CANCEL_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
+    --attach) ATTACH=1;;
+    --cancel) CANCEL_ONLY=1;;
     --fresh|--resume-last) [ "$MODE_SET" != 1 ] || [ "$MODE" = "$1" ] || die4 "$MODE and $1 are exclusive"; MODE="$1"; MODE_SET=1;;
-    --via) need "$@"; VIA="$2"; shift;;
+    --via) need "$@"; VIA="$2"; VIA_SET=1; shift;;
     --prompt-file) need "$@"; PROMPT_FILE="$2"; shift;;
     --stall-min) need "$@"; STALL_MIN="$2"; shift;;
     --max-min) need "$@"; MAX_MIN="$2"; shift;;
@@ -282,6 +379,15 @@ while [ $# -gt 0 ]; do
     *) die4 "unknown arg $1";;
   esac; shift
 done
+# --attach is an operation, not a launch mode: it submits no prompt and chooses no backend. The
+# backend, the launch mode and every identifier come from the detached record the launch left.
+[ "$CANCEL_ONLY" != 1 ] || [ "$ATTACH" = 1 ] || die4 "--cancel is only valid with --attach"
+if [ "$ATTACH" = 1 ]; then
+  [ "$MODE_SET" != 1 ] || die4 "--attach and $MODE are exclusive: an attach resumes the watch on the job the launch already started"
+  [ -z "$PROMPT_FILE" ] || die4 "--attach takes no --prompt-file: the prompt was submitted by the launch it re-attaches to"
+  [ -z "$MAX_TURNS" ] || die4 "--attach takes no --max-turns: the child's turn budget was fixed at launch"
+  [ "$VIA_SET" != 1 ] || die4 "--attach takes no --via: the backend is read from $PREFIX.detached"
+fi
 [ "$MODE" != "--resume-session" ] || [ -n "$RESUME_SESSION" ] || die4 "--resume-session requires a session id"
 case "$VIA" in
   codex) BACKEND=codex; ALIAS="";;
@@ -306,8 +412,37 @@ for v in STALL_MIN MAX_MIN POLL MAX_TURNS; do
   val=$(printf '%s' "$val" | sed 's/^0*//'); [ -n "$val" ] && [ "${#val}" -le 6 ] || die4 "--$(echo "$v" | tr 'A-Z_' 'a-z-') must be between 1 and 999999"
   eval "$v=\$val"
 done
-[ -n "$PROMPT_FILE" ] || die4 "--prompt-file is required"
-[ -r "$PROMPT_FILE" ] || die4 "prompt file not readable: $PROMPT_FILE"
+if [ "$ATTACH" != 1 ]; then
+  [ -n "$PROMPT_FILE" ] || die4 "--prompt-file is required"
+  [ -r "$PROMPT_FILE" ] || die4 "prompt file not readable: $PROMPT_FILE"
+fi
+
+# The detached record. It is the ONLY marker of a detached-but-live attempt: .exit stays absent,
+# because every review gate reads an existing .exit as a finished attempt and would rotate the
+# claim and authorize a second launch against the job that is still running.
+write_detached() {  # key=value lines on stdin
+  local tmp="$PREFIX.detached.tmp"
+  cat > "$tmp"
+  mv "$tmp" "$PREFIX.detached"
+}
+detached_field() { awk -F= -v k="$1" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$PREFIX.detached" 2>/dev/null; }
+prompt_digest() { { shasum -a 256 "$1" 2>/dev/null || sha256sum "$1" 2>/dev/null; } | awk '{print $1; exit}'; }
+# Publication of a terminal outcome is serialized against a concurrent attach and against the
+# review gate's release, which take the same lock while they rotate a claim. Held across the whole
+# step — receipt, .stdout, .meta, removing .detached, writing .exit — so no reader ever sees a
+# half-published attempt. A lock older than a minute belongs to a dead process, exactly as
+# stamp_claim treats it.
+publish_lock() {
+  local lock="$PREFIX.claim.lock" i=0 now m
+  while ! mkdir "$lock" 2>/dev/null; do
+    now=$(date +%s); m=$(fmtime "$lock" || echo "$now"); m=${m:-$now}
+    if [ $(( now - m )) -ge 60 ] && rmdir "$lock" 2>/dev/null; then continue; fi
+    i=$((i+1)); [ "$i" -lt 50 ] || { echo "codex-run.sh: $lock is held by another attach, a launch gate or a release; retry in a moment (nothing was published)" >&2; exit 4; }
+    sleep 0.1
+  done
+  HELD_LOCK="$lock"
+}
+publish_unlock() { [ -z "${HELD_LOCK:-}" ] || rmdir "$HELD_LOCK" 2>/dev/null; HELD_LOCK=""; }
 
 rotate_previous_attempt() {
   # never clobber a previous attempt: rotate its sidecars to <prefix>.attemptN.*
@@ -374,11 +509,66 @@ launch_error() {  # <message> <command>
 }
 START=$(date +%s); now() { date +%s; }; elapsed() { echo $(( $(now) - START )); }
 
+
+# =============================================================================================
+# --attach — resume the watch on a job this process did not launch
+# =============================================================================================
+# Not a launch: no claim is taken (stamp_claim would refuse a claim already held), no sidecar is
+# rotated (rotate_previous_attempt would hide the very .meta this needs), no launch budget is
+# spent, and `mode=` keeps the original launch mode so the review gates' thread anchoring is
+# untouched. Attachment is recorded separately, in `attached=`.
+if [ "$ATTACH" = 1 ]; then
+  [ -e "$PREFIX.detached" ] || die4 "--attach: no $PREFIX.detached — nothing detached from this prefix (a launch that finished wrote .exit; a launch that never ran wrote nothing)"
+  [ ! -e "$PREFIX.exit" ] || die4 "--attach: $PREFIX.exit exists, so that attempt already finished; re-read its sidecars instead of attaching"
+  BACKEND=$(detached_field backend); JOB=$(detached_field job); MODE=$(detached_field mode)
+  ALIAS=$(detached_field alias); LOGFILE=$(detached_field joblog); RECEIPT=$(detached_field receipt)
+  DPID=$(detached_field pid); PGID=$(detached_field pgid); IDENT=$(detached_field identity)
+  ATTEMPTS=$(awk -F= '$1=="attached"{print $2; exit}' "$PREFIX.meta" 2>/dev/null); ATTEMPTS=$(( ${ATTEMPTS:-0} + 1 ))
+  case "$BACKEND" in codex|ccr) ;; *) die4 "--attach: $PREFIX.detached names no usable backend (backend='$BACKEND')";; esac
+  ATTACH_CMD=$(detached_field attach_command); CANCEL_CMD=$(detached_field cancel_command)
+  echo "$(elapsed)s ATTACH #$((ATTEMPTS+1)) backend=$BACKEND ${JOB:+job=$JOB}${DPID:+pid=$DPID pgid=$PGID}" >> "$PREFIX.progress"
+
+  # ---- identity, before anything is observed or signalled -------------------
+  # 0 = the recorded number still names our execution · 1 = it is gone · 2 = it now names
+  # something else. 1 and 2 both mean our execution ended — a live pid is never reused — so both
+  # collect; what neither may do is signal, which is why the state is resolved before the loop.
+  ALIVE=1; IDENT_NOTE=""
+  if [ "$BACKEND" = ccr ]; then
+    identity_state "$DPID" "$IDENT"; case $? in
+      0) ALIVE=1;;
+      1) ALIVE=0; IDENT_NOTE="the recorded process is gone; collecting its result";;
+      2) ALIVE=0; IDENT_NOTE="pid $DPID now names a different execution (start time differs); nothing signalled, collecting what the launch left";;
+    esac
+    [ -z "$IDENT_NOTE" ] || echo "$(elapsed)s IDENTITY: $IDENT_NOTE" >> "$PREFIX.progress"
+  fi
+
+  if [ "$CANCEL_ONLY" = 1 ]; then
+    if [ "$BACKEND" = codex ]; then
+      CODEX_ROOT=$(codex_root); [ -n "$CODEX_ROOT" ] || die4 "--attach --cancel: cannot locate the codex plugin"
+      node "$CODEX_ROOT/scripts/codex-companion.mjs" cancel "$JOB" >>"$PREFIX.stderr" 2>&1 || true
+      echo "codex-run.sh: cancel requested for job $JOB"
+    elif [ "$ALIVE" = 1 ]; then
+      kill_group "$PGID" && echo "codex-run.sh: cancelled process group $PGID (identity verified)" || echo "codex-run.sh: cancel of process group $PGID not confirmed" >&2
+    else
+      echo "codex-run.sh: nothing to cancel — $IDENT_NOTE"
+    fi
+    exit 0
+  fi
+fi
+
 # =============================================================================================
 # ccr backend
 # =============================================================================================
 if [ "$BACKEND" = ccr ]; then
   DIR=$(dirname "$PREFIX")
+ if [ "$ATTACH" = 1 ]; then
+  # Attaching: the launch already happened. Take the identifiers from the detached record, keep
+  # the launch's own command line for .meta, and go straight to the watch loop.
+  CMD=$(awk -F= '$1=="command"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
+  CHILD="$DPID"; SESSION=""; PROMPT_FILE=$(awk -F= '$1=="prompt_file"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
+  MAX_TURNS=${MAX_TURNS:-$CCR_MAX_TURNS_DEFAULT}
+  ccr_preflight "$ALIAS" >/dev/null 2>&1 || true   # descriptive only; the child is already running
+ else
   CMD="ccr launch --model $ALIAS --permission-mode plan -p ... --max-turns $MAX_TURNS $MODE${RESUME_SESSION:+ $RESUME_SESSION} --prompt-file $PROMPT_FILE"
   ccr_preflight "$ALIAS" || launch_error "$REASON" "$CMD"
   ccr_smoke_check "$DIR" "$ALIAS" || launch_error "$REASON" "$CMD"
@@ -390,7 +580,8 @@ if [ "$BACKEND" = ccr ]; then
   ARGV=(); while IFS= read -r a; do ARGV+=("$a"); done < <(ccr_launch_argv "$ALIAS" "$MAX_TURNS" "$SESSION")
   stamp_claim; rotate_previous_attempt; unlock_claim
   : > "$PREFIX.progress"; : > "$PREFIX.stderr"; : > "$PREFIX.joblog"
-  start_in_own_group "${ARGV[@]}" < "$PROMPT_FILE" > "$PREFIX.joblog" 2>> "$PREFIX.stderr" &
+  rm -f "$PREFIX.childexit" "$PREFIX.childexit.tmp"
+  start_supervised_group "$PREFIX.childexit" "${ARGV[@]}" < "$PROMPT_FILE" > "$PREFIX.joblog" 2>> "$PREFIX.stderr" &
   CHILD=$!
   sleep 1
   PGID=$(pgid_of "$CHILD")
@@ -408,6 +599,7 @@ if [ "$BACKEND" = ccr ]; then
     PGID="$CHILD"
   fi
   echo "$(elapsed)s launched backend=ccr pid=$CHILD pgid=$PGID alias=$ALIAS" >> "$PREFIX.progress"
+ fi
 
   OUTCOME=""; LAST_ACTIVITY=$(now); PREV_SIG=""; IDLE=0
   while :; do
@@ -415,14 +607,57 @@ if [ "$BACKEND" = ccr ]; then
     SIG=$(fsig "$PREFIX.joblog"); LASTLINE=$(tail -n 1 "$PREFIX.joblog" 2>/dev/null | cut -c1-140)
     if [ "$SIG" != "$PREV_SIG" ]; then LAST_ACTIVITY=$(now); PREV_SIG="$SIG"; fi
     IDLE=$(( $(now) - LAST_ACTIVITY ))
-    if kill -0 "$CHILD" 2>/dev/null; then STATUS=running; else STATUS=exited; fi
+    if [ "$ATTACH" = 1 ]; then
+      # Not our child: `kill -0` would answer for whatever holds the number now, so the pid is
+      # paired with its start time. A number that is gone, or that has been reused, both mean our
+      # execution ended — and neither may be signalled.
+      identity_state "$CHILD" "$IDENT"; case $? in
+        0) STATUS=running;;
+        1) STATUS=exited;;
+        2) STATUS=exited; ALIVE=0; IDENT_NOTE="pid $CHILD was reused by another execution; nothing signalled";;
+      esac
+    elif kill -0 "$CHILD" 2>/dev/null; then STATUS=running; else STATUS=exited; fi
     echo "$(elapsed)s status=$STATUS idle=${IDLE}s | $LASTLINE" >> "$PREFIX.progress"
     [ "$STATUS" = running ] || { OUTCOME=EXITED; break; }
     if [ "$IDLE" -ge $(( STALL_MIN * 60 )) ]; then OUTCOME=STALLED; break; fi
-    if [ "$(elapsed)" -ge $(( MAX_MIN * 60 )) ]; then OUTCOME=TIMEOUT; break; fi
+    # The watch bound is the watcher's own and says nothing about the job, so it detaches
+    # instead of killing: the supervisor keeps the child, and an --attach resumes the watch.
+    if [ "$(elapsed)" -ge $(( MAX_MIN * 60 )) ]; then OUTCOME=DETACHED; break; fi
   done
+  if [ "$OUTCOME" = DETACHED ]; then
+    ATTACH_CMD="$0 $PREFIX --attach --stall-min $STALL_MIN --max-min $MAX_MIN --poll-sec $POLL"
+    CANCEL_CMD="$0 $PREFIX --attach --cancel   # identity-checked; never kill -$PGID directly, that number may name something else by now"
+    write_detached <<EOD
+backend=ccr
+alias=$ALIAS
+pid=$CHILD
+pgid=$PGID
+identity=$(proc_identity "$CHILD")
+joblog=$PREFIX.joblog
+receipt=$PREFIX.childexit
+mode=$MODE
+prompt_sha256=$(prompt_digest "$PROMPT_FILE")
+detached_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+attach_command=$ATTACH_CMD
+cancel_command=$CANCEL_CMD
+EOD
+    echo "$(elapsed)s DETACHED → watch bound reached with the job still running; nothing signalled (pgid $PGID left alive)" >> "$PREFIX.progress"
+    {
+      echo "outcome=DETACHED"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "detached=yes"; echo "attached=${ATTEMPTS:-0}"
+      echo "pid=$CHILD"; echo "pgid=$PGID"; echo "thread=$(stream_field "$PREFIX.joblog" init-session)"
+      echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"
+      echo "mode=$MODE"; echo "prompt_file=$PROMPT_FILE"; echo "command=$CMD"
+      echo "attach_command=$ATTACH_CMD"; echo "cancel_command=$CANCEL_CMD"
+    } > "$PREFIX.meta"
+    # NO .exit: an existing .exit tells every review gate the attempt finished, and it would then
+    # rotate the claim and authorize a second launch against this still-running job.
+    echo "codex-run.sh: DETACHED backend=ccr alias=$ALIAS pgid=$PGID elapsed=$(elapsed)s — the job is still running."
+    echo "  attach: $ATTACH_CMD"
+    echo "  cancel: $CANCEL_CMD"
+    exit 6
+  fi
   UNCONFIRMED_CANCEL=0
-  if [ "$OUTCOME" = STALLED ] || [ "$OUTCOME" = TIMEOUT ]; then
+  if [ "$OUTCOME" = STALLED ]; then
     if kill_group "$PGID"; then
       echo "$(elapsed)s $OUTCOME → process group $PGID terminated (confirmed: no member left)" >> "$PREFIX.progress"
     else
@@ -431,7 +666,18 @@ if [ "$BACKEND" = ccr ]; then
       echo "codex-run.sh: cancel of process group $PGID not confirmed; DO NOT retry — check with: ps -o pid,pgid,command -g $PGID" >&2
     fi
   fi
-  wait "$CHILD" 2>/dev/null; CHILD_RC=$?
+  if [ "$ATTACH" = 1 ]; then
+    # An attaching process cannot wait() for a child it did not fork. The supervisor's receipt is
+    # exactly why it exists: the success predicate below keeps its exit-status condition.
+    CHILD_RC=$(awk -F= '$1=="child_exit"{print $2; exit}' "$RECEIPT" 2>/dev/null)
+    if [ -z "$CHILD_RC" ]; then
+      CHILD_RC=1
+      echo "$(elapsed)s no supervisor receipt at $RECEIPT: the owner did not publish a child exit status" >> "$PREFIX.progress"
+      echo "codex-run.sh: supervisor receipt missing ($RECEIPT); treating the attempt as failed rather than assuming success" >> "$PREFIX.stderr"
+    fi
+  else
+    wait "$CHILD" 2>/dev/null; CHILD_RC=$?
+  fi
   SESSION_ID=$(stream_field "$PREFIX.joblog" init-session); ROUTED_MODEL=$(stream_field "$PREFIX.joblog" init-model)
   HAS_RESULT=$(stream_field "$PREFIX.joblog" has-result)
   stream_field "$PREFIX.joblog" result-text > "$PREFIX.stdout"
@@ -455,20 +701,28 @@ if [ "$BACKEND" = ccr ]; then
       ROUTE_OK=yes
     fi
   fi
+  # One publication at a time: a second attach, or the review gate's release, takes this same
+  # lock, so no reader can see a half-published attempt and no two collectors can race.
+  publish_lock
   [ "$OUTCOME" != COMPLETED ] || [ -z "$SESSION_ID" ] || printf '%s\n' "$SESSION_ID" > "$DIR/.ccr-last-session"
   {
-    echo "outcome=$OUTCOME"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "provider=$PROVIDER"; echo "provider_model=$PROVIDER_MODEL"
+    echo "outcome=$OUTCOME"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "detached=no"; echo "attached=${ATTEMPTS:-0}"
+    [ -z "${IDENT_NOTE:-}" ] || echo "identity_note=$IDENT_NOTE"; echo "provider=$PROVIDER"; echo "provider_model=$PROVIDER_MODEL"
     echo "claude_model_id=$CLAUDE_MODEL"; echo "routed_model=${ROUTED_MODEL:-unknown}"; echo "route_identity=$ROUTE_OK"; echo "compatibility=$COMPAT"; echo "ccr_version=$CCR_VER"
     echo "pid=$CHILD"; echo "pgid=$PGID"; echo "child_exit=$CHILD_RC"; echo "thread=${SESSION_ID:-unknown}"
     echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "max_turns=$MAX_TURNS"
     echo "mode=$MODE"; [ "$MODE" != "--resume-session" ] || echo "resume_session=$RESUME_SESSION"; echo "prompt_file=$PROMPT_FILE"; echo "result_event=$(stream_field "$PREFIX.joblog" result-subtype)"
     echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
     LASTERR=$(grep -E 'error|Error|exit status' "$PREFIX.stderr" | tail -1 | cut -c1-300)
-    echo "last_error=${LASTERR:-none}"; echo "cancel_confirmed=$([ "$UNCONFIRMED_CANCEL" = 1 ] && echo no || echo "$([ "$OUTCOME" = STALLED ] || [ "$OUTCOME" = TIMEOUT ] && echo yes || echo n/a)")"
+    echo "last_error=${LASTERR:-none}"; echo "cancel_confirmed=$([ "$UNCONFIRMED_CANCEL" = 1 ] && echo no || echo "$([ "$OUTCOME" = STALLED ] && echo yes || echo n/a)")"
   } > "$PREFIX.meta"
-  case "$OUTCOME" in COMPLETED) RC=0;; FAILED) RC=1;; STALLED) RC=2;; TIMEOUT) RC=3;; UNAVAILABLE) RC=4;; *) RC=1;; esac
+  case "$OUTCOME" in COMPLETED) RC=0;; FAILED) RC=1;; STALLED) RC=2;; TIMEOUT) RC=3;; UNAVAILABLE) RC=4;; DETACHED) RC=6;; *) RC=1;; esac
   [ "$UNCONFIRMED_CANCEL" = 1 ] && RC=5
+  # Terminal, in this order: the attempt stops being detached before it is marked finished, so no
+  # gate ever sees both markers, and none sees .exit while .detached still says a job may run.
+  rm -f "$PREFIX.detached"
   echo "$RC" > "$PREFIX.exit"
+  publish_unlock
   echo "codex-run.sh: $OUTCOME backend=ccr alias=$ALIAS session=${SESSION_ID:-unknown} elapsed=$(elapsed)s stdout=$(wc -c < "$PREFIX.stdout" | tr -d ' ')B → $PREFIX.{stdout,progress,meta}"
   exit "$RC"
 fi
@@ -481,6 +735,14 @@ CODEX_ROOT=$(codex_root)
 cc() { node "$CODEX_ROOT/scripts/codex-companion.mjs" "$@"; }
 jobfield() { python3 -c "import sys,json;d=json.load(sys.stdin);j=d.get('job') or {};print(j.get('$1') or '')" 2>/dev/null; }
 
+if [ "$ATTACH" = 1 ]; then
+  # The companion is already this job's durable owner: it survived the runner that launched it and
+  # answers `status` and `result` for the id in the detached record. Nothing to launch, nothing to
+  # claim — pick the watch back up where it stopped.
+  CMD=$(awk -F= '$1=="command"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
+  PROMPT_FILE=$(awk -F= '$1=="prompt_file"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
+  echo "$(elapsed)s attached job=$JOB" >> "$PREFIX.progress"
+else
 stamp_claim; rotate_previous_attempt; unlock_claim
 : > "$PREFIX.progress"; : > "$PREFIX.stderr"
 CMD="task $MODE --background --prompt-file $PROMPT_FILE"
@@ -492,6 +754,7 @@ if [ -z "$JOB" ]; then
   echo "codex-run.sh: LAUNCH-ERROR (see $PREFIX.stderr)"; exit 4
 fi
 echo "$(elapsed)s launched job=$JOB" >> "$PREFIX.progress"
+fi
 
 OUTCOME=""; LOGFILE=""; LAST_ACTIVITY=$(now); PREV_SIG=""
 while :; do
@@ -522,13 +785,41 @@ while :; do
         fi
       fi
       if [ "$IDLE" -ge $(( STALL_MIN * 60 )) ]; then OUTCOME=STALLED; break; fi
-      if [ "$(elapsed)" -ge $(( MAX_MIN * 60 )) ]; then OUTCOME=TIMEOUT; break; fi;;
+      # As on the ccr backend: the bound is the watcher's, not the job's. The companion keeps
+      # the job — it is already the durable owner — so detaching costs nothing and loses nothing.
+      if [ "$(elapsed)" -ge $(( MAX_MIN * 60 )) ]; then OUTCOME=DETACHED; break; fi;;
     *) echo "$(elapsed)s unknown status '$STATUS'" >> "$PREFIX.progress";;
   esac
 done
 
+if [ "$OUTCOME" = "DETACHED" ]; then
+  ATTACH_CMD="$0 $PREFIX --attach --stall-min $STALL_MIN --max-min $MAX_MIN --poll-sec $POLL"
+  CANCEL_CMD="node $CODEX_ROOT/scripts/codex-companion.mjs cancel $JOB"
+  write_detached <<EOD
+backend=codex
+job=$JOB
+joblog=${LOGFILE:-}
+mode=$MODE
+prompt_sha256=$(prompt_digest "$PROMPT_FILE")
+detached_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+attach_command=$ATTACH_CMD
+cancel_command=$CANCEL_CMD
+EOD
+  echo "$(elapsed)s DETACHED → watch bound reached with job $JOB still running; not cancelled" >> "$PREFIX.progress"
+  {
+    echo "outcome=DETACHED"; echo "backend=codex"; echo "job=$JOB"; echo "detached=yes"; echo "attached=${ATTEMPTS:-0}"
+    echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"
+    echo "mode=$MODE"; echo "prompt_file=$PROMPT_FILE"; echo "command=$CMD"
+    echo "attach_command=$ATTACH_CMD"; echo "cancel_command=$CANCEL_CMD"
+  } > "$PREFIX.meta"
+  # NO .exit — see the ccr branch: a terminal sidecar would free the claim for a second launch.
+  echo "codex-run.sh: DETACHED backend=codex job=$JOB elapsed=$(elapsed)s — the job is still running."
+  echo "  attach: $ATTACH_CMD"
+  echo "  cancel: $CANCEL_CMD"
+  exit 6
+fi
 UNCONFIRMED_CANCEL=0
-if [ "$OUTCOME" = "STALLED" ] || [ "$OUTCOME" = "TIMEOUT" ] || { [ "$OUTCOME" = "FAILED" ] && [ "${STATUS:-}" = "running" ]; }; then
+if [ "$OUTCOME" = "STALLED" ] || { [ "$OUTCOME" = "FAILED" ] && [ "${STATUS:-}" = "running" ]; }; then
   CANCEL_RC=0; cc cancel "$JOB" >>"$PREFIX.stderr" 2>&1 || CANCEL_RC=$?
   # Verify the cancel instead of asserting it: re-read status and look for a live
   # worker. Report honestly if either still says running — a claimed cancel that
@@ -557,17 +848,35 @@ else cc result "$JOB" > "$PREFIX.stdout" 2>>"$PREFIX.stderr" || true
 fi
 [ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && cp "$LOGFILE" "$PREFIX.joblog" 2>/dev/null
 THREAD=$(grep -oE 'Codex session ID: [0-9a-f-]+' "$PREFIX.stdout" | head -1 | awk '{print $4}')
+# A resumed run must land in the thread it named. The companion offers no way to ask for a thread
+# by id — --resume-last takes the newest eligible one — so the binding can only be checked after
+# the fact, and a mismatch is reported rather than accepted: continuing someone else's thread is
+# worse than starting a fresh, self-contained round.
+THREAD_NOTE=""
+if [ "$MODE" = "--resume-last" ] && [ "$OUTCOME" = COMPLETED ] && [ -n "$THREAD" ]; then
+  WANT=$(awk -F= '$1=="thread"{print $2; exit}' "$PREFIX.detached" 2>/dev/null)
+  [ -n "$WANT" ] || WANT=$(detached_field thread)
+  if [ -n "$WANT" ] && [ "$WANT" != unknown ] && [ "$WANT" != "$THREAD" ]; then
+    OUTCOME=FAILED
+    THREAD_NOTE="resumed thread $THREAD is not the expected $WANT; the continuation is not this attempt's, so it is refused"
+    echo "codex-run.sh: $THREAD_NOTE" >> "$PREFIX.stderr"
+  fi
+fi
+publish_lock
 {
   echo "outcome=$OUTCOME"; echo "backend=codex"; echo "job=$JOB"; echo "thread=${THREAD:-unknown}"
+  echo "detached=no"; echo "attached=${ATTEMPTS:-0}"; [ -z "$THREAD_NOTE" ] || echo "thread_note=$THREAD_NOTE"
   echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"
   echo "mode=$MODE"; echo "prompt_file=$PROMPT_FILE"; echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
   LASTERR=""; [ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && LASTERR=$(grep -E "Codex error:|Turn failed" "$LOGFILE" | tail -1 | cut -c1-300)
-  echo "last_error=${LASTERR:-none}"; echo "cancel_confirmed=$([ "${UNCONFIRMED_CANCEL:-0}" = "1" ] && echo no || echo "$([ "$OUTCOME" = "STALLED" ] || [ "$OUTCOME" = "TIMEOUT" ] && echo yes || echo n/a)")"
+  echo "last_error=${LASTERR:-none}"; echo "cancel_confirmed=$([ "${UNCONFIRMED_CANCEL:-0}" = "1" ] && echo no || echo "$([ "$OUTCOME" = "STALLED" ] && echo yes || echo n/a)")"
 } > "$PREFIX.meta"
-case "$OUTCOME" in COMPLETED) RC=0;; FAILED) RC=1;; STALLED) RC=2;; TIMEOUT) RC=3;; *) RC=1;; esac
+case "$OUTCOME" in COMPLETED) RC=0;; FAILED) RC=1;; STALLED) RC=2;; TIMEOUT) RC=3;; DETACHED) RC=6;; *) RC=1;; esac
 # An unconfirmed cancel outranks the outcome: 1, 2 and 3 all invite a retry or
 # treat the job as finished, and neither is safe while a worker may be alive.
 [ "${UNCONFIRMED_CANCEL:-0}" = "1" ] && RC=5
+rm -f "$PREFIX.detached"
 echo "$RC" > "$PREFIX.exit"
+publish_unlock
 echo "codex-run.sh: $OUTCOME job=$JOB elapsed=$(elapsed)s stdout=$(wc -c < "$PREFIX.stdout" | tr -d ' ')B → $PREFIX.{stdout,progress,meta}"
 exit "$RC"

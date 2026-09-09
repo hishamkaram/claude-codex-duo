@@ -66,6 +66,18 @@ in `$ART/.ccr-smoke.<alias>`; every ccr launch in the run directory refuses to
 start (exit 4) unless a matching record exists (same ccr version, model and launch
 line) — one smoke per alias per run, checked before every launch.
 
+After exit 6 the watch is resumed, never relaunched:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/<prefix>" --attach [--stall-min 6] [--max-min 20]
+```
+
+`--attach` is an operation, not a launch mode: it takes no prompt, no `--via` and no claim, spends
+no launch budget, rotates no sidecar, and leaves `mode=` in `.meta` as the original launch mode, so
+every gate anchors its thread exactly as before. It records `attached=<n>` and publishes the
+terminal `.exit` under the claim lock. `--attach --cancel` ends the job instead, after proving the
+recorded process identity still names the same execution.
+
 Thread semantics: `thread=` in `.meta` is the child's `session_id`. `--resume-last`
 resumes `$ART/.ccr-last-session` (the directory's last completed ccr launch);
 `--resume-session <id>` names one explicitly and is what the exchange phases use
@@ -232,7 +244,8 @@ the join. The runner exits with:
 | 0 | COMPLETED | proceed |
 | 1 | FAILED (plugin reported failure, or worker process died) | retry once: re-run the launch gate (it rotates the spent claim and prints a new `claim=` token) and launch with that token; if it fails again record FAILED |
 | 2 | STALLED (no job-log activity for `--stall-min`, cancel confirmed) | retry once the same way; then FAILED |
-| 3 | TIMEOUT (`--max-min` reached) | do not retry; record FAILED with the partial `.stdout` if any |
+| 3 | TIMEOUT (`--max-min` reached, job confirmed gone) | do not retry; record FAILED with the partial `.stdout` if any |
+| 6 | DETACHED (`--max-min` reached with the job still running) | The runner did not cancel it and deliberately wrote no `.exit`, so the phase gate still counts the attempt as in flight and will not authorise a second launch. **Attach again, never relaunch:** run the `attach_command` from `<prefix>.detached`; it resumes the watch under the same claim, spends no launch budget, and publishes the terminal outcome. `phase-gate.sh release` refuses a detached prefix — release only after an attach has published an outcome |
 | 4 | LAUNCH-ERROR, or any invalid invocation (missing option value, unknown argument, unreadable prompt file, `--write`) | record UNAVAILABLE with `.stderr`; a usage message means fix the call, not retry |
 | 5 | STALLED or TIMEOUT **and the cancel could not be confirmed** — a Codex worker may still be running | DO NOT retry: a second job would run alongside the first. Report the job id, quote `.progress`, and treat the phase as failed. |
 
