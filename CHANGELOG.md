@@ -86,6 +86,84 @@ debate (artifacts: `runner-hard-negatives-20260909-140134`, termination T1).
   a second job started against the same prefix. The launch is refused (exit 4) while the recorded
   identity is provably still running, and prints the record's own attach and cancel commands. An
   identity that cannot be proved is allowed to rotate, so a dead record can never deadlock a prefix.
+- **A process-group number read from a file was signalled without being checked — the whole login
+  session was in the blast radius.** `kill -- "-N"` is not "process group N" for every N: POSIX
+  gives `-1` the meaning *every process the user may signal* (on macOS that is the entire GUI
+  session, `loginwindow` included, which then relaunches every app) and `-0` the meaning *the
+  sender's own process group* (the invoking shell and every sibling terminal job). The `--attach`
+  path read `pgid=` straight out of `<prefix>.detached` and never validated it — the only PGID
+  assignment in the file that was unguarded — and the identity check that authorises a cancel
+  proves `pid=`, a **different field**. A record carrying `pgid=1` (a truncated write, a stale
+  file, a hand edit, or a test fixture — one was found on disk) therefore reached
+  `kill -TERM -- -1` followed by `kill -KILL -- -1`.
+
+  Every signal now goes through one fail-closed gate, `pgid_is_signalable`, which refuses empty,
+  non-numeric, `0`, `1`, this process, this process's own group, and — when the caller can name
+  the process it recorded — any group that is no longer that process's group. A refused target
+  returns "not confirmed" **having signalled nothing**, so callers treat it as a failed cancel
+  rather than a completed kill; `group_alive` is gated the same way, because `kill -0 -- "-1"` is
+  a permission probe against the whole machine that would answer "alive" for a group that does not
+  exist. The same gate is in `implement-run.sh`. Audited: no other executable path in this
+  repository invokes `kill`, `pkill`, `killall`, `launchctl`, `osascript` or `pmset`, and the only
+  configured hook (`impeccable`) sends no signals.
+
+  Forensics on the machine where this was found: `kill_group` had only ever been invoked on two
+  pgids, both from the validated launch path, and the one attach that did run against the `pgid=1`
+  record refused it (`nothing will be signalled … pgid 1 left alive`). The defect was reachable
+  and one field-value from firing; it had not fired.
+- **A signal handler that returns does not stop the script.** `trap 'publish_unlock' EXIT INT TERM`
+  released the publication lock on TERM and then *kept watching and publishing*, so a second
+  `--attach` was admitted and two collectors shared one job — and an operator who "stopped" the
+  runner had not stopped it. INT and TERM now exit (130 / 143).
+- **The supervisor never publishes a status it did not actually reap.** Its signal handler waited
+  three seconds and then wrote `child_exit=-<signal>` whether or not the child had exited —
+  publishing a terminal outcome for a job still running (reproduced: `child_exit=-15` with the
+  child alive). The handler could not have done better: `Popen.wait()` called from it can never
+  acquire the reaping lock the main thread already holds, so it always timed out. The supervisor
+  now **outlives** these signals instead of answering them. A group cancel reaches the child
+  directly, the main `wait()` returns the child's real status, and the receipt is true; a signal
+  aimed at the supervisor alone leaves it in place, still owning the child and still able to
+  publish the truth later. `SIGKILL` remains uncatchable, and the empty-group proof below is what
+  covers it. The dispositions are set after the fork on purpose — an ignored signal is inherited
+  across `exec`, and the child must stay killable by the `TERM` that `kill_group` sends.
+- **A receiptless attempt can be closed instead of wedging the run directory forever.** A
+  supervisor killed before it could reap (SIGKILL, the OOM killer, a host crash) left no receipt,
+  and all four recoveries then refused: `--attach` re-detached, `--attach --cancel` would not signal
+  an unprovable identity, `phase-gate.sh release` refused a detached prefix, and the taken claim
+  refused a relaunch. An **empty process group** is now accepted as the proof it is: pgid reuse can
+  only make a dead group look alive, never a live one look dead. The attempt closes as FAILED with
+  `child_exit=unknown` — the status is recorded as unknown, never manufactured as success.
+- **Lock reclaim is atomic, and an unreadable holder never wedges the lock.** Testing the holder
+  and deleting it were two steps, so a second reclaimer could delete the *replacement* holder and
+  two processes both held the lock; reclaim now renames the holder file, and only the process whose
+  rename won — and whose moved record is the one it judged stale — takes the lock. Separately, a
+  `holder` file that existed but was empty (an interrupted write) wedged the lock permanently: no
+  pid to prove dead, and `rmdir` cannot remove a non-empty directory. An unreadable holder now falls
+  to the clock, which deletes the file too.
+- **The relaunch guard works on the codex backend.** It tested a `pid=` the codex detach record
+  never wrote, so it was dead code exactly where it mattered most: `codex-debate` and
+  `codex-deep-plan` pass no `--claim`, and the guard is their only protection against relaunching
+  over a live job. The record now carries the worker pid and its identity, and the guard asks the
+  companion for the recorded `job=`; an undetermined answer refuses the launch rather than
+  permitting it.
+- **`.detached` is published last.** It is the token that admits an `--attach`, so writing it before
+  `.meta` opened a window in which an attach could collect the job and write `.exit`, only for the
+  launcher's outstanding `.meta` to land on top of the terminal record with `outcome=DETACHED`.
+- **A finished attempt is never discarded because a lock was busy.** The publication path took the
+  claim lock *after* the job had completed and its answer was on disk, then exited 4 — a completed
+  second-model review reported as a LAUNCH-ERROR — if the lock was held for five seconds, which
+  `phase-gate.sh release` alone can exceed. It now waits out a *provably live* holder instead, and
+  `stamp_claim` shares the one holder-based staleness rule rather than keeping a second, clock-based
+  copy of it.
+- **Exit 3 (TIMEOUT) is documented as retired** in all three protocol files and the README: no path
+  assigns it any more, and the arm is kept only so older sidecars stay readable. `--attach --cancel`
+  now prints the attach command it still requires, `--claim` is no longer advertised for `--attach`
+  (it was silently ignored), and an attach carries the launch's `max_turns` forward instead of
+  recording its own default.
+- **The gate half of this change has tests for the first time.** `phase-gate.sh` had none: the suite
+  stayed green if that file was reverted. Three fixtures now cover a detached attempt blocking the
+  gate, `release` refusing it, and the holder-based lock being kept for a live holder and reclaimed
+  from a dead one.
 - **Nothing that identity could not prove is ever signalled, or written down as proven.** The
   stall path used to TERM/KILL the recorded process group even on an attach that had already
   logged that the identity was unresolved; it now re-detaches instead. And a re-detaching attach

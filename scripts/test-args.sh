@@ -55,6 +55,18 @@ fixture_prov() {  # what Phase 3 writes beside the matrix: one raiser row per or
   [ -e "$1/03-matrix.tsv" ] && [ ! -e "$1/03-provenance.tsv" ] || return 0
   awk -F'\t' '$2=="BOTH"||$2=="CONFLICT"{printf "%s\tlead\tCL-%02d\n%s\tp1\tCX-%02d\n",$1,NR,$1,NR; next} $2=="CLAUDE-ONLY"{printf "%s\tlead\tCL-%02d\n",$1,NR; next} $2=="CODEX-ONLY"{printf "%s\tp1\tCX-%02d\n",$1,NR}' "$1/03-matrix.tsv" > "$1/03-provenance.tsv"
 }
+# Cleanup in this suite must never issue a session-wide signal. `kill -- "-0"` targets the suite's
+# OWN process group (this shell and every sibling job) and `kill -- "-1"` targets every process
+# this user owns — on macOS that ends the login session. A `${VAR:-0}` default turns an unset pgid
+# into the first, and a fixture that records `pgid=1` into the second. Every teardown kill goes
+# through here, which refuses both and anything that is not a plausible group id.
+signal_group() {  # <pgid> <signal> — refuses 0, 1, empty, non-numeric and our own group
+  case "${1:-}" in ''|*[!0-9]*) return 0;; esac
+  [ "$1" -ge 2 ] 2>/dev/null || return 0
+  [ "$1" != "$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" ] || return 0
+  kill "-$2" -- "-$1" 2>/dev/null || true
+}
+reap_group() { signal_group "${1:-}" KILL; }   # teardown
 pgw() { [ -d "${2:-}" ] && { top_up_claims "$2"; fixture_revs "$2"; fixture_prov "$2"; }; bash "$PG" "$@"; }
 pgwg() { local g="$1"; shift; [ -d "${2:-}" ] && { top_up_claims "$2"; fixture_revs "$2"; fixture_prov "$2"; }; PHASE_GATE_CLAIM_GRACE_SEC="$g" bash "$PG" "$@"; }
 chk() {
@@ -431,19 +443,21 @@ out=$(PATH="$CCRBIN:$PATH" bash "$R" "$CP4" --attach --stall-min 1 --poll-sec 5 
   && printf '  ok    %-42s\n' "T-22: stall on unproven identity signals nothing" \
   || { printf '  FAIL  T-22: rc=%s exit_written=%s group_alive=%s\n' "$rc3" "$([ -e "$CP4.exit" ] && echo yes || echo no)" "$(kill -0 -- "-$PG4" 2>/dev/null && echo yes || echo no)"; FAIL=1; }
 
-# T-23 (cycle 2, CL-03/CX-03): a group cancel signals every member, the supervisor included.
-# Dying without a receipt would leave the attempt uncollectable forever — .detached kept, claim
-# closed, every attach re-detaching — so the supervisor catches the signal and still publishes.
+# T-23 (cycle 2, CL-03; corrected in cycle 3): a group cancel signals every member, the supervisor
+# included. Dying without a receipt would leave the attempt uncollectable forever — .detached kept,
+# claim closed, every attach re-detaching. The supervisor now survives the signal and the CHILD is
+# what the signal ends, so the published status is one it genuinely reaped (-15 here), never one
+# the handler invented for a process it could not observe.
 SUP_PY=$(sed -n '/^start_supervised_group() {/,/^}/p' "$R")
 RCPT="$TMP/sup.receipt"; rm -f "$RCPT"
 bash -c "$SUP_PY"$'\n'"start_supervised_group '$RCPT' sleep 600" >/dev/null 2>&1 &
 SUPPID=$!; sleep 1
 SUPPG=$(ps -o pgid= -p "$SUPPID" 2>/dev/null | tr -d ' ')
-kill -TERM -- "-${SUPPG:-0}" 2>/dev/null; sleep 3
+signal_group "$SUPPG" TERM; sleep 3
 [ -n "$SUPPG" ] && [ -s "$RCPT" ] && grep -q '^child_exit=' "$RCPT" && ! grep -q '^child_exit=0$' "$RCPT" \
   && ! kill -0 -- "-$SUPPG" 2>/dev/null \
   && printf '  ok    %-42s\n' "T-23: a cancelled supervisor still publishes" \
-  || { printf '  FAIL  T-23: pgid=%s receipt=%s\n' "$SUPPG" "$(cat "$RCPT" 2>/dev/null || echo none)"; kill -KILL -- "-${SUPPG:-0}" 2>/dev/null; FAIL=1; }
+  || { printf '  FAIL  T-23: pgid=%s receipt=%s\n' "$SUPPG" "$(cat "$RCPT" 2>/dev/null || echo none)"; reap_group "$SUPPG"; FAIL=1; }
 
 # T-24 (cycle 2, CL-02): the publication lock is mutual exclusion, and an --attach legitimately
 # holds it for its whole watch — up to --max-min. Reclaiming it on age would admit a second
@@ -478,7 +492,7 @@ PG8=$(sed -n 's/.*launched backend=ccr pid=[0-9]* pgid=\([0-9]*\).*/\1/p' "$CP8.
 [ "$rc" = 4 ] && [ -e "$CP8.progress" ] && [ ! -e "$CP8.exit" ] && [ ! -e "$CP8.detached" ] \
   && printf '  ok    %-42s\n' "T-25: attach before detach leaves the launch alone" \
   || { printf '  FAIL  T-25: rc=%s exit_written=%s\n' "$rc" "$([ -e "$CP8.exit" ] && cat "$CP8.exit" || echo no)"; FAIL=1; }
-kill "$LAUNCHER" 2>/dev/null; kill -KILL -- "-${PG8:-0}" 2>/dev/null; wait "$LAUNCHER" 2>/dev/null
+kill "$LAUNCHER" 2>/dev/null; reap_group "$PG8"; wait "$LAUNCHER" 2>/dev/null
 
 # T-26 (cycle 2, CL-07): a launch against a prefix whose detached job is still running. Rotating
 # that record to .attemptN.* would strand the job — nothing could attach to it or cancel it again
@@ -490,7 +504,7 @@ sleep 300 & LIVE=$!
   printf 'attach_command=ATTACH-ME\ncancel_command=CANCEL-ME\n'; } > "$CP9.detached"
 printf '0s launched backend=ccr pid=%s pgid=%s alias=x\n' "$LIVE" "$LIVE" > "$CP9.progress"
 out=$(PATH="$CCRBIN:$PATH" bash "$R" "$CP9" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
-[ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'still running' && printf '%s' "$out" | grep -q 'ATTACH-ME' && printf '%s' "$out" | grep -q 'CANCEL-ME' \
+[ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'has not ended' && printf '%s' "$out" | grep -q 'ATTACH-ME' && printf '%s' "$out" | grep -q 'CANCEL-ME' \
   && [ -e "$CP9.detached" ] && [ ! -e "$CP9.attempt1.detached" ] && [ ! -e "$CP9.exit" ] \
   && printf '  ok    %-42s\n' "T-26: a launch never rotates a live detached job" \
   || { printf '  FAIL  T-26: rc=%s rotated=%s out=%s\n' "$rc" "$([ -e "$CP9.attempt1.detached" ] && echo yes || echo no)" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
@@ -500,6 +514,149 @@ out=$(PATH="$CCRBIN:$PATH" bash "$R" "$CP9" --via ccr:x --prompt-file "$CCRD/pro
 [ "$rc" = 0 ] && [ -e "$CP9.attempt1.detached" ] && [ ! -e "$CP9.detached" ] \
   && printf '  ok    %-42s\n' "T-26: a dead detached record never deadlocks the prefix" \
   || { printf '  FAIL  T-26(dead): rc=%s rotated=%s\n' "$rc" "$([ -e "$CP9.attempt1.detached" ] && echo yes || echo no)"; FAIL=1; }
+
+# ======================= signal-safety incident (2026-09-10) =================================
+# S-01..S-06 are GUARD-ONLY: they call pgid_is_signalable and assert what it REFUSES. No test here
+# sends a signal to a group-negative target, because the values under test are exactly the ones
+# that would end the login session if they ever reached `kill`.
+#
+# Background: `kill -- "-N"` is not "the group N" for every N. N=1 is every process the user may
+# signal (macOS: the whole GUI session, loginwindow included); N=0 is the sender's own process
+# group. The --attach path read `pgid=` out of <prefix>.detached and never checked it, while the
+# identity check that authorises a cancel proves `pid=` — a different field. A record carrying
+# pgid=1 therefore reached `kill -TERM -- -1`. One such file was found on disk.
+SAFE_PY=$(sed -n '/^pgid_is_signalable() {/,/^}/p' "$R")
+sig_ok() { bash -c "pgid_of() { ps -o pgid= -p \"\$1\" 2>/dev/null | tr -d ' '; }
+$SAFE_PY
+pgid_is_signalable $1" >/dev/null 2>&1; }
+s_refuses() {  # <label> <args...>
+  if sig_ok "$*"; then printf '  FAIL  %-42s (ACCEPTED a lethal target!)\n' "$1"; FAIL=1
+  else printf '  ok    %-42s\n' "$1"; fi
+}
+# S-01: the session-wide target. This is the reported incident.
+s_refuses "S-01: pgid 1 refused (whole login session)" 1
+# S-02: the sender's own process group — the invoking shell and every sibling terminal job.
+s_refuses "S-02: pgid 0 refused (own process group)" 0
+# S-03/S-04: nothing that is not a plausible group id is ever a target.
+s_refuses "S-03: empty pgid refused" ''
+s_refuses "S-04: non-numeric pgid refused" abc
+# S-05: ownership. A LIVE, perfectly plausible group is still refused when it is not the process
+# group of the pid the runner recorded — which is what makes a stale or corrupt record inert.
+# In its OWN group, the way the runner launches a job (setpgrp before exec) — a plain `&` job
+# inherits this shell's group, which the guard refuses by S-06 and rightly so.
+python3 -c 'import os,sys; os.setpgrp(); os.execvp("sleep",["sleep","30"])' & SOWN=$!
+sleep 1
+SOWNPG=$(ps -o pgid= -p "$SOWN" 2>/dev/null | tr -d ' ')
+sig_ok "$SOWNPG $SOWN" && printf '  ok    %-42s\n' "S-05: a real group with its true owner passes" \
+  || { printf '  FAIL  S-05: refused a legitimate target (pgid=%s owner=%s)\n' "$SOWNPG" "$SOWN"; FAIL=1; }
+s_refuses "S-05: real group, wrong owner refused" "$SOWNPG 2147483646"
+# S-06: the runner may never signal the group it is running in — that is the shell that invoked it.
+SELFPG=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+s_refuses "S-06: our own process group refused" "$SELFPG"
+kill "$SOWN" 2>/dev/null; wait "$SOWN" 2>/dev/null
+# S-07: no fixture in this suite may leave a lethal pgid on disk for a later --attach to pick up.
+BADFX=$(grep -cE '^(pid|pgid)=(0|1)$' "$0" 2>/dev/null); BADFX=${BADFX:-0}
+[ "$BADFX" = 0 ] && printf '  ok    %-42s\n' "S-07: no fixture records pgid 0 or 1" \
+  || { printf '  FAIL  S-07: %s fixture line(s) record a lethal pgid\n' "$BADFX"; FAIL=1; }
+# S-08: and no teardown may default a missing pgid to 0.
+BADTD=$(grep -cE 'kill[^|;]*-- *"?-\$\{[A-Za-z0-9_]+:-0\}' "$0" 2>/dev/null); BADTD=${BADTD:-0}
+[ "$BADTD" = 0 ] && printf '  ok    %-42s\n' "S-08: no teardown defaults a pgid to 0" \
+  || { printf '  FAIL  S-08: %s teardown line(s) default a pgid to 0\n' "$BADTD"; FAIL=1; }
+
+# ============================ review cycle 3 =================================================
+# T-27 (CL-02/CX-01): a bash trap handler that RETURNS does not stop the script. A TERM'd runner
+# that merely released the publication lock kept watching and still published, so a second attach
+# was admitted to the same job — two collectors, decided by scheduling.
+CP10="$CCRD/p-term"
+PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=slowok FAKE_CCR_SLEEP=600 bash "$R" "$CP10" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 5 --poll-sec 5 --max-min 9 >/dev/null 2>&1 &
+RUN10=$!; sleep 4
+PG10=$(sed -n 's/.*launched backend=ccr pid=[0-9]* pgid=\([0-9]*\).*/\1/p' "$CP10.progress" 2>/dev/null | head -1)
+kill -TERM "$RUN10" 2>/dev/null; sleep 3
+[ -n "$PG10" ] && ! kill -0 "$RUN10" 2>/dev/null \
+  && printf '  ok    %-42s\n' "T-27: TERM stops the runner, not just its lock" \
+  || { printf '  FAIL  T-27: runner still alive after TERM (rc=%s)\n' "$(kill -0 "$RUN10" 2>/dev/null && echo alive || echo gone)"; FAIL=1; }
+reap_group "$PG10"; wait "$RUN10" 2>/dev/null
+
+# T-28 (CX-03): the receipt means "this child was reaped and this was its status". The supervisor
+# therefore OUTLIVES a signal rather than answering it: catching TERM and writing a status after a
+# bounded wait published a lie, because Popen.wait() called from the handler can never acquire the
+# reaping lock the main thread already holds, so it always timed out and wrote child_exit=-15 for
+# a child that was still running (reproduced). A supervisor signalled while its child runs must
+# publish nothing AND still be there to publish the truth later.
+SUP_PY=$(sed -n '/^start_supervised_group() {/,/^}/p' "$R")
+RCPT2="$TMP/sup2.receipt"; rm -f "$RCPT2"
+bash -c "$SUP_PY"$'\n'"start_supervised_group '$RCPT2' sleep 600" >/dev/null 2>&1 &
+SP2=$!; sleep 1
+SPG2=$(ps -o pgid= -p "$SP2" 2>/dev/null | tr -d ' ')
+KID=$(pgrep -g "${SPG2:-0}" -f '^sleep 600' 2>/dev/null | head -1)
+kill -TERM "$SP2" 2>/dev/null   # the SUPERVISOR alone; the child is deliberately left running
+sleep 6
+[ -n "$KID" ] && kill -0 "$KID" 2>/dev/null && [ ! -e "$RCPT2" ] && kill -0 "$SP2" 2>/dev/null \
+  && printf '  ok    %-42s\n' "T-28: no receipt while the child still runs" \
+  || { printf '  FAIL  T-28: receipt=%s child=%s supervisor=%s\n' "$(cat "$RCPT2" 2>/dev/null || echo none)" "$(kill -0 "${KID:-0}" 2>/dev/null && echo alive || echo gone)" "$(kill -0 "${SP2:-0}" 2>/dev/null && echo alive || echo gone)"; FAIL=1; }
+reap_group "$SPG2"; [ -n "${KID:-}" ] && kill -KILL "$KID" 2>/dev/null
+
+# T-29 (CL-01/CX-06): a supervisor killed before it could reap (SIGKILL, OOM, a host crash) leaves
+# no receipt. An EMPTY process group is a sound proof of termination — a reused pgid can only make
+# a dead group look alive, never the reverse — so the attempt is closed as FAILED with the status
+# recorded as unknown. Without this the prefix wedged: attach re-detached forever, cancel refused,
+# release refused, relaunch refused.
+CP11="$CCRD/p-noreceipt"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=slowok FAKE_CCR_SLEEP=600 bash "$R" "$CP11" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 5 --poll-sec 5 --max-min 1 2>&1); rc=$?
+PG11=$(awk -F= '$1=="pgid"{print $2}' "$CP11.meta")
+reap_group "$PG11"; sleep 2      # the whole group dies with no receipt
+rm -f "$CP11.childexit"
+out=$(PATH="$CCRBIN:$PATH" bash "$R" "$CP11" --attach --poll-sec 1 --max-min 2 2>&1); rc2=$?
+[ "$rc" = 6 ] && [ "$rc2" = 1 ] && [ "$(cat "$CP11.exit")" = 1 ] && grep -q '^outcome=FAILED' "$CP11.meta" \
+  && grep -q '^child_exit=unknown' "$CP11.meta" && [ ! -e "$CP11.detached" ] \
+  && grep -q 'provably empty' "$CP11.meta" \
+  && printf '  ok    %-42s\n' "T-29: an empty group closes a receiptless attempt" \
+  || { printf '  FAIL  T-29: detach=%s attach=%s exit=%s meta=%s\n' "$rc" "$rc2" "$(cat "$CP11.exit" 2>/dev/null || echo none)" "$(grep -E '^(outcome|child_exit)=' "$CP11.meta" 2>/dev/null | tr '\n' ' ')"; FAIL=1; }
+
+# T-30 (CX-05): a holder file that exists but cannot be read is not evidence of a dead holder, and
+# `rmdir` cannot remove a directory that still contains it. That pair wedged the lock forever
+# (reproduced: exit 4 on every attempt, the lock still present).
+CP12="$CCRD/p-emptyholder"
+mkdir -p "$CP12.claim.lock"; : > "$CP12.claim.lock/holder"; touch -t 200001010000 "$CP12.claim.lock"
+# NEVER write pid=1/pgid=1 into a fixture: `pgid=1` is the session-wide signal target, and this
+# file is left on disk after the run. A pid that cannot exist keeps the fixture inert.
+printf 'backend=ccr\nalias=x\npid=2147483646\npgid=2147483646\nidentity=never\nattach_command=A\ncancel_command=C\n' > "$CP12.detached"
+out=$(PATH="$CCRBIN:$PATH" bash "$R" "$CP12" --attach --poll-sec 1 --max-min 1 2>&1); rc=$?
+[ ! -d "$CP12.claim.lock" ] && ! printf '%s' "$out" | grep -q 'held by another attach' \
+  && printf '  ok    %-42s\n' "T-30: an unreadable holder never wedges the lock" \
+  || { printf '  FAIL  T-30: rc=%s lock_left=%s out=%s\n' "$rc" "$([ -d "$CP12.claim.lock" ] && echo yes || echo no)" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+reap_group "$(awk -F= '$1=="pgid"{print $2}' "$CP12.meta" 2>/dev/null)"
+
+# T-31 (CL-03/CX-02): the relaunch guard was dead code on the codex backend — its detach record
+# carried no identity at all, so a relaunch rotated a LIVE job's record away and started a second
+# job beside it. codex-debate and codex-deep-plan pass no --claim, so this guard is their only
+# protection. A record whose worker is provably alive must refuse the launch.
+CP13="$CCRD/p-codexlive"
+sleep 300 & CJOB=$!
+{ printf 'backend=codex\njob=task-fake-live\nthread=t\njoblog=\n'
+  printf 'worker_pid=%s\nworker_identity=%s\n' "$CJOB" "$(TZ=UTC ps -o lstart= -p "$CJOB" | tr -s ' ' | sed 's/^ *//;s/ *$//')"
+  printf 'mode=--fresh\nattach_command=ATTACH-CODEX\ncancel_command=CANCEL-CODEX\n'; } > "$CP13.detached"
+printf '0s launched job=task-fake-live\n' > "$CP13.progress"
+out=$(bash "$R" "$CP13" --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'has not ended' && printf '%s' "$out" | grep -q 'ATTACH-CODEX' \
+  && [ -e "$CP13.detached" ] && [ ! -e "$CP13.attempt1.detached" ] \
+  && printf '  ok    %-42s\n' "T-31: a codex relaunch is refused while alive" \
+  || { printf '  FAIL  T-31: rc=%s rotated=%s out=%s\n' "$rc" "$([ -e "$CP13.attempt1.detached" ] && echo yes || echo no)" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+kill "$CJOB" 2>/dev/null; wait "$CJOB" 2>/dev/null
+
+# T-32 (CX-07): .detached is what admits an --attach, so it must be the LAST sidecar a detach
+# writes. Published first, it opened a window in which an attach could collect the job and write
+# .exit, only for the launcher's still-outstanding .meta to land on top of the terminal record.
+CP14="$CCRD/p-order"
+out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=slowok FAKE_CCR_SLEEP=600 bash "$R" "$CP14" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 5 --poll-sec 5 --max-min 1 2>&1); rc=$?
+PG14=$(awk -F= '$1=="pgid"{print $2}' "$CP14.meta")
+M_T=$(python3 -c "import os,sys;print(os.stat(sys.argv[1]).st_mtime)" "$CP14.meta")
+D_T=$(python3 -c "import os,sys;print(os.stat(sys.argv[1]).st_mtime)" "$CP14.detached")
+python3 -c "import sys;sys.exit(0 if float('$D_T') >= float('$M_T') else 1)" \
+  && printf '  ok    %-42s\n' "T-32: .detached is published after .meta" \
+  || { printf '  FAIL  T-32: .detached %s older than .meta %s\n' "$D_T" "$M_T"; FAIL=1; }
+reap_group "$PG14"
+
 kill -- "-$PG4" 2>/dev/null
 kill -- "-$PG3" 2>/dev/null
 
@@ -1832,6 +1989,38 @@ printf '0s launched backend=ccr pid=2147483646 pgid=%s alias=some-alias\n' "$GRP
 chk "T-19b: live process group refused" 1 "process group $GRP of 02-p2 is still alive" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
 kill -TERM -- "-$GRP" 2>/dev/null; wait "$GRP" 2>/dev/null; sleep 1
 chk "T-19b: group gone → released without the companion" 0 "RELEASED 02-p2" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+# ---- review cycle 3, CL-06: the gate half of the detach change had NO test at all. These three
+# fail if phase-gate.sh is reverted to its pre-change form.
+# T-23g: a detached attempt (.detached, no .exit) is IN FLIGHT — the gate must refuse to advance
+# rather than read a missing .exit as "the runner died" and authorize a second launch.
+PD="$TMP/parts-detached"; mkdir -p "$PD"; printf 'scope\n' > "$PD/00-scope.md"; mkbrief "$PD"; printf 'p1\tcodex\t-\n' > "$PD/00-participants.tsv"
+pgw pre-codex "$PD" "$G2" >/dev/null 2>&1 || { printf '  FAIL  T-23g: preflight\n'; FAIL=1; }
+mkdir -p "$PD/02-p1.claim/runner"; printf '%s\n' "$$" > "$PD/02-p1.claim/runner/pid"
+printf '0s launched job=task-fake\n' > "$PD/02-p1.progress"
+printf 'backend=codex\njob=task-fake\nattach_command=ATTACH-ME\ncancel_command=CANCEL-ME\n' > "$PD/02-p1.detached"
+# The join gate checks the lead and the participant artifacts BEFORE it looks at claims, so both
+# must be present or the run fails for an unrelated reason and the detached check is never reached
+# (which is exactly what the first draft of this test did).
+printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$PD/01-lead.md"; chmod 000 "$PD/01-lead.md"
+printf 'p1\nSTATUS: PHASE 2 COMPLETE\n' > "$PD/02-p1.md"
+chk "T-23g: a detached attempt blocks the gate"   1 "detached" pgw pre-phase3 "$PD"
+chmod 600 "$PD/01-lead.md"
+# T-24g: release must refuse it. The job is still running and still spending tokens; only an
+# attach that publishes an outcome may free the claim.
+chk "T-24g: release refuses a detached prefix"    1 "detached" bash "$PG" release "$PD" 02-p1
+# T-25g: the gate's claim lock is reclaimed from a DEAD holder, never on age — an --attach holds
+# it for its whole watch (up to --max-min) and is not stale for being old.
+sleep 300 & GH=$!
+mkdir -p "$PD/02-p1.claim.lock"
+printf 'pid=%s\nidentity=%s\n' "$GH" "$(TZ=UTC ps -o lstart= -p "$GH" | tr -s ' ' | sed 's/^ *//;s/ *$//')" > "$PD/02-p1.claim.lock/holder"
+touch -t 200001010000 "$PD/02-p1.claim.lock"
+chk "T-25g: an aged lock with a live holder is kept" 1 "claim.lock is held by a live" bash "$PG" release "$PD" 02-p1
+kill "$GH" 2>/dev/null; wait "$GH" 2>/dev/null
+out=$(bash "$PG" release "$PD" 02-p1 2>&1)
+printf '%s' "$out" | grep -q 'claim.lock is held' \
+  && { printf '  FAIL  T-25g: a dead holder still blocked the lock\n'; FAIL=1; } \
+  || printf '  ok    %-42s\n' "T-25g: a dead holder's lock is reclaimed"
+[ ! -d "$PD/02-p1.claim.lock" ] || { printf '  FAIL  T-25g: lock left behind\n'; FAIL=1; }
 rm -rf "$PR"/02-p2.claim.spent*; rm -f "$PR/02-p2.progress"
 mkdir -p "$PR/02-p2.claim/runner"; printf '2147483646\n' > "$PR/02-p2.claim/runner/pid"; printf '0s launched backend=ccr pid=2147483646 alias=some-alias\n' > "$PR/02-p2.progress"
 chk "T-19b: launch line without pgid refused" 1 "has no pgid=" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2

@@ -238,7 +238,16 @@ participants_status() {
     # attempt or SKIPPED (round-19 CX-01).
     reject_unconfirmed_cancel "02-$id"
     if [ "$pst" = COMPLETE ]; then
-      [ -s "$ART/02-$id.exit" ] || fail "02-$id.exit missing: participant $id has not finished"
+      if [ ! -s "$ART/02-$id.exit" ]; then
+        # A DETACHED attempt has no .exit by design (runner exit 6) and is not the same thing as a
+        # runner that died mid-flight. Both refuse here, but only one of them has a recovery, and
+        # naming it is the difference between an operator attaching and an operator relaunching a
+        # live job. Say which state this is and print the record's own attach command.
+        if [ -e "$ART/02-$id.detached" ]; then
+          fail "02-$id is detached and still in flight (runner exit 6): its job is still running, so no .exit was written. Do NOT relaunch — attach to it to publish the outcome: $(awk -F= '$1=="attach_command"{sub(/^[^=]*=/,""); print; exit}' "$ART/02-$id.detached" 2>/dev/null)"
+        fi
+        fail "02-$id.exit missing: participant $id has not finished"
+      fi
       [ "$(cat "$ART/02-$id.exit")" = 0 ] || fail "02-$id.exit must be 0 for a completed blind review (got $(cat "$ART/02-$id.exit"))"
       [ -s "$ART/02-$id.stdout" ] || fail "02-$id.stdout is empty: an empty response is not a completed blind review; record Phase 2 SKIPPED (empty response) for $id or relaunch"
       ST=COMPLETE
@@ -803,20 +812,41 @@ CLAIM_LOCK_STALE_SEC=60
 lock_identity() {  # <pid> -> start time, pinned to UTC so it does not depend on who is looking
   TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//'
 }
+# Reclaiming is a race: testing the holder and deleting it are two steps, so a second reclaimer
+# could delete the REPLACEMENT holder and two processes would both hold the lock (review cycle 3:
+# CL-04/CX-04). The rename serializes it — only one contender can move the holder file away — and
+# the mover then verifies that what it moved is the very record it judged stale, restoring it if a
+# live process has replaced it in the meantime. A holder file that cannot be READ (empty, or
+# truncated by an interrupted write) is not evidence of a dead holder; it falls through to the
+# clock, which must delete the file too, because `rmdir` cannot remove a directory that still
+# contains it — that pair wedged the lock permanently (cycle 3: CX-05).
+reclaim_lock() {  # <lock> <the exact holder record judged stale> -> 0 when the lock is now free
+  local lock="$1" want="$2" tmp="$1/holder.dead.$$"
+  mv "$lock/holder" "$tmp" 2>/dev/null || return 1
+  if [ "$(cat "$tmp" 2>/dev/null)" = "$want" ]; then
+    rm -f "$tmp"; rmdir "$lock" 2>/dev/null && return 0
+    return 1
+  fi
+  mv "$tmp" "$lock/holder" 2>/dev/null || rm -f "$tmp"
+  return 1
+}
 claim_lock() {  # claim_lock <prefix>
-  local lock="$ART/$1.claim.lock" i=0 now hpid hident hlive
+  local lock="$ART/$1.claim.lock" i=0 now hrec hpid hident hlive
   while ! mkdir "$lock" 2>/dev/null; do
-    hpid=$(awk -F= '$1=="pid"{print $2; exit}' "$lock/holder" 2>/dev/null)
-    hident=$(awk -F= '$1=="identity"{sub(/^[^=]*=/,""); print; exit}' "$lock/holder" 2>/dev/null)
+    hrec=$(cat "$lock/holder" 2>/dev/null)
+    hpid=$(printf '%s\n' "$hrec" | awk -F= '$1=="pid"{print $2; exit}')
+    hident=$(printf '%s\n' "$hrec" | awk -F= '$1=="identity"{sub(/^[^=]*=/,""); print; exit}')
     if [ -n "$hpid" ]; then
       hlive=$(lock_identity "$hpid")
       if [ -z "$hlive" ] || [ "$hlive" != "$hident" ]; then
-        rm -f "$lock/holder" 2>/dev/null
-        rmdir "$lock" 2>/dev/null && continue
+        reclaim_lock "$lock" "$hrec" && continue
       fi
     else
       now=$(date +%s)
-      if [ $(( now - $(mtime "$lock" || echo "$now") )) -ge "$CLAIM_LOCK_STALE_SEC" ] && rmdir "$lock" 2>/dev/null; then continue; fi  # an unremovable stale lock is retried like a held one (bounded)
+      if [ $(( now - $(mtime "$lock" || echo "$now") )) -ge "$CLAIM_LOCK_STALE_SEC" ]; then
+        rm -f "$lock/holder" 2>/dev/null
+        rmdir "$lock" 2>/dev/null && continue   # an unremovable stale lock is retried like a held one (bounded)
+      fi
     fi
     i=$((i+1)); [ "$i" -lt 50 ] || fail "$1.claim.lock is held by a live launcher, runner or attach (a claim is being taken or rotated, or a detached job is being collected — an attach holds it for its whole watch); retry in a moment"
     sleep 0.1
