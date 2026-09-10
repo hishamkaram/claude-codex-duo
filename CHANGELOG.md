@@ -76,11 +76,6 @@ debate (artifacts: `runner-hard-negatives-20260909-140134`, termination T1).
   collector and admit exactly the concurrency the lock exists to exclude. The holder now records
   its pid and start-time identity inside the lock and the lock is released only once that
   execution is provably gone. The clock still decides one case: a lock with no holder record.
-- **The supervisor publishes a receipt even when it is cancelled.** A group cancel signals every
-  member, the supervisor included; dying before writing `child_exit=` would leave the attempt
-  permanently uncollectable — `.detached` kept, the claim closed, and every later attach finding
-  no receipt and re-detaching forever. SIGTERM/SIGINT/SIGHUP are caught, the child gets a bounded
-  chance to land, and a receipt is published either way.
 - **A launch never rotates a live detached job away.** Rotating `<prefix>.detached` to
   `.attemptN.*` would strand a running job — nothing could attach to it or cancel it again — while
   a second job started against the same prefix. The launch is refused (exit 4) while the recorded
@@ -104,8 +99,11 @@ debate (artifacts: `runner-hard-negatives-20260909-140134`, termination T1).
   rather than a completed kill; `group_alive` is gated the same way, because `kill -0 -- "-1"` is
   a permission probe against the whole machine that would answer "alive" for a group that does not
   exist. The same gate is in `implement-run.sh`. Audited: no other executable path in this
-  repository invokes `kill`, `pkill`, `killall`, `launchctl`, `osascript` or `pmset`, and the only
-  configured hook (`impeccable`) sends no signals.
+  repository sends a signal to a *process-group* target — `phase-gate.sh` and `scripts/test-args.sh`
+  do invoke `kill` and `pkill`, but only as `kill -0`, per-pid kills of a pid they created, and (in
+  the tests) group teardowns re-proved against the recorded owner pid; nothing in the repository
+  invokes `killall`, `launchctl`, `osascript` or `pmset`, and the only configured hook (`impeccable`)
+  sends no signals.
 
   Forensics on the machine where this was found: `kill_group` had only ever been invoked on two
   pgids, both from the validated launch path, and the one attach that did run against the `pgid=1`

@@ -812,6 +812,20 @@ CLAIM_LOCK_STALE_SEC=60
 lock_identity() {  # <pid> -> start time, pinned to UTC so it does not depend on who is looking
   TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//'
 }
+# Emptiness of a job's process group, asked by READING the process table — this gate never signals
+# a group, and `kill -0 -- "-N"` would in any case answer for N=0 (this shell's own group) and N=1
+# (every process this user owns). Returns 0 ONLY on proof: a non-numeric or sentinel pgid, or a ps
+# that told us nothing, is undetermined and returns 1 so callers stay refused. Sound one way only —
+# a reused pgid can make a dead group look alive, never a live one look dead.
+group_is_empty() {  # <pgid>
+  local pg="$1" table
+  case "$pg" in ''|*[!0-9]*) return 1;; esac
+  [ "$pg" -ge 2 ] 2>/dev/null || return 1
+  table=$(ps -Ao pgid= 2>/dev/null | tr -d ' ') || return 1
+  [ -n "$table" ] || return 1
+  printf '%s\n' "$table" | grep -qx -- "$pg" && return 1
+  return 0
+}
 # Reclaiming is a race: testing the holder and deleting it are two steps, so a second reclaimer
 # could delete the REPLACEMENT holder and two processes would both hold the lock (review cycle 3:
 # CL-04/CX-04). The rename serializes it — only one contender can move the holder file away — and
@@ -844,7 +858,11 @@ claim_lock() {  # claim_lock <prefix>
     else
       now=$(date +%s)
       if [ $(( now - $(mtime "$lock" || echo "$now") )) -ge "$CLAIM_LOCK_STALE_SEC" ]; then
-        rm -f "$lock/holder" 2>/dev/null
+        # rmdir refuses a directory that still contains anything, so the clock clears every file a
+        # lock can hold — `holder`, and a `holder.dead.<pid>` left behind by a reclaim_lock killed
+        # between its rename and its rm. Clearing only `holder` wedged the lock permanently, the
+        # same shape cycle 3 fixed for `holder` itself (cycle 4: CX-05).
+        rm -f "$lock/holder" "$lock"/holder.dead.* 2>/dev/null
         rmdir "$lock" 2>/dev/null && continue   # an unremovable stale lock is retried like a held one (bounded)
       fi
     fi
@@ -881,15 +899,19 @@ ccr_release_check() {  # ccr_release_check <prefix> <launch line>
   pid=$(printf '%s' "$launch" | grep -oE ' pid=[0-9]+' | head -1 | cut -d= -f2)
   pgid=$(printf '%s' "$launch" | grep -oE ' pgid=[0-9]+' | head -1 | cut -d= -f2)
   [ -n "$pgid" ] || fail "release: ccr launch record of $prefix has no pgid= (launch line: ${launch:0:120}); cancel the process tree by hand (ps -o pid,pgid,command | grep 'ccr launch'), then re-run the gate"
-  if kill -0 -- "-$pgid" 2>/dev/null; then
-    fail "release: process group $pgid of $prefix is still alive ($(ps -o pid=,command= -g "$pgid" 2>/dev/null | head -3 | tr '\n' ';')); cancel it first (kill -TERM -- -$pgid)"
+  # Asked by reading, not by probing: `kill -0 -- "-N"` is a permission test, and for N=1 it tests
+  # every process this user owns and would answer "alive" for a group that never existed, wedging
+  # release against a truncated or hand-edited record. group_is_empty answers from the process
+  # table and returns "not empty" for the sentinels, so this still fails closed.
+  if ! group_is_empty "$pgid"; then
+    left=$(ps -o pid= -g "$pgid" 2>/dev/null | tr -d ' \n')
+    fail "release: process group $pgid of $prefix is not provably empty (members: ${left:-unreadable}; $(ps -o pid=,command= -g "$pgid" 2>/dev/null | head -3 | tr '\n' ';')); cancel it first"
   fi
-  left=$(ps -o pid= -g "$pgid" 2>/dev/null | tr -d ' \n')
-  [ -z "$left" ] || fail "release: process group $pgid of $prefix still has members ($left); cancel them first"
   if [ -n "$pid" ] && descendants_alive "$pid"; then fail "release: a descendant of pid $pid ($prefix) is still alive; cancel it first"; fi
 }
 release_claim() {
   local prefix="$1" claim="$ART/$1.claim" pid job st root launch backend alias
+  local d_backend d_pid d_ident d_pgid d_live
   case "$prefix" in 04-consultation|06-resolution) ;; *)
     participant_ids | sed 's/^/02-/' | grep -qx -- "$prefix" || fail "release: unknown phase prefix '$prefix' (participants: $(participant_ids | tr '\n' ' '))";;
   esac
@@ -904,7 +926,15 @@ release_claim() {
     d_backend=$(awk -F= '$1=="backend"{print $2; exit}' "$ART/$prefix.detached" 2>/dev/null)
     d_pid=$(awk -F= '$1=="pid"{print $2; exit}' "$ART/$prefix.detached" 2>/dev/null)
     d_ident=$(awk -F= '$1=="identity"{sub(/^[^=]*=/,""); print; exit}' "$ART/$prefix.detached" 2>/dev/null)
-    if [ "$d_backend" = ccr ] && [ -n "$d_pid" ]; then
+    d_pgid=$(awk -F= '$1=="pgid"{print $2; exit}' "$ART/$prefix.detached" 2>/dev/null)
+    # backend=codex is NOT refused here. The companion-based proof below (the `[ -n "$job" ]`
+    # branch) is exactly the evidence this decision needs, and refusing before reaching it left the
+    # three recoveries pointing at each other: the attach could not publish, `release` said "attach
+    # first", and the relaunch said "attach or cancel first" (cycle 4: CL-05). Detachment is not
+    # itself a reason to refuse — an unfinished job is, and that is what the proof below asks.
+    if [ "$d_backend" = codex ]; then
+      : # fall through to the companion proof; it fails closed if the job is not provably finished
+    elif [ "$d_backend" = ccr ] && [ -n "$d_pid" ]; then
       # TZ=UTC, exactly as the runner records it: `ps -o lstart=` renders the start time in the
       # OBSERVING shell's local time, so without it this gate would read a live, matching process
       # as unidentifiable whenever it runs under a different TZ than the launcher did.
@@ -912,12 +942,19 @@ release_claim() {
       if [ -n "$d_live" ] && [ "$d_live" = "$d_ident" ]; then
         fail "release: $prefix is detached and its job is still alive (pid $d_pid, identity verified); attach to collect it, or cancel it — never release a running job"
       fi
-      # Either the process is gone or the number now names something else. Both mean this
-      # attempt's execution ended, but neither means its RESULT was collected: an attach must
-      # publish the outcome first, so that the claim is released against a finished record.
-      fail "release: $prefix is detached and its execution is no longer identifiable (pid $d_pid); run its attach command first so the outcome is published, then release"
+      # Either the process is gone or the number now names something else. Neither is proof the
+      # WORK stopped — the supervisor's child is reparented and keeps running in the same process
+      # group — so the group is read directly. An empty group is proof in the one sound direction;
+      # anything else stays refused, and the message now names a recovery that is reachable rather
+      # than pointing back at the attach (cycle 4: CL-05).
+      if [ -n "$d_pgid" ] && group_is_empty "$d_pgid"; then
+        : # nothing of that job is left: fall through to the generic checks below
+      else
+        fail "release: $prefix is detached and its execution is no longer identifiable (pid $d_pid) and process group ${d_pgid:-(unrecorded)} is not provably empty; run its attach command first so the outcome is published, then release. If the attach cannot reach its backend at all, the two exits are: restore the backend and re-run the attach, or abandon this prefix — record the phase FAILED and start a fresh run directory. Check for survivors first: ps -o pid,pgid,command -g ${d_pgid:-<pgid>}"
+      fi
+    else
+      fail "release: $prefix is detached (backend=$d_backend); run its attach command to publish an outcome before releasing the claim. If the attach cannot reach its backend at all, the two exits are: restore the backend and re-run the attach, or abandon this prefix — record the phase FAILED and start a fresh run directory. Never hand-free a claim whose job may still be running."
     fi
-    fail "release: $prefix is detached (backend=$d_backend); run its attach command to publish an outcome before releasing the claim"
   fi
   # A publication in progress holds the same lock this function took, so reaching here means no
   # attach is mid-publish for this prefix.
@@ -952,7 +989,7 @@ try: print(json.load(open(p))["plugins"]["codex@openai-codex"][0]["installPath"]
 except Exception: pass
 c=sorted(glob.glob(os.path.expanduser("~/.claude/plugins/cache/openai-codex/codex/*/scripts/codex-companion.mjs")))
 print(os.path.dirname(os.path.dirname(c[-1])) if c else "")' 2>/dev/null)
-    [ -n "$root" ] && [ -f "$root/scripts/codex-companion.mjs" ] || fail "release: cannot locate the codex plugin to check job ${job:-(unrecorded)}; refusing to release a claim whose job may be running"
+    [ -n "$root" ] && [ -f "$root/scripts/codex-companion.mjs" ] || fail "release: cannot locate the codex plugin to check job ${job:-(unrecorded)}; refusing to release a claim whose job may be running. Reinstall or repair the codex plugin (validate.sh check 11 reports this state) and re-run this release; or abandon the prefix — record the phase FAILED and start a fresh run directory. Live jobs can be listed directly with: node <codex-plugin>/scripts/codex-companion.mjs status --all --json"
     if [ -n "$job" ]; then
       st=$(node "$root/scripts/codex-companion.mjs" status "$job" --json 2>/dev/null | python3 -c 'import sys,json
 try: d=json.load(sys.stdin); print((d.get("job") or {}).get("status") or "")

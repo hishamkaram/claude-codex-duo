@@ -270,9 +270,27 @@ refuse_signal() {  # <pgid> <context>
 # Liveness is asked the same way, and about the same verified target: `kill -0 -- "-1"` is a
 # permission probe against every process on the machine and would answer "alive" for a group that
 # does not exist, which would in turn keep a finished attempt open forever.
-group_alive() {  # <pgid> [owner-pid]
+group_alive() {  # <pgid> [owner-pid] -> 0 only when the group is BOTH signalable and alive
   pgid_is_signalable "$1" "${2:-}" || return 1
   kill -0 -- "-$1" 2>/dev/null
+}
+# group_alive answers "may I signal this, and is it there" — a refusal and an empty group are the
+# same answer (1), so `! group_alive` is NOT a proof of emptiness. Every caller that closes an
+# attempt needs that proof, and reaches it on paths where the owner pid is already gone and the
+# gate therefore refuses unconditionally: `! group_alive` would be vacuously true and would close
+# a live job (cycle 4: F-01/CL-01/CX-02). So emptiness is asked separately, by READING the process
+# table and never by signalling. Soundness runs one way only: a pgid can be reused, which can make
+# a dead group look alive but never a live one look dead. Undetermined answers — a non-numeric or
+# sentinel pgid, or a ps that told us nothing — return 1 (not provably empty), so callers stay in
+# flight rather than closing on an unproven termination.
+group_is_empty() {  # <pgid> -> 0 only when the process table proves no member is left
+  local pg="$1" table
+  case "$pg" in ''|*[!0-9]*) return 1;; esac
+  [ "$pg" -ge 2 ] 2>/dev/null || return 1
+  table=$(ps -Ao pgid= 2>/dev/null | tr -d ' ') || return 1
+  [ -n "$table" ] || return 1
+  printf '%s\n' "$table" | grep -qx -- "$pg" && return 1
+  return 0
 }
 # TERM then KILL the whole group; return 0 when nothing in it is left, 1 when something survives.
 # Fails closed: an unverified target returns 1 (not confirmed) WITHOUT signalling anything, so
@@ -598,7 +616,11 @@ publish_lock() {  # [--must]
       fi
     else
       now=$(date +%s); m=$(fmtime "$lock" || echo "$now"); m=${m:-$now}
-      if [ $(( now - m )) -ge 60 ]; then rm -f "$lock/holder" 2>/dev/null; rmdir "$lock" 2>/dev/null && continue; fi
+      # rmdir cannot remove a directory that still contains anything, so the clock must clear
+      # EVERY file a lock can hold — including a `holder.dead.<pid>` left by a reclaim_lock that
+      # was killed between its rename and its rm. Clearing only `holder` wedged the lock forever
+      # in exactly the shape cycle 3 fixed for `holder` itself (cycle 4: CX-05).
+      if [ $(( now - m )) -ge 60 ]; then rm -f "$lock/holder" "$lock"/holder.dead.* 2>/dev/null; rmdir "$lock" 2>/dev/null && continue; fi
     fi
     # One bound for both shapes of failure: a lock a live holder legitimately owns, and a stale one
     # that cannot be removed (a directory with something else inside it). Neither may spin forever.
@@ -621,9 +643,28 @@ rotate_previous_attempt() {
     dbackend=$(detached_field backend)
     case "$dbackend" in
       ccr)
+        # The recorded pid is the SUPERVISOR, not the work. A supervisor that is gone or whose
+        # number has been reused proves nothing about the child: the child is reparented and keeps
+        # running in the same process group. Treating an unresolved identity as "not live" rotated
+        # the record of a job still executing and authorized a second one beside it — the same
+        # defect the codex branch below already fails closed on (cycle 4: CX-04). So identity is
+        # only ever promoted to a POSITIVE answer here; the negative comes from the group.
+        local dpgid dreceipt
         dpid=$(detached_field pid); dident=$(detached_field identity)
-        [ -z "$dpid" ] || identity_state "$dpid" "$dident" || dpid=""
-        [ -z "$dpid" ] || dlive="yes (pid $dpid, start time matches)"
+        dpgid=$(detached_field pgid); dreceipt=$(detached_field receipt)
+        if [ -n "$dpid" ] && identity_state "$dpid" "$dident"; then
+          dlive="yes (pid $dpid, start time matches)"
+        elif [ -n "$dreceipt" ] && [ -s "$dreceipt" ]; then
+          dlive=no                                  # the supervisor reaped the child: over
+        elif [ -s "$PREFIX.childexit" ]; then
+          dlive=no
+        elif [ -n "$dpgid" ] && group_is_empty "$dpgid"; then
+          dlive=no                                  # nothing of the job is left: over
+        elif [ -z "$dpid" ] && [ -z "$dpgid" ]; then
+          dlive="undetermined ($PREFIX.detached records no pid or pgid for the ccr attempt)"
+        else
+          dlive="undetermined (pid ${dpid:-<none>} is gone or reused and process group ${dpgid:-<none>} is not provably empty)"
+        fi
         ;;
       codex)
         # The codex record carries no process WE own — the companion owns the job — so liveness is
@@ -676,7 +717,13 @@ stamp_claim() {
   # reclaimed, a retry without a fresh gate, a double launch) cannot both start
   # or rotate each other's files (round-28 CX-02, round-29 CX-02). The loser
   # exits 4 and writes nothing under the prefix.
-  if [ ! -d "$PREFIX.claim" ] && [ "$CLAIM_MODE" != 1 ]; then return 0; fi
+  # The lock is taken FIRST and unconditionally, because what it serializes is not only the claim:
+  # every caller runs `stamp_claim; rotate_previous_attempt; unlock_claim`, so returning early from
+  # here left the in-flight check and the sidecar rotation completely unserialized. On the default
+  # path of codex-debate and codex-deep-plan — no claim directory and no --claim — that early
+  # return was ALWAYS taken, so two launches racing on one prefix could both read "not in flight"
+  # and both rotate, each hiding the other's attempt (cycle 4: CL-04/CX-03). The claim-specific
+  # work below stays conditional; the lock does not.
   # Taking the claim (token check, mkdir runner, pid) is serialized against the
   # gate rotating or replacing it by <prefix>.claim.lock, the same atomic-mkdir
   # lock the gate holds while it rotates (round-38 CX-03). The lock stays held
@@ -689,10 +736,14 @@ stamp_claim() {
   publish_lock
   local lock="$HELD_LOCK"
   if [ ! -d "$PREFIX.claim" ]; then
-    publish_unlock
-    [ "$CLAIM_MODE" = 1 ] || return 0
-    echo "codex-run.sh: --claim given but $PREFIX.claim does not exist; run the launch gate first (no sidecar was written)" >&2
-    exit 4
+    if [ "$CLAIM_MODE" = 1 ]; then
+      publish_unlock
+      echo "codex-run.sh: --claim given but $PREFIX.claim does not exist; run the launch gate first (no sidecar was written)" >&2
+      exit 4
+    fi
+    # No claim to take — but the lock is deliberately still HELD, so the caller's in-flight check
+    # and rotation are serialized against every other launch, attach and release on this prefix.
+    return 0
   fi
   if [ "$CLAIM_MODE" = 1 ] && ! grep -qxF "token=$CLAIM_TOKEN" "$PREFIX.claim/owner" 2>/dev/null; then
     publish_unlock
@@ -850,7 +901,7 @@ if [ "$BACKEND" = ccr ]; then
         # attempt stays in flight and this watch re-detaches at the bound (see below).
         1|2) ALIVE=0
              if [ -s "$RECEIPT" ]; then STATUS=exited
-             elif [ -n "$PGID" ] && ! group_alive "$PGID" "$CHILD"; then
+             elif [ -n "$PGID" ] && group_is_empty "$PGID"; then
                # The identity is gone AND the whole process group is empty. Group emptiness is
                # sound in this direction — pgid reuse can only make a dead group look alive — so
                # the execution really is over, and the collector below closes the attempt with the
@@ -942,7 +993,7 @@ EOD
     # An attaching process cannot wait() for a child it did not fork. The supervisor's receipt is
     # exactly why it exists: the success predicate below keeps its exit-status condition.
     CHILD_RC=$(awk -F= '$1=="child_exit"{print $2; exit}' "$RECEIPT" 2>/dev/null)
-    if [ -z "$CHILD_RC" ] && [ -n "$PGID" ] && ! group_alive "$PGID" "$DPID"; then
+    if [ -z "$CHILD_RC" ] && [ -n "$PGID" ] && group_is_empty "$PGID"; then
       # No receipt, and the recorded process group is EMPTY. That is a proof of termination in the
       # one direction that is sound: a pgid can be reused, which can only make a dead group look
       # alive, never a live one look dead. So the execution is over and its exit status is
