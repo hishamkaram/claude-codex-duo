@@ -27,6 +27,7 @@ class Provider:
         self.release.set()
         self.requests = 0
         self.marker = None
+        self.history_marker = None
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -62,11 +63,16 @@ class Provider:
                 if matched and not owner.release.wait(90):
                     self.send_error(504)
                     return
+                reply = 'DONE'
+                if owner.history_marker is not None:
+                    # The fixture only echoes a marker actually present in Claude's
+                    # request history. Later prompts never carry it.
+                    reply = owner.history_marker if owner.history_marker in json.dumps(body) else 'HISTORY_MISSING'
                 message = {'id': 'msg_fixture', 'type': 'message', 'role': 'assistant',
                            'model': 'fixture-model', 'content': [], 'stop_reason': None,
                            'stop_sequence': None, 'usage': {'input_tokens': 100, 'output_tokens': 0}}
                 if not body.get('stream'):
-                    message.update(content=[{'type': 'text', 'text': 'DONE'}], stop_reason='end_turn')
+                    message.update(content=[{'type': 'text', 'text': reply}], stop_reason='end_turn')
                     self.send(message)
                     return
                 events = [
@@ -74,7 +80,7 @@ class Provider:
                     ('content_block_start', {'type': 'content_block_start', 'index': 0,
                                              'content_block': {'type': 'text', 'text': ''}}),
                     ('content_block_delta', {'type': 'content_block_delta', 'index': 0,
-                                             'delta': {'type': 'text_delta', 'text': 'DONE'}}),
+                                             'delta': {'type': 'text_delta', 'text': reply}}),
                     ('content_block_stop', {'type': 'content_block_stop', 'index': 0}),
                     ('message_delta', {'type': 'message_delta', 'delta': {'stop_reason': 'end_turn',
                                                                        'stop_sequence': None},
@@ -186,6 +192,41 @@ def main():
         committed = json.loads(Path(str(prefix) + '.ccr-result.json').read_text())
         assert committed['job_id'] == receipt['job_id'] and committed['successful']
         assert 'DONE' in Path(str(prefix) + '.stdout').read_text()
+        # Exercise all packaged consumers against real Claude session persistence.
+        provider.history_marker = uuid.uuid4().hex
+        rounds = []
+        phases = [('original', 'codex-pr-review'), ('review-consultation', 'codex-pr-review'),
+                  ('residual-resolution', 'codex-pr-review'), ('debate', 'codex-debate'),
+                  ('deep-plan', 'codex-deep-plan')]
+        for phase, plugin in phases:
+            runner = ROOT / 'plugins' / plugin / 'scripts/codex-run.sh'
+            prefix = out / phase
+            arguments = ['bash', str(runner), str(prefix), '--via', 'ccr:fixture', '--poll-sec', '1']
+            if rounds:
+                # Resolve before creating the next prompt, as every caller must.
+                anchor = json.loads(run(['python3', str(runner.with_name('ccr-job.py')),
+                                         'resolve-session', str(prefix), rounds[-1]['session_id']],
+                                        name=phase + '.anchor').stdout)
+                arguments += ['--resume-session', anchor['session_id'],
+                              '--expected-parent-job', anchor['expected_parent_job']]
+                prompt = 'Return the unpredictable marker from the original session. Do not use tools.'
+            else:
+                arguments += ['--fresh']
+                prompt = 'Remember and return this unpredictable marker: ' + provider.history_marker
+            prompt_file = out / (phase + '.prompt')
+            prompt_file.write_text(prompt)
+            run(arguments + ['--prompt-file', str(prompt_file)], name=phase + '.control', timeout=90)
+            admitted = json.loads(Path(str(prefix) + '.ccr-attempt.json').read_text())
+            current = admitted['receipt']
+            jobs.append(current['job_id'])
+            assert Path(str(prefix) + '.stdout').read_text().strip() == provider.history_marker, phase
+            assert current['job_id'] not in [item['job_id'] for item in rounds]
+            if rounds:
+                assert current['session_id'] == rounds[0]['session_id']
+                assert admitted['expected_parent_job'] == rounds[-1]['job_id']
+            rounds.append(current)
+        (out / 'continuation.json').write_text(json.dumps(rounds, indent=2))
+        provider.history_marker = None
         # A separately launched interactive --chrome session is the sentinel.
         sentinel_fd, slave = pty.openpty()
         sentinel = subprocess.Popen(['ccr', 'launch', '--model', 'fixture', '--chrome',
@@ -232,7 +273,7 @@ def main():
                                                   'test_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                                                   'runner_sha256': hashlib.sha256(RUNNER.read_bytes()).hexdigest(),
                                                   'helper_sha256': hashlib.sha256(RUNNER.with_name('ccr-job.py').read_bytes()).hexdigest(),
-                                                  'sentinel_survived': True}, indent=2))
+                                                  'continuation_rounds': rounds, 'sentinel_survived': True}, indent=2))
         print('REAL CLI PASS:', out)
     finally:
         # Only this test's isolated canonical job namespace is considered.

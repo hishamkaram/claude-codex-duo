@@ -45,7 +45,7 @@ hashed with the packets by `pre-codex` and never changes afterwards.
 
 ## ccr backend (`--via ccr:<alias>`)
 
-The gateway is the user's `ccr` (claude-code-router, >= 0.5.1). Aliases are
+The gateway is the user's `ccr` (claude-code-router, >= 0.6.0). Aliases are
 machine-local (`ccr model list`); never write one into a shipped file and never
 default to one. The runner's launch line is fixed and is the only one this plugin
 uses for a review:
@@ -80,10 +80,9 @@ no launch budget, rotates no sidecar, and leaves `mode=` in `.meta` as the origi
 every gate anchors its thread exactly as before. It records `attached=<n>` and publishes the
 terminal `.exit` under the claim lock. `--attach --cancel` ends the job instead, by requesting cancellation from its CCR owner using the durable job ID.
 
-CCR currently supports **fresh detached jobs only** in this runner. Both resume options
-fail with exit 4 before admission or claim mutation. For an exchange, explicitly record
-`continuity=unavailable` in the phase record and choose `--fresh` with a self-contained prompt
-containing the prior response and evidence. The runner never silently replaces a resume.
+CCR continuation requires the participant’s session ID and expected parent job. Resolve
+the authoritative head before preparing the exchange prompt. The runner persists the
+submission identity before admission and never silently replaces a resume with fresh work.
 
 `thread=` is the child's session ID. A launch receipt binds `job_id` and `session_id`;
 initialization and result identities must match it. `.progress` records
@@ -280,7 +279,7 @@ Run one monitored call for the complete selected set, not one call per finding:
 ```bash
 # exchange participant = $(cat "$ART/02-exchange-participant"); the CONSULTATION-OK line also prints it as exchange=p<k> via=<backend[:alias]>
 ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/04-consultation" --claim "$CLAIM" --resume-last --prompt-file "$ART/04-consultation.prompt.md" --stall-min 6 --max-min 20                                                    # codex participant
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/04-consultation" --via ccr:<alias> --claim "$CLAIM" --fresh --prompt-file "$ART/04-consultation.prompt.md" --stall-min 6 --max-min 20   # CCR: explicitly recorded self-contained exchange
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/04-consultation" --via ccr:<alias> --claim "$CLAIM" --resume-session "$SID" --expected-parent-job "$PARENT" --prompt-file "$ART/04-consultation.prompt.md" --stall-min 6 --max-min 20   # CCR: head resolved before preparing the prompt
 ```
 
 The raw sidecars remain immutable. The response is one fenced `json` object
@@ -289,11 +288,11 @@ disposition must contain all normalized fields described in adjudication.md;
 validate it with `validate-consultation.py` before Phase 5. The exchange runs on
 the exchange participant's session: for the codex backend `--resume-last` is
 repository-global, so run no other codex command between Phase 2 and Phase 6;
-for CCR in this release, record unavailable continuity and use an explicit self-contained `--fresh` exchange. Then
+for CCR, resolve the session head before preparing the prompt and supply its expected parent job. Then
 compare `04-consultation.meta`'s `thread=` to `02-p<k>.meta`'s `thread=` before
-accepting the response (the gate does the same). If the session cannot be
-resumed, retry once with `--fresh`; record that continuity is unavailable and
-treat the call as a self-contained consultation. A launch or stall failure becomes a skipped consultation and never reruns an
+accepting the response (the gate does the same). For Codex, if the session cannot be
+resumed, retry once with `--fresh` and record unavailable continuity. For CCR, a fresh
+retry requires the explicit safely stopped startup-failure decision described below. A launch or stall failure becomes a skipped consultation and never reruns an
 initial review. An exit-0 non-empty response that fails canonical validation
 gets exactly one correction: run `pre-consultation` again, use its new `claim=`
 token and `prompt=04-consultation.prompt.retry.md`, and invoke the same command
@@ -311,10 +310,10 @@ monitored exchange protocol once with executed verification evidence, again from
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/06-resolution" --claim "$CLAIM" --resume-last --prompt-file "$ART/06-resolution.prompt.md" --stall-min 6 --max-min 20                                            # codex participant
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/06-resolution" --via ccr:<alias> --claim "$CLAIM" --fresh --prompt-file "$ART/06-resolution.prompt.md" --stall-min 6 --max-min 20   # CCR: explicitly recorded self-contained exchange
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/06-resolution" --via ccr:<alias> --claim "$CLAIM" --resume-session "$SID" --expected-parent-job "$PARENT" --prompt-file "$ART/06-resolution.prompt.md" --stall-min 6 --max-min 20   # CCR: head resolved before preparing the prompt
 ```
 
-Historical `--resume-session` records use `mode=--resume-session` (plus `resume_session=<id>`)
+CCR `--resume-session` records use `mode=--resume-session` (plus `resume_session=<id>`)
 and the gates anchor it exactly like `--resume-last`: its `thread=` must equal the exchange
 participant's session, or the attempt is unusable.
 
@@ -383,3 +382,45 @@ Collectors use a kernel lease on the persistent `.claim.lock` file. Do not delet
 that file. Drain legacy directory locks and unfinished legacy attempts before
 upgrading. Partial cleanup coverage cannot exclude escaped descendants; an empty
 observed survivor list does not establish that escaped tool processes are absent.
+
+## Durable CCR continuation
+
+Before preparing each continuation prompt, resolve that participant's session head:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ccr-job.py" resolve-session "$ART/next-anchor" "$SID"
+PARENT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["expected_parent_job"])' "$ART/next-anchor.ccr-anchor.json")
+```
+
+Retain the anchor with the round. Then prepare its prompt and launch with
+`--via ccr:<alias> --resume-session "$SID" --expected-parent-job "$PARENT"`.
+Every round has a new job and submission identity; its session stays the same.
+A changed head is refused by CCR. Never select an older successful job to bypass a
+newer unresolved attempt. Keep separate anchors for separate participants.
+
+The private attempt persists its submission token and complete invocation before admission.
+Attach recovers a lost receipt through read-only submission status; it never submits another
+workload. An unavailable lookup remains unresolved with no terminal `.exit`.
+A proven aborted `not_started` admission may close as failure without inventing a child exit.
+Successful output is restricted to CCR's committed byte boundary and verified digest.
+
+Fresh retry is a separate, explicitly recorded caller decision. For CCR, permit at most one
+fresh retry after a positively stopped `startup_failed` attempt. Obtain a new gate claim for
+the same canonical phase prefix (`04-consultation` or `06-resolution`), then launch with
+`--fresh` and that claim. The runner rotates the previous attempt, preserving both
+observations, and uses the new claim as a new submission with a new session. Never
+launch an alternate prefix outside the gate budget. Missing/unknown failure codes, owner loss,
+identity mismatch, or uncertain admission do not authorize this retry. Fresh success does
+not establish why the earlier attempt failed. Never infer missing history from stderr.
+
+If status identifies a prepared transactional admission whose owner was lost, an explicit
+recovery can finish that same admission:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ccr-job.py" complete-admission "$PREFIX"
+```
+
+This uses the saved complete invocation, prompt digest, and original submission token.
+CCR checks the request, execution configuration, leases, and execution boundary. It cannot
+create a replacement job. Ordinary attach remains read-only; after recovery, attach to
+collect the original job. Missing lookup evidence remains unresolved.

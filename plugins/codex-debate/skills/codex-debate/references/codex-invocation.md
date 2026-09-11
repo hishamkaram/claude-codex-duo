@@ -66,7 +66,7 @@ upstream "model is at capacity" is transient: retry once).
 
 ## ccr backend (`--via ccr:<alias>`)
 
-The gateway is the user's `ccr` (claude-code-router, >= 0.5.1). Aliases are
+The gateway is the user's `ccr` (claude-code-router, >= 0.6.0). Aliases are
 machine-local (`ccr model list`); never write one into a shipped file and never
 default to one. The runner's launch line is fixed:
 
@@ -96,10 +96,9 @@ with another alias and never fall back to Claude; the registration belongs to
 ccr. `.meta` records `alias=`, `provider=`, `provider_model=`,
 `claude_model_id=`, `routed_model=`, `route_identity=` alongside `prompt_file=`.
 
-CCR uses fresh detached jobs in this release. Resume options fail with exit 4 before
-admission or claim mutation. Record `continuity=unavailable` for each later CCR round and
-explicitly choose `--fresh`, including the previous response and ledger in the prompt.
-The Codex backend retains its existing resume behavior.
+CCR uses a fresh session for the original round and guarded continuation for later rounds.
+Resolve each participant’s authoritative head before preparing its prompt, then supply
+`--resume-session` and `--expected-parent-job`. Codex retains its existing resume behavior.
 
 The receipt binds the job and session IDs; initialization, result, and route identities
 must agree. Watch expiry only detaches. A stall requests cancellation by job ID.
@@ -109,7 +108,10 @@ The private `.ccr-attempt.json` and receipt support immediate attach after watch
 `.ccr-result.json` commits the result bytes. Never relaunch an unresolved attempt.
 Drain legacy process-based attempts using their original runner before upgrading.
 
-## Thread semantics
+## Codex thread semantics
+
+These fallback rules apply only to the Codex companion. CCR continuation follows the
+durable contract below and never silently changes sessions.
 
 - Blind round: `--fresh`, so no earlier Codex thread in this repo leaks in.
 - Rounds: `--resume-last`, so Codex keeps its own positions. It resumes the
@@ -127,12 +129,11 @@ participant: `02-blind-p<k>.*` for the blind take, `03-round-<n>-p<k>.*` for a r
 
 - The single codex participant (at most one) keeps `--resume-last`: the companion resumes the
   most recent thread in the repository, so no other codex call may run between its rounds.
-- Every CCR participant uses explicitly recorded self-contained `--fresh` rounds in
-  this release. Keep each participant's previous response and evidence in its own prompt;
-  resume requests are rejected before admission.
-- Record `thread=` of every launch in the round file; a round whose `.meta` `thread=` differs
-  from the participant's previous one lost its session — rule on it as a self-contained
-  round and say so.
+- Every CCR participant resumes its own session with an explicit expected parent job.
+  Resolve that head before preparing each round prompt as described below.
+- Record `thread=` of every launch in the round file. A CCR session mismatch is a failed
+  identity check; never accept it as a self-contained round. For the Codex companion,
+  record any explicitly chosen fresh context in the round file.
 
 ## What Codex can see — and what that means for the debate
 
@@ -178,3 +179,42 @@ Collectors use a kernel lease on the persistent `.claim.lock` file. Do not delet
 that file. Drain legacy directory locks and unfinished legacy attempts before
 upgrading. Partial cleanup coverage cannot exclude escaped descendants; an empty
 observed survivor list does not establish that escaped tool processes are absent.
+
+## Durable CCR continuation
+
+Before preparing each continuation prompt, resolve that participant's session head:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ccr-job.py" resolve-session "$ART/next-anchor" "$SID"
+PARENT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["expected_parent_job"])' "$ART/next-anchor.ccr-anchor.json")
+```
+
+Retain the anchor with the round. Then prepare its prompt and launch with
+`--via ccr:<alias> --resume-session "$SID" --expected-parent-job "$PARENT"`.
+Every round has a new job and submission identity; its session stays the same.
+A changed head is refused by CCR. Never select an older successful job to bypass a
+newer unresolved attempt. Keep separate anchors for separate participants.
+
+The private attempt persists its submission token and complete invocation before admission.
+Attach recovers a lost receipt through read-only submission status; it never submits another
+workload. An unavailable lookup remains unresolved with no terminal `.exit`.
+A proven aborted `not_started` admission may close as failure without inventing a child exit.
+Successful output is restricted to CCR's committed byte boundary and verified digest.
+
+Fresh retry is a separate, explicitly recorded caller decision. For CCR, permit at most one
+fresh retry after a positively stopped `startup_failed` attempt; use a new prefix, submission,
+and session and preserve both observations. Missing/unknown failure codes, owner loss,
+identity mismatch, or uncertain admission do not authorize this retry. Fresh success does
+not establish why the earlier attempt failed. Never infer missing history from stderr.
+
+If status identifies a prepared transactional admission whose owner was lost, an explicit
+recovery can finish that same admission:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ccr-job.py" complete-admission "$PREFIX"
+```
+
+This uses the saved complete invocation, prompt digest, and original submission token.
+CCR checks the request, execution configuration, leases, and execution boundary. It cannot
+create a replacement job. Ordinary attach remains read-only; after recovery, attach to
+collect the original job. Missing lookup evidence remains unresolved.

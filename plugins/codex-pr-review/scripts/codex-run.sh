@@ -4,7 +4,7 @@
 # Usage:
 #   codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file>
 #                [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>]
-#                [--max-turns N]                                  (--max-turns and --resume-session: ccr backend only)
+#                [--max-turns N] [--expected-parent-job <job>]       (CCR options)
 #   codex-run.sh <out-prefix> --attach [--stall-min N] [--max-min M] [--poll-sec S]
 #   codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]
 #
@@ -51,7 +51,7 @@
 #                           commands. Removed when an attach publishes the terminal outcome.
 #   Exit 4 with NO sidecar written: another runner already took <out-prefix>.claim/, or (--claim)
 #   no claim exists / the arguments are invalid.
-#   ccr backend also writes <dir>/.ccr-last-session (the session id --resume-last resumes).
+#   CCR continuation requires an explicit session and authoritative parent job.
 #
 # CCR owns workload lifecycle. A stall requests cancellation by job ID; a watch
 # deadline only detaches the collector. Unknown admission or cleanup retains the
@@ -59,8 +59,8 @@
 
 set -u
 umask 077
-# The job API arrived in 0.5.0; 0.5.1 fixes process-group cleanup observation.
-CCR_MIN_VERSION="0.5.1"
+# Transactional submission and guarded same-session continuation require 0.6.0.
+CCR_MIN_VERSION="0.6.0"
 CCR_HELPER="$(exec 9>&-; cd "$(exec 9>&-; dirname "$0")" && pwd)/ccr-job.py"
 CCR_RUNNER="${CCR_HELPER%/*}/${0##*/}"
 # These are assigned inside ccr_preflight, past its early-return failures. The attach path is
@@ -351,7 +351,7 @@ raise SystemExit(rc)'
     *) echo "PROBE UNAVAILABLE: --via must be codex or ccr:<alias> (got '$VIA')"; exit 1;;
   esac
 fi
-USAGE='usage: codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>] [--max-turns N]
+USAGE='usage: codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>] [--max-turns N] [--expected-parent-job <job>]
        codex-run.sh <out-prefix> --attach [--stall-min N] [--max-min M] [--poll-sec S]
        codex-run.sh <out-prefix> --attach --cancel
        codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]'
@@ -382,12 +382,13 @@ CLAIM_MODE=0; CLAIM_TOKEN=""; for _a in "$@"; do [ "$_a" = "--claim" ] && CLAIM_
 # invocation, so when any of them is present it is reported and nothing is published.
 die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || [ -e "${PREFIX:-/nonexistent}.exit" ] || [ -e "${PREFIX:-/nonexistent}.detached" ] || [ -e "${PREFIX:-/nonexistent}.progress" ] || [ -e "${PREFIX:-/nonexistent}.ccr-attempt.json" ] || [ -e "${PREFIX:-/nonexistent}.ccr-receipt.json" ] || [ -e "${PREFIX:-/nonexistent}.claim.lock" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
 need() { [ $# -ge 2 ] || die4 "$1 requires a value"; case "$2" in -*) die4 "$1 requires a value (got option $2)";; esac; }
-MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""; ATTACH=0; VIA_SET=0; CANCEL_ONLY=0; EXPECTED_JOB=""
+MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""; ATTACH=0; VIA_SET=0; CANCEL_ONLY=0; EXPECTED_JOB=""; EXPECTED_PARENT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --attach) ATTACH=1;;
     --cancel) CANCEL_ONLY=1;;
     --expected-job) need "$@"; EXPECTED_JOB="$2"; shift;;
+    --expected-parent-job) need "$@"; EXPECTED_PARENT="$2"; shift;;
     --fresh|--resume-last) [ "$MODE_SET" != 1 ] || [ "$MODE" = "$1" ] || die4 "$MODE and $1 are exclusive"; MODE="$1"; MODE_SET=1;;
     --via) need "$@"; VIA="$2"; VIA_SET=1; shift;;
     --prompt-file) need "$@"; PROMPT_FILE="$2"; shift;;
@@ -403,6 +404,7 @@ while [ $# -gt 0 ]; do
 done
 # --attach is an operation, not a launch mode: it submits no prompt and chooses no backend. The
 # backend, the launch mode and every identifier come from the detached record the launch left.
+[ -z "$EXPECTED_PARENT" ] || { [ "$ATTACH" != 1 ] && [ "$MODE" != --fresh ]; } || die4 "--expected-parent-job requires a resume launch"
 [ -z "$EXPECTED_JOB" ] || [ "$ATTACH" = 1 ] || die4 "--expected-job requires --attach"
 [ -z "$EXPECTED_JOB" ] || [ -f "$PREFIX.ccr-attempt.json" ] || die4 "--expected-job requires a durable CCR attempt"
 [ "$CANCEL_ONLY" != 1 ] || [ "$ATTACH" = 1 ] || die4 "--cancel is only valid with --attach"
@@ -422,13 +424,26 @@ esac
 if [ "$BACKEND" = codex ]; then
   [ -z "$MAX_TURNS" ] || die4 "--max-turns is ccr-only (pass --via ccr:<alias>)"
   [ -z "$RESUME_SESSION" ] || die4 "--resume-session is ccr-only (pass --via ccr:<alias>)"
+  [ -z "$EXPECTED_PARENT" ] || die4 "--expected-parent-job is ccr-only"
 else
+  [ "$MODE" != --resume-last ] || die4 "CCR --resume-last is ambiguous; resolve the session before preparing the prompt and use --resume-session with --expected-parent-job"
   [ -n "$MAX_TURNS" ] || MAX_TURNS=$CCR_MAX_TURNS_DEFAULT
   case "$RESUME_SESSION" in *[!A-Za-z0-9-]*) die4 "--resume-session: a session id has only letters, digits and '-' (got '$RESUME_SESSION')";; esac
 fi
-if [ "$BACKEND" = ccr ] && [ "$ATTACH" != 1 ] && [ "$MODE" != --fresh ]; then
-  echo "codex-run.sh: CCR detached resume is unavailable in this release; explicitly choose --fresh for a new session (nothing admitted)" >&2
-  exit 4
+valid_resume_identity() {
+  python3 - "$1" "$2" <<'PYIDS'
+import sys, uuid
+try:
+    sid, job = sys.argv[1:]
+    valid = str(uuid.UUID(sid)) == sid and job.startswith("ccr-") and str(uuid.UUID(job[4:])) == job[4:]
+except ValueError:
+    valid = False
+sys.exit(0 if valid else 1)
+PYIDS
+}
+if [ "$BACKEND" = ccr ] && [ "$ATTACH" != 1 ] && [ "$MODE" = --resume-session ]; then
+  [ -n "$EXPECTED_PARENT" ] || die4 "--resume-session requires --expected-parent-job; resolve the session head before preparing this round's prompt"
+  valid_resume_identity "$RESUME_SESSION" "$EXPECTED_PARENT" || die4 "resume requires a canonical session UUID and ccr-UUID parent job"
 fi
 for v in STALL_MIN MAX_MIN POLL MAX_TURNS; do
   eval "val=\$$v"
@@ -602,7 +617,11 @@ rotate_previous_attempt() {
     # .detached and .childexit belong to the attempt too: a record left behind would make a bogus
     # --attach admissible against the NEXT, live attempt, and a stale receipt would let it publish
     # a terminal outcome from the previous run's exit status.
-    for ext in stdout stderr progress joblog meta exit detached childexit ccr-attempt.json ccr-receipt.json ccr-prompt ccr-result.json ccr-errorlog ccr-submit.stderr; do [ -e "$PREFIX.$ext" ] && mv "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
+    for ext in stdout stderr progress joblog meta exit detached childexit ccr-attempt.json ccr-receipt.json ccr-receipt.observed ccr-recovery-receipt.json ccr-admission-conflict.json ccr-prompt ccr-result.json ccr-errorlog ccr-submit.stderr; do [ -e "$PREFIX.$ext" ] && mv "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
+    for observation in "$PREFIX.ccr-observation."* "$PREFIX.ccr-capture."*; do
+      [ -e "$observation" ] || continue
+      mv "$observation" "$PREFIX.attempt$N.${observation#"$PREFIX."}"
+    done
     echo "codex-run.sh: previous attempt rotated to $PREFIX.attempt$N.*"
   fi
 }
@@ -718,6 +737,9 @@ if [ "$ATTACH" = 1 ]; then
   ALIVE=1; IDENT_NOTE=""; IDENT_STATE=0
   if [ "$BACKEND" = ccr ]; then
     JOB_ID="$JOB"; CCR_SESSION=$(exec 9>&-; detached_field session)
+    ATTEMPT_JSON=$(exec 9>&-; python3 "$CCR_HELPER" verify-attempt "$PREFIX" "$JOB_ID") || exit 6
+    RESUME_SESSION=$(exec 9>&-; ccr_job_field "$ATTEMPT_JSON" requested_resume_session)
+    if [ -n "$RESUME_SESSION" ]; then MODE=--resume-session; else MODE=--fresh; fi
     JOB_JSON=$(exec 9>&-; ccr_job_json "$JOB_ID")
     case "$(exec 9>&-; ccr_job_state "$JOB_JSON")" in
       running) ALIVE=1;;
@@ -781,11 +803,9 @@ if [ "$BACKEND" = ccr ]; then
   ccr_preflight "$ALIAS" || launch_error "$REASON" "$CMD"
   ccr_smoke_check "$DIR" "$ALIAS" || launch_error "$REASON" "$CMD"
   SESSION=""
-  if [ "$MODE" = "--resume-last" ]; then
-    SESSION=$(exec 9>&-; cat "$DIR/.ccr-last-session" 2>/dev/null | head -1 | tr -d ' ')
-    [ -n "$SESSION" ] || launch_error "--resume-last: no previous ccr session recorded in $DIR/.ccr-last-session" "$CMD"
-  elif [ "$MODE" = "--resume-session" ]; then SESSION="$RESUME_SESSION"; fi
+  if [ "$MODE" = "--resume-session" ]; then SESSION="$RESUME_SESSION"; fi
   ccr_launch_argv "$ALIAS" "$MAX_TURNS" "$PROMPT_FILE"
+  if [ -n "$SESSION" ]; then ARGV+=("--resume=$SESSION" "--expected-parent-job=$EXPECTED_PARENT"); fi
   stamp_claim; rotate_previous_attempt
   : > "$PREFIX.progress"; : > "$PREFIX.stderr"; : > "$PREFIX.joblog"
   ADMISSION_WAIT=$(( MAX_MIN*60 - $(exec 9>&-; elapsed) ))
@@ -1000,6 +1020,8 @@ EOD
     echo "outcome=$OUTCOME"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "detached=no"; echo "attached=${ATTEMPTS:-0}"
     [ -z "${IDENT_NOTE:-}" ] || echo "identity_note=$IDENT_NOTE"; echo "provider=$PROVIDER"; echo "provider_model=$PROVIDER_MODEL"
     echo "claude_model_id=$CLAUDE_MODEL"; echo "routed_model=${ROUTED_MODEL:-unknown}"; echo "route_identity=$ROUTE_OK"; echo "compatibility=$COMPAT"; echo "ccr_version=$CCR_VER"
+    echo "submission_id=$(exec 9>&-; ccr_job_field "$JOB_JSON" submission_id)"; echo "requested_resume_session=$(exec 9>&-; ccr_job_field "$JOB_JSON" requested_resume_session)"; echo "resumed_from=$(exec 9>&-; ccr_job_field "$JOB_JSON" resumed_from)"
+    echo "workload_disposition=$(exec 9>&-; ccr_job_field "$JOB_JSON" workload_disposition)"; echo "reason_code=$(exec 9>&-; ccr_job_field "$JOB_JSON" reason_code)"
     echo "job=$JOB_ID"; echo "session=$CCR_SESSION"; echo "child_exit=$CHILD_RC"; echo "thread=${SESSION_ID:-unknown}"
     # CCR reports what it cleaned up separately from what the workload returned, and an empty
     # survivor list is NOT a claim that everything was cleaned up. Both facts are recorded here

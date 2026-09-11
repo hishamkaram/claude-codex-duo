@@ -89,7 +89,7 @@ if not. `--solo` skips the probe and records SOLO.
 
 ## ccr backend (`--via ccr:<alias>`)
 
-The gateway is the user's `ccr` (claude-code-router, >= 0.5.1). Aliases are machine-local
+The gateway is the user's `ccr` (claude-code-router, >= 0.6.0). Aliases are machine-local
 (`ccr model list`); never write one into a shipped file, and never default to one. The runner's
 launch line is fixed and is the only one the plugin ever uses:
 
@@ -110,10 +110,9 @@ prompt that asks for a write by the Write tool and by Bash) and records `readonl
 `<dir>/.ccr-smoke.<alias>`; every ccr launch in that directory refuses to start (exit 4) unless a
 matching record exists (same alias, provider model, CCR-generated child model ID, observed child init model, ccr version and launch-line digest). One smoke per alias per run. The configured alias is the only value passed to `ccr launch --model` before `--`; `provider_model` is descriptive, never a child CLI argument. The runner accepts a completed launch only when the child init model equals `claude_model_id`; a mismatch is `UNAVAILABLE` without an alias or Claude fallback.
 
-CCR currently supports fresh detached jobs in this runner. Resume requests fail with
-exit 4 before admission or claim mutation. Record `continuity=unavailable` and explicitly
-choose `--fresh` for later CCR rounds, carrying the previous response and ledger in the
-self-contained prompt. Codex resume behavior is unchanged.
+CCR resumes later rounds using the original session and an explicit expected parent job.
+Resolve that head before preparing the next prompt. A changed or unresolved head refuses
+continuation; it never silently becomes a fresh exchange. Codex resume is unchanged.
 
 The receipt binds job and session IDs. Initialization, result, and model identities must
 agree before success is accepted. CCR alone owns workload cancellation. Watch expiry
@@ -127,7 +126,10 @@ Plan mode's own plan file under `~/.claude/plans/` is the one write a ccr child 
 the artifact directory (Claude Code writes it when a plan-mode session ends); it holds nothing
 the run relies on.
 
-## Thread semantics
+## Codex thread semantics
+
+These fallback rules apply only to the Codex companion. CCR continuation follows the
+durable contract below and never silently changes sessions.
 
 - Round 0: `--fresh`, so no earlier Codex thread in this repo leaks in.
 - Rounds 1–3: `--resume-last`, so Codex keeps its own positions. Any probe between rounds breaks the
@@ -166,3 +168,42 @@ Collectors use a kernel lease on the persistent `.claim.lock` file. Do not delet
 that file. Drain legacy directory locks and unfinished legacy attempts before
 upgrading. Partial cleanup coverage cannot exclude escaped descendants; an empty
 observed survivor list does not establish that escaped tool processes are absent.
+
+## Durable CCR continuation
+
+Before preparing each continuation prompt, resolve that participant's session head:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ccr-job.py" resolve-session "$ART/next-anchor" "$SID"
+PARENT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["expected_parent_job"])' "$ART/next-anchor.ccr-anchor.json")
+```
+
+Retain the anchor with the round. Then prepare its prompt and launch with
+`--via ccr:<alias> --resume-session "$SID" --expected-parent-job "$PARENT"`.
+Every round has a new job and submission identity; its session stays the same.
+A changed head is refused by CCR. Never select an older successful job to bypass a
+newer unresolved attempt. Keep separate anchors for separate participants.
+
+The private attempt persists its submission token and complete invocation before admission.
+Attach recovers a lost receipt through read-only submission status; it never submits another
+workload. An unavailable lookup remains unresolved with no terminal `.exit`.
+A proven aborted `not_started` admission may close as failure without inventing a child exit.
+Successful output is restricted to CCR's committed byte boundary and verified digest.
+
+Fresh retry is a separate, explicitly recorded caller decision. For CCR, permit at most one
+fresh retry after a positively stopped `startup_failed` attempt; use a new prefix, submission,
+and session and preserve both observations. Missing/unknown failure codes, owner loss,
+identity mismatch, or uncertain admission do not authorize this retry. Fresh success does
+not establish why the earlier attempt failed. Never infer missing history from stderr.
+
+If status identifies a prepared transactional admission whose owner was lost, an explicit
+recovery can finish that same admission:
+
+```bash
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ccr-job.py" complete-admission "$PREFIX"
+```
+
+This uses the saved complete invocation, prompt digest, and original submission token.
+CCR checks the request, execution configuration, leases, and execution boundary. It cannot
+create a replacement job. Ordinary attach remains read-only; after recovery, attach to
+collect the original job. Missing lookup evidence remains unresolved.

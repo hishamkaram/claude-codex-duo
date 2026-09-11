@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Stateful job-protocol fixture. Never supervises or signals processes."""
 import json
+import hashlib
 import fcntl
 import os
 from pathlib import Path
@@ -20,14 +21,35 @@ def write(path, data):
 
 
 if args[0] == "launch":
-    if "--detach" not in args or "--prompt-file" not in args or any(a.startswith("--resume") for a in args):
-        sys.exit("fixture requires fresh durable prompt-file launch")
+    if "--detach" not in args or "--prompt-file" not in args:
+        sys.exit("fixture requires durable prompt-file launch")
     alias = args[args.index("--model") + 1]
     prompt = Path(args[args.index("--prompt-file") + 1]).read_bytes()
     for variable, content in (("FAKE_CCR_ARGV_OUT", "\n".join(args[1:]).encode()), ("FAKE_CCR_STDIN_OUT", prompt)):
         if os.environ.get(variable):
             Path(os.environ[variable]).write_bytes(content)
-    jid, sid = "ccr-" + str(uuid.uuid4()), os.environ.get("FAKE_CCR_SESSION", str(uuid.uuid4()))
+    submission = next((a.split("=", 1)[1] for a in args if a.startswith("--submission-id=")), "")
+    resumed = next((a.split("=", 1)[1] for a in args if a.startswith("--resume=")), "")
+    parent = next((a.split("=", 1)[1] for a in args if a.startswith("--expected-parent-job=")), "")
+    bindings = root / "submissions"
+    bindings.mkdir(exist_ok=True)
+    key = bindings / hashlib.sha256(submission.encode()).hexdigest()
+    request = hashlib.sha256(prompt + json.dumps(args).encode()).hexdigest()
+    if key.exists():
+        bound = json.loads(key.read_text())
+        if bound["request"] != request:
+            sys.exit("submission conflict")
+        print(json.dumps(bound["receipt"]))
+        sys.exit(0)
+    heads = root / "heads"
+    heads.mkdir(exist_ok=True)
+    if resumed:
+        if (heads / resumed).read_text() != parent:
+            sys.exit("stale expected parent")
+        previous = json.loads((root / (parent + ".json")).read_text())
+        if previous["session_id"] != resumed or previous["status"] == "running":
+            sys.exit("parent conflict")
+    jid, sid = "ccr-" + str(uuid.uuid4()), resumed or os.environ.get("FAKE_CCR_SESSION", str(uuid.uuid4()))
     mode = os.environ.get("FAKE_CCR_MODE", "ok")
     log = root / (jid + ".log")
     init = dict(type="system", subtype="init", session_id=sid,
@@ -46,20 +68,31 @@ if args[0] == "launch":
         import re
         match = re.search(r"echo hello > (.*smoke-outside\.txt)", prompt.decode())
         Path(match[1]).write_text("hello")
-    record = dict(schema_version=1, job_id=jid, session_id=sid, status="running",
+    record = dict(schema_version=2, submission_id=submission, requested_resume_session=resumed, resumed_from=parent, resumed_from_status=(previous["status"] if resumed else ""), admission_state="execution_possible", workload_disposition="unknown", job_id=jid, session_id=sid, status="running",
                   exit_code=None, log=str(log), error_log=str(err), containment="process-group",
                   cleanup=dict(coverage="unknown", survivors=[], observed=[], reason="running"),
                   fixture_mode=mode, fixture_started=time.time(),
                   fixture_delay=float(os.environ.get("FAKE_CCR_SLEEP", "75")))
+    record["result_evidence"] = dict(boundary=log.stat().st_size, sha256=hashlib.sha256(log.read_bytes()).hexdigest(), session_id=sid, model=init["model"], successful=mode not in ("error_result", "noresult", "fail"))
     write(root / (jid + ".json"), record)
+    (heads / sid).write_text(jid)
+    write(key, dict(request=request, receipt=dict(submission_id=submission, job_id=jid, session_id=sid)))
     hang = os.environ.get("FAKE_CCR_HANG_RECEIPT")
     if hang == "partial":
         print('{"job_id":', end="", flush=True)
-    elif mode != "receipt_lost" and hang != "none":
-        print(json.dumps(dict(job_id=jid, session_id=sid)), flush=True)
+    elif mode != "receipt_lost" and hang != "none" and not os.environ.get("FAKE_CCR_DROP_RECEIPT"):
+        print(json.dumps(dict(submission_id=submission, job_id=jid, session_id=sid)), flush=True)
     if hang:
         time.sleep(60)
 elif args[0] in ("status", "cancel"):
+    if args[1].startswith("--session-id="):
+        args[1] = (root / "heads" / args[1].split("=", 1)[1]).read_text()
+    if args[1].startswith("--submission-id="):
+        submission = args[1].split("=", 1)[1]
+        bound = json.loads((root / "submissions" / hashlib.sha256(submission.encode()).hexdigest()).read_text())
+        args[1] = bound["receipt"]["job_id"]
+        if json.loads((root / (args[1] + ".json")).read_text())["fixture_mode"] == "receipt_lost":
+            sys.exit("fixture admission lookup unavailable")
     path = root / (args[1] + ".json")
     with open(str(path) + ".lock", "a") as lease:
         fcntl.flock(lease, fcntl.LOCK_EX)
@@ -69,8 +102,10 @@ elif args[0] in ("status", "cancel"):
             record.update(status="cancelled", exit_code=137)
         elif record["status"] == "running" and mode not in ("sleep", "grandchild", "receipt_lost"):
             if mode != "slowok" or time.time() - record["fixture_started"] >= record["fixture_delay"]:
-                record.update(status="failed" if mode == "fail" else "completed", exit_code=1 if mode == "fail" else 0)
+                failed = mode in ("fail", "error_result", "noresult")
+                record.update(status="failed" if failed else "completed", exit_code=1 if failed else 0)
         if record["status"] != "running":
+            record.update(admission_state="finished", workload_disposition="stopped")
             record["cleanup"] = dict(coverage="partial", survivors=[], observed=["launch_pgid_members"], reason="")
         write(path, record)
         if os.environ.get("FAKE_CCR_BAD_STATUS"):
