@@ -66,14 +66,15 @@ upstream "model is at capacity" is transient: retry once).
 
 ## ccr backend (`--via ccr:<alias>`)
 
-The gateway is the user's `ccr` (claude-code-router, >= 0.4.11). Aliases are
+The gateway is the user's `ccr` (claude-code-router, >= 0.5.1). Aliases are
 machine-local (`ccr model list`); never write one into a shipped file and never
 default to one. The runner's launch line is fixed:
 
 ```
-ccr launch --model <alias> --permission-mode plan -p --no-lifecycle --no-statusline -- \
-  --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
-  --disallowedTools Write,Edit,MultiEdit,NotebookEdit,Agent --max-turns <N> [--resume <session>]
+ccr launch --model <alias> --permission-mode plan -p --no-lifecycle --no-statusline \
+  --detach --prompt-file <file> --output-format=stream-json --verbose \
+  --strict-mcp-config --mcp-config='{"mcpServers":{}}' \
+  --disallowedTools=Write,Edit,MultiEdit,NotebookEdit,Agent --max-turns=<N>
 ```
 
 Read-only rests on `--permission-mode plan` first (Claude Code's own permission
@@ -95,14 +96,18 @@ with another alias and never fall back to Claude; the registration belongs to
 ccr. `.meta` records `alias=`, `provider=`, `provider_model=`,
 `claude_model_id=`, `routed_model=`, `route_identity=` alongside `prompt_file=`.
 
-`thread=` in `.meta` is the child's `session_id`;
-`--resume-last` resumes `<dir>/.ccr-last-session`, `--resume-session <id>`
-names a session, `--fresh` starts one. `--max-turns <N>` (default 100) is
-ccr-only. `.progress` opens with `launched backend=ccr pid=<pid> pgid=<pgid>
-alias=<alias>`; the child runs in its own process group, which stall or timeout
-signals as a whole. Sidecar names, meaning and the exit table are identical.
-The `--model`/`--effort` prohibition below is about the codex backend; for ccr
-the alias is the model choice and it is the user's.
+CCR uses fresh detached jobs in this release. Resume options fail with exit 4 before
+admission or claim mutation. Record `continuity=unavailable` for each later CCR round and
+explicitly choose `--fresh`, including the previous response and ledger in the prompt.
+The Codex backend retains its existing resume behavior.
+
+The receipt binds the job and session IDs; initialization, result, and route identities
+must agree. Watch expiry only detaches. A stall requests cancellation by job ID.
+Unknown admission, unknown cleanup, missing exit evidence, or survivors retain the
+attempt and claim without a terminal `.exit`. Partial coverage remains visible.
+The private `.ccr-attempt.json` and receipt support immediate attach after watcher death;
+`.ccr-result.json` commits the result bytes. Never relaunch an unresolved attempt.
+Drain legacy process-based attempts using their original runner before upgrading.
 
 ## Thread semantics
 
@@ -122,11 +127,9 @@ participant: `02-blind-p<k>.*` for the blind take, `03-round-<n>-p<k>.*` for a r
 
 - The single codex participant (at most one) keeps `--resume-last`: the companion resumes the
   most recent thread in the repository, so no other codex call may run between its rounds.
-- Every ccr participant resumes by explicit id: `--via ccr:<alias> --resume-session <id>`,
-  where `<id>` is the `thread=` line of that participant's previous `.meta` (its blind take, or
-  its last round). Never `--resume-last` for a ccr participant when two ccr participants share
-  the directory: `.ccr-last-session` is the directory's last completed ccr launch, which may be
-  the other participant's.
+- Every CCR participant uses explicitly recorded self-contained `--fresh` rounds in
+  this release. Keep each participant's previous response and evidence in its own prompt;
+  resume requests are rejected before admission.
 - Record `thread=` of every launch in the round file; a round whose `.meta` `thread=` differs
   from the participant's previous one lost its session — rule on it as a self-contained
   round and say so.
@@ -163,3 +166,15 @@ splits a single raw argument and parses any `--resume`, `--write`, or
 
 - zsh treats `$VAR:x` as a modifier (`:u` uppercases, `:h` dirname…); always brace: `${TREE}:path`.
 - Shell state does not persist between tool calls; re-derive variables each call.
+
+CCR admission observation is bounded to 30 seconds and the remaining watch or
+smoke budget. Expiry ends only the submitting CLI, retains admission evidence,
+and reports unresolved admission; it never cancels the detached job or permits
+resubmission. Attach observes the original receipt when one was saved.
+Workload stderr is frozen separately in `.ccr-errorlog`, with submission diagnostics
+in `.ccr-submit.stderr`; `.stderr` exposes their combined diagnostics without
+repeating them on attach. The committed evidence checks both stream digests.
+Collectors use a kernel lease on the persistent `.claim.lock` file. Do not delete
+that file. Drain legacy directory locks and unfinished legacy attempts before
+upgrading. Partial cleanup coverage cannot exclude escaped descendants; an empty
+observed survivor list does not establish that escaped tool processes are absent.

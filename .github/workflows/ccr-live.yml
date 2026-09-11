@@ -1,0 +1,75 @@
+name: Real CCR lifecycle
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  lifecycle:
+    name: ${{ matrix.os }} / ${{ matrix.containment }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            containment: process-group
+          - os: ubuntu-latest
+            containment: systemd-scope
+          - os: ubuntu-latest
+            containment: process-group
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out CCR 0.5.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: hishamkaram/claude-code-router
+          ref: d17d9bde76530fe5de845ec5f8c12a4c84595b0f
+          path: .live-ccr
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: .live-ccr/go.mod
+          cache-dependency-path: .live-ccr/go.sum
+      - name: Build pinned CCR and install real Claude Code
+        working-directory: .live-ccr
+        run: |
+          mkdir -p "$RUNNER_TEMP/ccr-bin"
+          go build -ldflags '-X github.com/hishamkaram/claude-code-router/internal/buildinfo.Version=0.5.1 -X github.com/hishamkaram/claude-code-router/internal/buildinfo.Commit=d17d9bde76530fe5de845ec5f8c12a4c84595b0f' -o "$RUNNER_TEMP/ccr-bin/ccr" ./cmd/ccr
+          echo "$RUNNER_TEMP/ccr-bin" >> "$GITHUB_PATH"
+          npm install --global @anthropic-ai/claude-code@latest
+      - name: Provision Linux user manager
+        if: runner.os == 'Linux' && matrix.containment == 'systemd-scope'
+        run: |
+          sudo loginctl enable-linger "$(id -un)"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "$GITHUB_ENV"
+      - name: Force Linux process-group fallback
+        if: runner.os == 'Linux' && matrix.containment == 'process-group'
+        run: echo "DBUS_SESSION_BUS_ADDRESS=unix:path=$RUNNER_TEMP/no-user-bus" >> "$GITHUB_ENV"
+      - name: Verify Linux systemd readiness
+        if: runner.os == 'Linux' && matrix.containment == 'systemd-scope'
+        run: timeout 30s bash -c 'until busctl --user status org.freedesktop.systemd1 >/dev/null 2>&1; do sleep 0.1; done'
+      - name: Populated process-group cancellation regression
+        working-directory: .live-ccr
+        run: go test -tags=live -race -count=1 -timeout 2m -v ./internal/jobs -run '^TestOwnedProcessGroupCancellationSettles$'
+      - name: Real CLI admission, watcher loss, attach and cancellation
+        run: python3 scripts/test-ccr-live.py --artifacts "$RUNNER_TEMP/ccr-live" --containment '${{ matrix.containment }}'
+      - name: Preserve redacted lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ccr-live-${{ matrix.os }}-${{ matrix.containment }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/ccr-live/PASS.json
+            ${{ runner.temp }}/ccr-live/versions.json
+            ${{ runner.temp }}/ccr-live/*.ready.json
+            ${{ runner.temp }}/ccr-live/cancel.final.json
+            ${{ runner.temp }}/ccr-live/sentinel.after.json
+            ${{ runner.temp }}/ccr-live/*.control*
+            ${{ runner.temp }}/ccr-live/probe.stdout
+            ${{ runner.temp }}/ccr-live/probe.stderr

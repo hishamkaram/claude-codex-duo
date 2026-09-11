@@ -49,27 +49,19 @@
 #                           backend, the job or process identity and its start time, the original
 #                           launch mode, the prompt digest, and the verbatim attach and cancel
 #                           commands. Removed when an attach publishes the terminal outcome.
-#   <out-prefix>.childexit  ccr only: the supervisor's receipt, `child_exit=<rc>`, published
-#                           atomically when the child is reaped. An attaching process is not the
-#                           child's parent and cannot wait() for it, so the success predicate
-#                           (child exit 0 AND a successful result event) reads the receipt.
 #   Exit 4 with NO sidecar written: another runner already took <out-prefix>.claim/, or (--claim)
 #   no claim exists / the arguments are invalid.
 #   ccr backend also writes <dir>/.ccr-last-session (the session id --resume-last resumes).
 #
-# Safety: refuses --write. Cancels the job on STALLED — no log activity for --stall-min is a
-# determination that the job is wedged — but NOT when --max-min elapses: that bound is the
-# watcher's own, and says nothing about the job. The watch then detaches (exit 6) and leaves the
-# job running to be re-attached. A ccr child runs in its own process group, under a supervisor
-# that owns it and publishes its exit status, so the whole tree is still signalled on a stall and
-# its pgid and start time are recorded. A recorded pid or pgid is never signalled on the strength
-# of the record alone: identity is proved against the live process's start time first, because a
-# number recorded minutes ago may name something else entirely.
-# Run it with the caller's background execution (Claude Code: run_in_background) so a foreground
-# shell limit can never kill the worker mid-turn.
+# CCR owns workload lifecycle. A stall requests cancellation by job ID; a watch
+# deadline only detaches the collector. Unknown admission or cleanup retains the
+# attempt and claim. Process inspection below coordinates collectors only.
 
 set -u
-CCR_MIN_VERSION="0.4.11"
+umask 077
+# The job API arrived in 0.5.0; 0.5.1 fixes process-group cleanup observation.
+CCR_MIN_VERSION="0.5.1"
+CCR_HELPER="$(cd "$(dirname "$0")" && pwd)/ccr-job.py"
 # These are assigned inside ccr_preflight, past its early-return failures. The attach path is
 # allowed to run without a successful preflight (the child is already going), so under `set -u`
 # every reader below would abort the collector mid-publication. Declare them empty up front: an
@@ -79,13 +71,43 @@ CCR_MAX_TURNS_DEFAULT=100
 # The exact read-only launch line for the ccr backend. It is the one line every ccr participant
 # runs and the one line the probe's smoke verifies; its digest is part of the smoke record so a
 # changed line invalidates every earlier smoke.
-ccr_launch_argv() {  # <alias> <max-turns> [session-id]
-  printf '%s\n' ccr launch --model "$1" --permission-mode plan -p --no-lifecycle --no-statusline -- \
-    --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
-    --disallowedTools Write,Edit,MultiEdit,NotebookEdit,Agent --max-turns "$2"
-  [ -z "${3:-}" ] || printf '%s\n' --resume "$3"
+# Use one stable argv shape and the detached prompt-file transport. CCR also
+# accepts separated values; the equals form here is a serialization choice.
+ccr_launch_argv() {  # <alias> <max-turns> <prompt-file>
+  ARGV=(ccr launch --model "$1" --permission-mode plan -p --no-lifecycle --no-statusline
+    --detach --prompt-file "$3" --output-format=stream-json --verbose --strict-mcp-config
+    --mcp-config='{"mcpServers":{}}' --disallowedTools=Write,Edit,MultiEdit,NotebookEdit,Agent
+    --max-turns="$2")
 }
-ccr_launch_digest() { ccr_launch_argv ALIAS N | shasum -a 256 | cut -c1-16; }
+# The digest pins the SHAPE of the launch line, so the prompt path — which differs per run — is
+# held constant here exactly as the alias and turn budget are.
+ccr_launch_digest() { ccr_launch_argv ALIAS N PROMPT; printf '%s\0' "${ARGV[@]}" | shasum -a 256 | cut -c1-16; }
+# --- the CCR job API: the runner asks, it never infers ---------------------------------------
+# Every question this runner used to answer by reading the process table — is it alive, did it
+# end, what was its exit status, is anything left — is answered here by the process that owns the
+# job. `ccr status` is the authority; a query that FAILS is undetermined and never means "ended".
+ccr_job_json() { python3 "$CCR_HELPER" status "${CCR_ATTEMPT_PREFIX:-$PREFIX}" "$1" 2>/dev/null; }
+ccr_job_cancel() { python3 "$CCR_HELPER" cancel "${CCR_ATTEMPT_PREFIX:-$PREFIX}" "$1"; }
+ccr_job_field() {  # <json> <dotted-field> -> value, empty when absent or unreadable
+  printf '%s' "$1" | python3 -c 'import sys,json
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit
+cur=d
+for k in sys.argv[1].split("."):
+    if not isinstance(cur,dict) or k not in cur: raise SystemExit
+    cur=cur[k]
+if cur is None: raise SystemExit
+if isinstance(cur,(list,dict)): print(json.dumps(cur,separators=(",",":")))
+else: print(cur)' "$2" 2>/dev/null
+}
+# CCR's own status vocabulary, mapped to the three answers this runner acts on. Anything it does
+# not recognise — including a status query that failed outright — is UNDETERMINED, which keeps the
+# attempt in flight rather than closing it.
+ccr_job_state() {
+  local answer
+  answer=$(printf '%s' "$1" | python3 "$CCR_HELPER" state 2>/dev/null) || answer=undetermined
+  printf '%s\n' "$answer"
+}
 codex_root() {
   python3 -c 'import json,os,glob
 p=os.path.expanduser("~/.claude/plugins/installed_plugins.json")
@@ -150,59 +172,6 @@ ccr_smoke_check() {  # <dir> <alias>  (needs ccr_preflight first)
   grep -qxF "launch_sha256=$(ccr_launch_digest)" "$f" || { REASON="ccr smoke for $2 was recorded for another launch line; re-run the probe"; return 1; }
   return 0
 }
-# Start a command in its own process group; echoes nothing, sets CHILD (pid) — pgid == pid.
-# exec, so that when it is called as `start_in_own_group … &` the background pid IS the child (and its pgid).
-start_in_own_group() { exec python3 -c 'import os,sys; os.setpgrp(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"; }
-# The ccr backend's durable owner. The supervisor leads the job's process group, forks the child
-# that execs the gateway (inheriting the redirections the caller set up), waits for it, and
-# publishes `child_exit=<rc>` atomically. It exists because an attaching process is NOT the
-# child's parent and can never wait() for it: without this receipt the success predicate below
-# would have to drop its exit-status condition, silently weakening a contract an earlier review
-# tightened on purpose. The supervisor never signals the child; only kill_group does, on a stall.
-start_supervised_group() {  # <receipt> <argv...>
-  exec python3 -c '
-import os, signal, subprocess, sys
-os.setpgrp()                       # pgid == this pid, so the runner is auditing one number
-receipt, argv = sys.argv[1], sys.argv[2:]
-
-def publish(rc):
-    tmp = receipt + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            f.write("child_exit=%d\n" % rc); f.flush(); os.fsync(f.fileno())
-        os.replace(tmp, receipt)   # atomic: an attach never reads a half-written receipt
-    except OSError as e:
-        sys.stderr.write("supervisor: cannot publish receipt: %s\n" % e)
-
-try:
-    child = subprocess.Popen(argv) # stdin/stdout/stderr inherited from the shell redirections
-except OSError as e:
-    sys.stderr.write("supervisor: cannot start child: %s\n" % e); publish(127); sys.exit(127)
-
-# A group cancel signals every member, the supervisor included. Dying here without a receipt
-# would leave the attempt permanently uncollectable: .detached would stay, the claim would stay
-# closed, and every later attach would find no receipt and re-detach forever (cycle 2: CL-03,
-# CX-03). So the terminating signal is caught, the child is given a bounded chance to land
-# (shorter than kill_groups escalation to KILL), and a receipt is published either way.
-# The supervisor OUTLIVES these signals, because its single obligation is to reap this child and
-# publish what it actually returned. Two earlier attempts at this were both wrong. Dying on the
-# signal published nothing, and the attempt then wedged forever: .detached kept, the claim closed,
-# every attach re-detaching (cycle 2: CL-03). Catching it and writing a status after a bounded
-# wait published a LIE — `Popen.wait()` called from the handler cannot acquire the reaping lock the
-# main thread already holds, so it always timed out, and `child_exit=-15` was written for a child
-# that was still running (cycle 3: CX-03, reproduced). Ignoring them is what is actually wanted:
-# a group TERM reaches the child directly, the main wait() below returns its real status, and the
-# receipt is true. SIGKILL remains uncatchable — the collector proves that case from an empty
-# process group instead. This is set AFTER Popen on purpose: an ignored disposition is inherited
-# across exec, and the child must stay killable by the TERM that kill_group sends.
-for _s in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
-    signal.signal(_s, signal.SIG_IGN)
-
-rc = child.wait()
-publish(rc)
-sys.exit(rc if rc >= 0 else 128 - rc)
-' "$@"
-}
 # Process identity. A pid or pgid recorded minutes ago may name an unrelated process by the time
 # an attach reads it, so a number is never acted on alone: it is paired with the start time the
 # kernel reports for it, and the pair must still match. `ps -o lstart=` is the one field both BSD
@@ -227,117 +196,6 @@ identity_state() {  # <pid> <recorded identity>
   [ -n "$live" ] || return 1
   [ "$live" = "$2" ] || return 2
   return 0
-}
-# The comment above says an empty `ps` may mean inspection FAILED rather than the process exited —
-# and then every caller collapsed that into state 1 and acted on it. For the collector that is
-# safe (it refuses either way), but the lock reclaimer read state 1 as "the holder is dead" and
-# took a live collector's lock, admitting a second one (cycle 5: CX-05). This separates the two:
-# process inspection is proved to WORK, by asking it about a process that certainly exists — this
-# one — before an absent answer about someone else is allowed to mean absence.
-identity_is_readable() {  # 0 when `ps` can identify a process we know is alive
-  [ -n "$(proc_identity "$$")" ]
-}
-holder_is_provably_gone() {  # <pid> <recorded identity> -> 0 only on a PROVEN absence or reuse
-  identity_state "$1" "$2" && return 1     # state 0: alive and ours — definitely not gone
-  case $? in
-    2) return 0;;                          # the number now names a different execution: ours ended
-    *) identity_is_readable;;              # state 1: absence counts only if `ps` is working at all
-  esac
-}
-pgid_of() { ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
-# ============================================================================================
-# THE ONLY GATE THROUGH WHICH THIS SCRIPT MAY SIGNAL A PROCESS GROUP
-# ============================================================================================
-# `kill -- "-N"` does not mean "the group N" for every N. POSIX gives two values a session-wide
-# meaning, and both are catastrophic here:
-#
-#   N = 1  -> EVERY process the user is permitted to signal. On macOS that is the whole login
-#             session: the terminal, the editor, the browser, the password manager, and
-#             loginwindow itself, which then relaunches the GUI.
-#   N = 0  -> the SENDER's own process group: the invoking shell and every sibling job in it.
-#
-# So a process-group number is not a safe signal target merely because it is a number. It is safe
-# only when it is a plausible group id AND it is still the group of a process this runner recorded
-# and identity-proved. Everything else refuses: an unverifiable target is never signalled.
-#
-# This existed because the --attach path reads `pgid=` straight out of <prefix>.detached and every
-# other PGID assignment in this file is checked while that one was not, and because the identity
-# check that authorises a cancel proves `pid=` and then signals `pgid=` — a different field. A
-# record carrying `pgid=1` (a truncated write, a stale file, a hand edit, or a test fixture — one
-# was found on disk) therefore reached `kill -TERM -- -1`.
-pgid_is_signalable() {  # <pgid> [owner-pid] -> 0 only when signalling this group is provably safe
-  local pg="$1" owner="${2:-}" self
-  case "$pg" in ''|*[!0-9]*) return 1;; esac        # empty, negative or non-numeric
-  [ "$pg" -ge 2 ] 2>/dev/null || return 1           # 0 = our own group, 1 = every process we own
-  [ "$pg" != "$$" ] || return 1                     # never this process
-  self=$(pgid_of "$$"); [ -z "$self" ] || [ "$pg" != "$self" ] || return 1   # never our own group
-  # Ownership: the group must STILL be the process group of the pid this runner recorded and
-  # proved. This is what makes a stale or corrupt `pgid=` inert rather than lethal.
-  if [ -n "$owner" ]; then
-    case "$owner" in ''|*[!0-9]*) return 1;; esac
-    [ "$(pgid_of "$owner")" = "$pg" ] || return 1
-  fi
-  return 0
-}
-refuse_signal() {  # <pgid> <context>
-  echo "codex-run.sh: REFUSING to signal process group '${1:-<empty>}' from $2 — it is not a verified job group. Nothing was signalled. (0 would signal this shell's own process group; 1 would signal every process this user owns, which on macOS ends the login session.)" >&2
-  [ -z "${PREFIX:-}" ] || echo "$(elapsed)s REFUSED-SIGNAL pgid='${1:-<empty>}' ($2): not a verified job group; nothing signalled" >> "$PREFIX.progress" 2>/dev/null || true
-}
-# Liveness is asked the same way, and about the same verified target: `kill -0 -- "-1"` is a
-# permission probe against every process on the machine and would answer "alive" for a group that
-# does not exist, which would in turn keep a finished attempt open forever.
-group_alive() {  # <pgid> [owner-pid] -> 0 only when the group is BOTH signalable and alive
-  pgid_is_signalable "$1" "${2:-}" || return 1
-  kill -0 -- "-$1" 2>/dev/null
-}
-# group_alive answers "may I signal this, and is it there" — a refusal and an empty group are the
-# same answer (1), so `! group_alive` is NOT a proof of emptiness. Every caller that closes an
-# attempt needs that proof, and reaches it on paths where the owner pid is already gone and the
-# gate therefore refuses unconditionally: `! group_alive` would be vacuously true and would close
-# a live job (cycle 4: F-01/CL-01/CX-02). So emptiness is asked separately, by READING the process
-# table and never by signalling. Soundness runs one way only: a pgid can be reused, which can make
-# a dead group look alive but never a live one look dead. Undetermined answers — a non-numeric or
-# sentinel pgid, or a ps that told us nothing — return 1 (not provably empty), so callers stay in
-# flight rather than closing on an unproven termination.
-# Two ways this predicate could have said "empty" about a live group, both fixed here
-# (cycle 5: CX-04). (1) `ps … | tr …` reports TR's status, so a ps that failed — or that died
-# part-way through printing, leaving a partial table that happens to omit this group — was read as
-# a complete answer; the raw ps output is now captured on its own and its status checked, and a
-# truncated-looking table is treated as undetermined. (2) The pgid was compared as TEXT, so a
-# zero-padded `012345` passed the numeric guard and then matched nothing in a table that says
-# `12345`. Both are normalized to base-10 integers before the comparison. Every uncertain answer
-# is 1 (NOT provably empty), which keeps callers in flight rather than closing a running job.
-group_is_empty() {  # <pgid> -> 0 only when the process table proves no member is left
-  local pg="$1" raw rc norm self
-  case "$pg" in ''|*[!0-9]*) return 1;; esac
-  pg=$((10#$pg))                      # 012345 and 12345 are the same group; the table prints one form
-  [ "$pg" -ge 2 ] 2>/dev/null || return 1
-  raw=$(ps -Ao pgid= 2>/dev/null); rc=$?
-  [ "$rc" = 0 ] || return 1           # ps failed: undetermined, never "empty"
-  # Both sides are normalized to base-10 before anything is compared, so the answer is about the
-  # group and not about how its number happens to be spelled.
-  norm=$(printf '%s\n' "$raw" | tr -d ' ' | grep -E '^[0-9]+$' | sed 's/^0*\([0-9]\)/\1/')
-  [ -n "$norm" ] || return 1
-  # A working `ps -A` always lists at least this shell, and our own group is the cheapest thing to
-  # look for: a table that does not contain it is truncated or filtered, not a description of the
-  # machine, and nothing may be concluded from it.
-  self=$(pgid_of "$$")
-  case "$self" in ''|*[!0-9]*) return 1;; esac
-  printf '%s\n' "$norm" | grep -qx -- "$((10#$self))" || return 1
-  printf '%s\n' "$norm" | grep -qx -- "$pg" && return 1
-  return 0
-}
-# TERM then KILL the whole group; return 0 when nothing in it is left, 1 when something survives.
-# Fails closed: an unverified target returns 1 (not confirmed) WITHOUT signalling anything, so
-# every caller treats it as "the cancel could not be confirmed" rather than as a completed kill.
-kill_group() {  # <pgid> [owner-pid]
-  local i owner="${2:-}"
-  pgid_is_signalable "$1" "$owner" || { refuse_signal "$1" "kill_group"; return 1; }
-  kill -TERM -- "-$1" 2>/dev/null || true
-  for i in 1 2 3 4 5; do group_alive "$1" || return 0; sleep 1; done
-  kill -KILL -- "-$1" 2>/dev/null || true
-  for i in 1 2 3 4 5; do group_alive "$1" || return 0; sleep 1; done
-  return 1
 }
 # stream-json readers
 stream_field() {  # <joblog> init-session|init-model|result-text|has-result
@@ -425,11 +283,11 @@ raise SystemExit(rc)'
       ccr_preflight "$ALIAS" || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS $REASON"; exit 1; }
       # Read-only smoke: a disposable repository, the exact review launch line, and a prompt that
       # asks for a write by the Write tool and by Bash, inside and outside the repository. Any file
-      # created ⇒ readonly=violated. The smoke runs in its own process group under a wall-clock bound
-      # (SMOKE_MAX_SEC, default 300 s): a provider that never answers is killed as a group and reported
-      # UNAVAILABLE instead of hanging Phase 0 (review round 1: F-04).
+      # created ⇒ readonly=violated. CCR owns cancellation; admission observation
+      # and the subsequent watch both spend the smoke's wall-clock budget.
       SMOKE=$(mktemp -d 2>/dev/null) && [ -d "$SMOKE" ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS mktemp failed"; exit 1; }
-      trap 'rm -rf "$SMOKE"' EXIT
+      trap 'echo "CCR smoke evidence: $SMOKE" >&2' EXIT
+      CCR_ATTEMPT_PREFIX="$SMOKE/run"
       git init -q "$SMOKE/repo" 2>/dev/null || mkdir -p "$SMOKE/repo"
       mkdir -p "$SMOKE/outside"
       printf '%s\n' "Smoke test. Do exactly these three things, then reply with the single word DONE:" \
@@ -437,31 +295,38 @@ raise SystemExit(rc)'
         "2. Use the Bash tool to run: echo hello > smoke-bash.txt" \
         "3. Use the Bash tool to run: echo hello > $SMOKE/outside/smoke-outside.txt" \
         "If a step is refused, say so and continue." > "$SMOKE/prompt.md"
-      ARGV=(); while IFS= read -r a; do ARGV+=("$a"); done < <(ccr_launch_argv "$ALIAS" 6)
+      ccr_launch_argv "$ALIAS" 6 "$SMOKE/prompt.md"
       SMOKE_MAX_SEC="${CODEX_RUN_SMOKE_MAX_SEC:-300}"
       case "$SMOKE_MAX_SEC" in ''|*[!0-9]*|0*|??????????*) echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS CODEX_RUN_SMOKE_MAX_SEC must be a positive whole number of at most 9 digits (got '$SMOKE_MAX_SEC')"; exit 1;; esac   # review round 2: F-03; round 3: F-02 oversized integers fail-open
-      ( cd "$SMOKE/repo" && start_in_own_group "${ARGV[@]}" ) < "$SMOKE/prompt.md" > "$SMOKE/stream.jsonl" 2> "$SMOKE/stderr" &
-      SCHILD=$!; sleep 1; SPGID=$(pgid_of "$SCHILD")
-      # Same guard as the launch path: signal only a group the child created (pgid == pid); a group id
-      # that is not the child's is the runner's own inherited group (review round 2: F-07).
-      [ "$SPGID" = "$SCHILD" ] || SPGID=""
-      SWAITED=0; STIMED=0
-      while kill -0 "$SCHILD" 2>/dev/null; do
-        if [ "$SWAITED" -ge "$SMOKE_MAX_SEC" ]; then STIMED=1; break; fi
-        sleep 1; SWAITED=$((SWAITED+1))
+      # The smoke is a detached job like any other, so the bound is enforced by asking its owner to
+      # cancel rather than by this script signalling a process group it inferred (review round 1:
+      # F-04 required the bound; the CCR job API is how it is now enforced).
+      SSTART=$(date +%s)
+      SADMISSION_WAIT="$SMOKE_MAX_SEC"; [ "$SADMISSION_WAIT" -le 30 ] || SADMISSION_WAIT=30
+      SRECEIPT=$(cd "$SMOKE/repo" && python3 "$CCR_HELPER" admit "$CCR_ATTEMPT_PREFIX" "$ALIAS" "$CLAUDE_MODEL" 6 "$0" "$MODEL_JSON" "$CCR_VER" "$SADMISSION_WAIT" "${ARGV[@]}"); SLRC=$?
+      SJOB=$(ccr_job_field "$SRECEIPT" job_id)
+      if [ "$SLRC" != 0 ] || [ -z "$SJOB" ]; then
+        echo "PROBE UNDETERMINED: admission unresolved; evidence=$SMOKE; do not retry"
+        exit 1
+      fi
+      STIMED=0
+      while :; do
+        SJSON=$(ccr_job_json "$SJOB")
+        [ "$(ccr_job_state "$SJSON")" = running ] || break
+        if [ $(( $(date +%s) - SSTART )) -ge "$SMOKE_MAX_SEC" ]; then STIMED=1; break; fi
+        sleep 1
       done
       if [ "$STIMED" = 1 ]; then
-        if [ -n "$SPGID" ] && kill_group "$SPGID" "$SCHILD"; then SKILL="process group $SPGID terminated"
-        else
-          # No verified group: signal the CHILD BY PID only. A bare negative here would be a
-          # group target derived from an unverified number.
-          pgid_is_signalable "$SCHILD" "$SCHILD" && kill -KILL -- "-$SCHILD" 2>/dev/null
-          kill -KILL "$SCHILD" 2>/dev/null
-          SKILL="process group ${SPGID:-$SCHILD} NOT confirmed terminated (check: ps -o pid,pgid,command -g ${SPGID:-$SCHILD})"; fi
-        wait "$SCHILD" 2>/dev/null
+        ccr_job_cancel "$SJOB" >/dev/null 2>&1 || true
+        SCW=0; while [ "$SCW" -lt 30 ]; do SJSON=$(ccr_job_json "$SJOB"); [ "$(ccr_job_state "$SJSON")" = running ] || break; sleep 1; SCW=$((SCW+1)); done
+        if [ "$(ccr_job_state "$SJSON")" = ended ]; then SKILL="job $SJOB cancelled by its owner (cleanup coverage=$(ccr_job_field "$SJSON" cleanup.coverage))"
+        else SKILL="cancellation of job $SJOB NOT confirmed (check: ccr status $SJOB --json)"; fi
         echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke timed out after ${SMOKE_MAX_SEC}s ($SKILL) ccr=$CCR_VER"; exit 1
       fi
-      wait "$SCHILD" 2>/dev/null; SRC=$?
+      SFROZEN=$(python3 "$CCR_HELPER" freeze "$CCR_ATTEMPT_PREFIX" "$SJOB") || { echo "PROBE UNDETERMINED: workload stop/result unproven; evidence=$SMOKE"; exit 1; }
+      [ "$(ccr_job_field "$SFROZEN" successful)" = True ] || { echo "PROBE UNAVAILABLE: unsuccessful workload result; evidence=$SMOKE"; exit 1; }
+      cp "$CCR_ATTEMPT_PREFIX.joblog" "$SMOKE/stream.jsonl"
+      SRC=$(ccr_job_field "$SJSON" exit_code); SRC=${SRC:-1}
       CREATED=$( { cd "$SMOKE/repo" && find . -path ./.git -prune -o -type f -print | sed 's|^\./||'; cd "$SMOKE/outside" && find . -type f -print | sed 's|^\./|outside/|'; } 2>/dev/null)
       if [ -n "$CREATED" ]; then
         echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS readonly=violated files_created=$(printf '%s' "$CREATED" | tr '\n' ',') ccr=$CCR_VER"; exit 1
@@ -557,6 +422,10 @@ else
   [ -n "$MAX_TURNS" ] || MAX_TURNS=$CCR_MAX_TURNS_DEFAULT
   case "$RESUME_SESSION" in *[!A-Za-z0-9-]*) die4 "--resume-session: a session id has only letters, digits and '-' (got '$RESUME_SESSION')";; esac
 fi
+if [ "$BACKEND" = ccr ] && [ "$ATTACH" != 1 ] && [ "$MODE" != --fresh ]; then
+  echo "codex-run.sh: CCR detached resume is unavailable in this release; explicitly choose --fresh for a new session (nothing admitted)" >&2
+  exit 4
+fi
 for v in STALL_MIN MAX_MIN POLL MAX_TURNS; do
   eval "val=\$$v"
   [ "$v" != MAX_TURNS ] || [ -n "$val" ] || continue
@@ -582,106 +451,24 @@ write_detached() {  # key=value lines on stdin
 }
 detached_field() { awk -F= -v k="$1" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$PREFIX.detached" 2>/dev/null; }
 prompt_digest() { { shasum -a 256 "$1" 2>/dev/null || sha256sum "$1" 2>/dev/null; } | awk '{print $1; exit}'; }
-# Publication of a terminal outcome is serialized against a concurrent attach and against the
-# review gate's release, which take the same lock while they rotate a claim. Held across the whole
-# step — receipt, .stdout, .meta, removing .detached, writing .exit — so no reader ever sees a
-# half-published attempt. A lock older than a minute belongs to a dead process, exactly as
-# stamp_claim treats it.
-# Released on every exit path, including a die4 or a `set -e`-style abort inside the publish
-# window: a lock leaked by a crashed collector would otherwise block every later attach and the
-# review gate's own release for a full minute (F-04's abort was exactly this shape).
-# A bash trap handler that RETURNS does not terminate the script. Releasing the lock on INT/TERM
-# and carrying on would hand the publication lock to a second collector while this one keeps
-# watching and still publishes at the end — two collectors of one job, the exact failure this lock
-# exists to prevent (cycle 3: CL-02/CX-01, reproduced). The signal handlers therefore exit.
+# Kernel file locks serialize collectors, admission and claim rotation. The
+# shell owns descriptor 9; the helper locks that inherited open-file description.
+# Keep the lock inode permanently: unlinking it would split future contenders.
+# Old directory locks must drain under the old runner before upgrading.
+publish_lock() {  # [--must], bounded acquisition for every caller
+  local lock="$PREFIX.claim.lock"
+  [ ! -d "$lock" ] || die4 "legacy collector lock $lock: drain old runners before upgrading"
+  exec 9>>"$lock" || die4 "cannot open collector lock $lock"
+  if ! python3 "$CCR_HELPER" lock 9 5; then
+    exec 9>&-
+    die4 "$lock is held by another collector or locking is unavailable; retry without relaunching"
+  fi
+  HELD_LOCK="$lock"
+}
+publish_unlock() { exec 9>&-; HELD_LOCK=""; }
 trap 'publish_unlock' EXIT
 trap 'publish_unlock; exit 130' INT
 trap 'publish_unlock; exit 143' TERM
-# Staleness here is a property of the HOLDER, never of the clock. An --attach holds this lock for
-# its whole watch — up to --max-min, twenty-five minutes by default — so an age-based reclaim
-# would time out against a perfectly healthy holder and admit a second collector into the same
-# job, which is exactly the mutual exclusion this lock exists to provide (cycle 2: CL-02). The
-# holder records its pid and start-time identity inside the lock; the lock is reclaimed only when
-# that execution is provably no longer running. The clock is used for one case only: a lock
-# directory with no holder record, which is either a pre-change lock or the millisecond window
-# between mkdir and the record being written — a grace far longer than that window settles it.
-# Reclaiming a lock is a race against a contender who may legitimately own it by now. Testing the
-# holder and then deleting it are two steps, so a second reclaimer can delete the REPLACEMENT
-# holder and both end up believing they hold the lock (cycle 3: CL-04/CX-04). The rename is the
-# serializing step: only one contender can move the holder file away, and the loser's `mv` fails
-# because the source is gone. The mover then checks that what it moved is the very record it
-# judged stale — a live contender's holder carries a different, live pid — and puts it back if it
-# is not. A holder file that cannot be read at all (empty, truncated by an interrupted write) is
-# NOT treated as a dead holder; it falls to the clock, which must remove the file too, because
-# `rmdir` cannot remove a directory that still contains it — that combination wedged the lock
-# permanently (cycle 3: CX-05, reproduced: rc=4 forever with the lock still present).
-reclaim_lock() {  # <lock> <the exact holder record judged stale> -> 0 when the lock is now free
-  local lock="$1" want="$2" tmp="$1/holder.dead.$$"
-  mv "$lock/holder" "$tmp" 2>/dev/null || return 1
-  if [ "$(cat "$tmp" 2>/dev/null)" = "$want" ]; then
-    rm -f "$tmp"; rmdir "$lock" 2>/dev/null && return 0
-    return 1
-  fi
-  mv "$tmp" "$lock/holder" 2>/dev/null || rm -f "$tmp"   # a live holder replaced it: leave it alone
-  return 1
-}
-# `--must` is for the publication path, which is reached only AFTER the job has finished and its
-# answer has been written to .stdout. Abandoning there because another process held the lock for
-# five seconds threw away a completed second-model review and reported it as a LAUNCH-ERROR
-# (cycle 3: CL-05) — `phase-gate.sh release` alone holds this lock across a companion call that
-# can exceed that. With `--must` a PROVABLY LIVE holder is waited out instead: the wait is bounded
-# by the longest legitimate hold (an attach's own watch bound) and says so in .progress, and a
-# holder that stops being provable is reclaimed by the branch above as usual.
-PUBLISH_WAIT_MAX=$(( 30 * 60 * 10 ))   # 0.1 s ticks
-publish_lock() {  # [--must]
-  local must=0; [ "${1:-}" != --must ] || must=1
-  local lock="$PREFIX.claim.lock" i=0 waited=0 now m hpid hident hrec d dp
-  while ! mkdir "$lock" 2>/dev/null; do
-    hrec=$(cat "$lock/holder" 2>/dev/null)
-    hpid=$(printf '%s\n' "$hrec" | awk -F= '$1=="pid"{print $2; exit}')
-    hident=$(printf '%s\n' "$hrec" | awk -F= '$1=="identity"{sub(/^[^=]*=/, ""); print; exit}')
-    if [ -n "$hpid" ]; then
-      # Reclaim only on a PROVEN absence. `identity_state` returns 1 both when the holder is gone
-      # and when `ps` could not answer, and reading the second as the first let a contender take a
-      # live collector's lock during a transient inspection failure (cycle 5: CX-05).
-      if holder_is_provably_gone "$hpid" "$hident"; then
-        reclaim_lock "$lock" "$hrec" && continue
-      elif [ "$must" = 1 ]; then
-        waited=$((waited+1))
-        [ "$waited" -lt "$PUBLISH_WAIT_MAX" ] || { echo "codex-run.sh: $lock has been held by a live process (pid $hpid) for 30 minutes; the job's answer is in $PREFIX.stdout but no terminal sidecar was published" >&2; exit 4; }
-        [ $(( waited % 600 )) -ne 0 ] || echo "$(elapsed)s waiting to publish: $lock held by live pid $hpid ($(( waited / 600 )) min)" >> "$PREFIX.progress"
-        i=0   # a provably live holder is not a reason to discard a finished attempt
-      fi
-    else
-      now=$(date +%s); m=$(fmtime "$lock" || echo "$now"); m=${m:-$now}
-      # rmdir cannot remove a directory that still contains anything, so the clock must clear
-      # EVERY file a lock can hold — including a `holder.dead.<pid>` left by a reclaim_lock that
-      # was killed between its rename and its rm. Clearing only `holder` wedged the lock forever
-      # in exactly the shape cycle 3 fixed for `holder` itself (cycle 4: CX-05).
-      # But `holder.dead.<pid>` is only abandoned once <pid> is gone: while that reclaimer is still
-      # running, the file is a LIVE holder record it has moved aside and may still put back, and
-      # deleting it let a third contender take a lock a second one legitimately owned (cycle 5:
-      # CX-06). The name carries the reclaimer's pid, so the question is answerable — and it is
-      # asked, rather than assumed from the directory's age.
-      if [ $(( now - m )) -ge 60 ]; then
-        for d in "$lock"/holder.dead.*; do
-          [ -e "$d" ] || continue
-          dp=${d##*.}
-          case "$dp" in ''|*[!0-9]*) rm -f "$d" 2>/dev/null; continue;; esac
-          kill -0 "$dp" 2>/dev/null || rm -f "$d" 2>/dev/null   # its reclaimer is gone: abandoned
-        done
-        rm -f "$lock/holder" 2>/dev/null; rmdir "$lock" 2>/dev/null && continue
-      fi
-    fi
-    # One bound for both shapes of failure: a lock a live holder legitimately owns, and a stale one
-    # that cannot be removed (a directory with something else inside it). Neither may spin forever.
-    i=$((i+1)); [ "$i" -lt 50 ] || { echo "codex-run.sh: $lock is held by another attach, a launch gate or a release, or is stale and cannot be removed; retry in a moment (nothing was published)" >&2; exit 4; }
-    sleep 0.1
-  done
-  printf 'pid=%s\nidentity=%s\n' "$$" "$(proc_identity "$$")" > "$lock/holder" 2>/dev/null || true
-  HELD_LOCK="$lock"
-}
-publish_unlock() { [ -z "${HELD_LOCK:-}" ] || { rm -f "$HELD_LOCK/holder" 2>/dev/null; rmdir "$HELD_LOCK" 2>/dev/null; }; HELD_LOCK=""; }
 
 # The in-flight refusals, split out of rotate_previous_attempt so they can run BEFORE the claim is
 # taken. They used to run after: stamp_claim did `mkdir <prefix>.claim/runner` and wrote its pid,
@@ -691,6 +478,12 @@ publish_unlock() { [ -z "${HELD_LOCK:-}" ] || { rm -f "$HELD_LOCK/holder" 2>/dev
 # a review's budget without a single job being launched (cycle 5: CL-05). This function only ever
 # reads and refuses; it never rotates or writes.
 refuse_if_in_flight() {
+  if [ -e "$PREFIX.ccr-attempt.json" ] && [ ! -e "$PREFIX.exit" ]; then
+    python3 "$CCR_HELPER" stopped "$PREFIX" >/dev/null 2>&1 || {
+      echo "codex-run.sh: durable CCR attempt is still open; use --attach. An unresolved admission must never be resubmitted." >&2
+      exit 4
+    }
+  fi
   # A RUNNING attempt that has not detached yet is in flight too. `.detached` is only written when
   # a watch bound elapses, so between launch and that bound the prefix has `.progress` and a `.meta`
   # naming a live pid and pgid, and no `.detached` at all — and the guard below, keyed on
@@ -706,11 +499,17 @@ refuse_if_in_flight() {
     local lline lpgid ljob lstat lroot mlive=""
     lline=$(grep -E '^[0-9]+s launched backend=ccr ' "$PREFIX.progress" 2>/dev/null | tail -1)
     if [ -n "$lline" ]; then
-      lpgid=$(printf '%s' "$lline" | sed -n 's/.* pgid=\([0-9]*\).*/\1/p')
-      # The pid on that line is the SUPERVISOR and its child outlives it, so the group — not the
-      # pid — is what says whether work is still happening. Only a provably empty group clears it.
-      if [ -n "$lpgid" ] && ! group_is_empty "$lpgid"; then
-        mlive="process group $lpgid still has members"
+      lccrjob=$(printf '%s' "$lline" | sed -n 's/.* job=\([^ ]*\).*/\1/p')
+      # The job's owner is the authority, exactly as it is in the watch loop. An unanswerable
+      # status is undetermined and refuses the launch; only a job CCR reports as over clears it.
+      if [ -n "$lccrjob" ]; then
+        case "$(ccr_job_state "$(ccr_job_json "$lccrjob")")" in
+          ended) ;;                                                        # over: rotate
+          running) mlive="ccr reports job $lccrjob as still running";;
+          *) mlive="ccr could not be asked about job $lccrjob";;            # fail closed
+        esac
+      else
+        mlive="legacy CCR attempt has no durable job receipt; drain it before upgrading"
       fi
     else
       ljob=$(grep -oE 'launched job=task-[a-z0-9-]+' "$PREFIX.progress" 2>/dev/null | head -1 | cut -d= -f2)
@@ -744,28 +543,8 @@ refuse_if_in_flight() {
     dbackend=$(detached_field backend)
     case "$dbackend" in
       ccr)
-        # The recorded pid is the SUPERVISOR, not the work. A supervisor that is gone or whose
-        # number has been reused proves nothing about the child: the child is reparented and keeps
-        # running in the same process group. Treating an unresolved identity as "not live" rotated
-        # the record of a job still executing and authorized a second one beside it — the same
-        # defect the codex branch below already fails closed on (cycle 4: CX-04). So identity is
-        # only ever promoted to a POSITIVE answer here; the negative comes from the group.
-        local dpgid dreceipt
-        dpid=$(detached_field pid); dident=$(detached_field identity)
-        dpgid=$(detached_field pgid); dreceipt=$(detached_field receipt)
-        if [ -n "$dpid" ] && identity_state "$dpid" "$dident"; then
-          dlive="yes (pid $dpid, start time matches)"
-        elif [ -n "$dreceipt" ] && [ -s "$dreceipt" ]; then
-          dlive=no                                  # the supervisor reaped the child: over
-        elif [ -s "$PREFIX.childexit" ]; then
-          dlive=no
-        elif [ -n "$dpgid" ] && group_is_empty "$dpgid"; then
-          dlive=no                                  # nothing of the job is left: over
-        elif [ -z "$dpid" ] && [ -z "$dpgid" ]; then
-          dlive="undetermined ($PREFIX.detached records no pid or pgid for the ccr attempt)"
-        else
-          dlive="undetermined (pid ${dpid:-<none>} is gone or reused and process group ${dpgid:-<none>} is not provably empty)"
-        fi
+        if python3 "$CCR_HELPER" stopped "$PREFIX" >/dev/null 2>&1; then dlive=no
+        else dlive="unresolved CCR attempt; attach to collect it (legacy process records cannot grant control)"; fi
         ;;
       codex)
         # The codex record carries no process WE own — the companion owns the job — so liveness is
@@ -811,11 +590,16 @@ rotate_previous_attempt() {
     # .detached and .childexit belong to the attempt too: a record left behind would make a bogus
     # --attach admissible against the NEXT, live attempt, and a stale receipt would let it publish
     # a terminal outcome from the previous run's exit status.
-    for ext in stdout stderr progress joblog meta exit detached childexit; do [ -e "$PREFIX.$ext" ] && mv "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
+    for ext in stdout stderr progress joblog meta exit detached childexit ccr-attempt.json ccr-receipt.json ccr-prompt ccr-result.json ccr-errorlog ccr-submit.stderr; do [ -e "$PREFIX.$ext" ] && mv "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
     echo "codex-run.sh: previous attempt rotated to $PREFIX.attempt$N.*"
   fi
 }
 stamp_claim() {
+  # Reject a missing requested claim without creating even a coordination file.
+  # The same condition is checked again after acquiring the lease.
+  if [ "$CLAIM_MODE" = 1 ] && [ ! -d "$PREFIX.claim" ]; then
+    die4 "--claim given but $PREFIX.claim does not exist; run the launch gate first"
+  fi
   # A launch gate that hands off to this runner records its claim in
   # <prefix>.claim/. One claim authorizes ONE runner: the runner takes the claim
   # with an atomic mkdir of <prefix>.claim/runner BEFORE it touches any sidecar,
@@ -888,11 +672,21 @@ START=$(date +%s); now() { date +%s; }; elapsed() { echo $(( $(now) - START )); 
 # spent, and `mode=` keeps the original launch mode so the review gates' thread anchoring is
 # untouched. Attachment is recorded separately, in `attached=`.
 if [ "$ATTACH" = 1 ]; then
+  # Cancellation addresses the admitted job and does not publish collector
+  # artifacts. It must remain available while another collector holds its lease.
+  if [ "$CANCEL_ONLY" = 1 ] && [ -e "$PREFIX.ccr-attempt.json" ]; then
+    CANCEL_RESULT=$(python3 "$CCR_HELPER" cancel-attempt "$PREFIX") || exit 6
+    echo "codex-run.sh: stopped job $(ccr_job_field "$CANCEL_RESULT" job_id) (cleanup coverage=$(ccr_job_field "$CANCEL_RESULT" cleanup.coverage))"
+    exit 0
+  fi
   # Admission is decided under the publication lock and HELD for the whole attach, so a second
   # attach cannot pass the same guard and end up as a concurrent collector of one job. Testing
   # `.exit` outside the lock only proved it was absent at some moment in the past; by the time
   # this process published, another collector could already have finished.
   publish_lock
+  if [ -e "$PREFIX.ccr-attempt.json" ] && [ ! -e "$PREFIX.exit" ]; then
+    python3 "$CCR_HELPER" recover "$PREFIX" >/dev/null || { echo "codex-run.sh: admission unresolved; retain the claim and investigate, never retry launch" >&2; exit 6; }
+  fi
   [ -e "$PREFIX.detached" ] || die4 "--attach: no $PREFIX.detached — nothing detached from this prefix (a launch that finished wrote .exit; a launch that never ran wrote nothing)"
   [ ! -e "$PREFIX.exit" ] || die4 "--attach: $PREFIX.exit exists, so that attempt already finished; re-read its sidecars instead of attaching"
   BACKEND=$(detached_field backend); JOB=$(detached_field job); MODE=$(detached_field mode)
@@ -903,23 +697,21 @@ if [ "$ATTACH" = 1 ]; then
   ATTACH_CMD=$(detached_field attach_command); CANCEL_CMD=$(detached_field cancel_command)
   echo "$(elapsed)s ATTACH #$ATTEMPTS backend=$BACKEND ${JOB:+job=$JOB}${DPID:+pid=$DPID pgid=$PGID}" >> "$PREFIX.progress"
 
-  # ---- identity, before anything is observed or signalled -------------------
-  # 0 = the recorded number still names our execution · 1 = it is gone · 2 = it now names
-  # something else. 1 and 2 both mean our execution ended — a live pid is never reused — so both
-  # collect; what neither may do is signal, which is why the state is resolved before the loop.
-  # ALIVE gates SIGNALLING only. Whether the job ENDED is a separate question, and identity cannot
-  # answer it: an empty `ps` may be a failed inspection rather than an exit, and an unequal string
-  # may be an identity we cannot reproduce rather than a reused pid. Only the supervisor receipt
-  # settles that, so an ambiguous state with no receipt re-detaches instead of publishing.
+  # ---- the job's state, asked of its owner ----------------------------------
+  # There is no identity to resolve any more. Both backends address their job by an id issued by
+  # the process that owns it, so "is it still running" and "may I cancel it" are the same question
+  # asked of the same authority — not two different fields read out of a file, one of which was
+  # proved and the other of which was signalled (cycles 2-5).
   ALIVE=1; IDENT_NOTE=""; IDENT_STATE=0
   if [ "$BACKEND" = ccr ]; then
-    identity_state "$DPID" "$IDENT"; IDENT_STATE=$?
-    case "$IDENT_STATE" in
-      0) ALIVE=1;;
-      1) ALIVE=0; IDENT_NOTE="the recorded process id is not readable; only the supervisor receipt can say whether the job ended";;
-      2) ALIVE=0; IDENT_NOTE="pid $DPID does not match the recorded start time; nothing will be signalled, and only the receipt can end this attempt";;
+    JOB_ID="$JOB"; CCR_SESSION=$(detached_field session)
+    JOB_JSON=$(ccr_job_json "$JOB_ID")
+    case "$(ccr_job_state "$JOB_JSON")" in
+      running) ALIVE=1;;
+      ended)   ALIVE=0; IDENT_NOTE="ccr reports job $JOB_ID as $(ccr_job_field "$JOB_JSON" status); there is nothing left to cancel";;
+      *)       ALIVE=0; IDENT_NOTE="ccr could not be asked about job $JOB_ID; nothing will be requested and the attempt stays open";;
     esac
-    [ -z "$IDENT_NOTE" ] || echo "$(elapsed)s IDENTITY: $IDENT_NOTE" >> "$PREFIX.progress"
+    [ -z "$IDENT_NOTE" ] || echo "$(elapsed)s JOB-STATE: $IDENT_NOTE" >> "$PREFIX.progress"
   fi
 
   if [ "$CANCEL_ONLY" = 1 ]; then
@@ -928,10 +720,15 @@ if [ "$ATTACH" = 1 ]; then
       node "$CODEX_ROOT/scripts/codex-companion.mjs" cancel "$JOB" >>"$PREFIX.stderr" 2>&1 || true
       echo "codex-run.sh: cancel requested for job $JOB"
     elif [ "$ALIVE" = 1 ]; then
-      # `ALIVE` proved DPID. It says nothing about PGID, which is a different field read from the
-      # same file — so the group is passed with its owner and signalled only if it is still that
-      # process's group.
-      kill_group "$PGID" "$DPID" && echo "codex-run.sh: cancelled process group $PGID (identity verified)" || echo "codex-run.sh: cancel of process group $PGID not confirmed" >&2
+      # A request to the owner, by job id. Nothing is signalled, no pid is derived and no process
+      # group is named, so there is no target this runner could get wrong.
+      ccr_job_cancel "$JOB_ID" >>"$PREFIX.stderr" 2>&1 || true
+      CWAIT=0; while [ "$CWAIT" -lt 30 ]; do JOB_JSON=$(ccr_job_json "$JOB_ID"); [ "$(ccr_job_state "$JOB_JSON")" = running ] || break; sleep 1; CWAIT=$((CWAIT+1)); done
+      if [ "$(ccr_job_state "$JOB_JSON")" = ended ]; then
+        echo "codex-run.sh: cancelled job $JOB_ID (cleanup coverage=$(ccr_job_field "$JOB_JSON" cleanup.coverage) survivors=$(ccr_job_field "$JOB_JSON" cleanup.survivors))"
+      else
+        echo "codex-run.sh: cancellation of job $JOB_ID not confirmed; check: ccr status $JOB_ID --json" >&2
+      fi
     else
       echo "codex-run.sh: nothing to cancel — $IDENT_NOTE"
     fi
@@ -953,11 +750,19 @@ if [ "$BACKEND" = ccr ]; then
   # Attaching: the launch already happened. Take the identifiers from the detached record, keep
   # the launch's own command line for .meta, and go straight to the watch loop.
   CMD=$(awk -F= '$1=="command"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
-  CHILD="$DPID"; SESSION=""; PROMPT_FILE=$(awk -F= '$1=="prompt_file"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
+  [ -n "$CMD" ] || CMD=$(detached_field command)
+  SESSION=""; PROMPT_FILE=$(detached_field prompt_file)
+  CLAUDE_MODEL=$(detached_field claude_model_id)
+  PROVIDER=$(detached_field provider); PROVIDER_MODEL=$(detached_field provider_model)
+  COMPAT=$(detached_field compatibility); CCR_VER=$(detached_field ccr_version)
+  # The job id is the whole handle. An attach re-asks CCR about it; it inherits no pid, no pgid
+  # and no start-time identity, because it needs none of them to observe or to cancel.
+  JOB_ID=$(detached_field job); CCR_SESSION=$(detached_field session)
+  [ -n "$JOB_ID" ] || die4 "--attach: $PREFIX.detached records no job= for the ccr backend; this record predates the CCR job API and cannot be attached to"
   # The launch's turn budget, not this collector's default: `error_max_turns` in a result event is
   # only interpretable against the budget the run actually used (cycle 3: CL-11).
   MAX_TURNS=$(detached_field max_turns); MAX_TURNS=${MAX_TURNS:-$CCR_MAX_TURNS_DEFAULT}
-  ccr_preflight "$ALIAS" >/dev/null 2>&1 || true   # descriptive only; the child is already running
+  # Control and expected model come from the admitted attempt, not current configuration.
  else
   CMD="ccr launch --model $ALIAS --permission-mode plan -p ... --max-turns $MAX_TURNS $MODE${RESUME_SESSION:+ $RESUME_SESSION} --prompt-file $PROMPT_FILE"
   ccr_preflight "$ALIAS" || launch_error "$REASON" "$CMD"
@@ -967,77 +772,52 @@ if [ "$BACKEND" = ccr ]; then
     SESSION=$(cat "$DIR/.ccr-last-session" 2>/dev/null | head -1 | tr -d ' ')
     [ -n "$SESSION" ] || launch_error "--resume-last: no previous ccr session recorded in $DIR/.ccr-last-session" "$CMD"
   elif [ "$MODE" = "--resume-session" ]; then SESSION="$RESUME_SESSION"; fi
-  ARGV=(); while IFS= read -r a; do ARGV+=("$a"); done < <(ccr_launch_argv "$ALIAS" "$MAX_TURNS" "$SESSION")
-  stamp_claim; rotate_previous_attempt; unlock_claim
+  ccr_launch_argv "$ALIAS" "$MAX_TURNS" "$PROMPT_FILE"
+  stamp_claim; rotate_previous_attempt
   : > "$PREFIX.progress"; : > "$PREFIX.stderr"; : > "$PREFIX.joblog"
-  rm -f "$PREFIX.childexit" "$PREFIX.childexit.tmp"
-  # The launcher needs the receipt path by the same name the attach path reads it under: its
-  # monitor now uses the identical "receipt or provably empty group" termination predicate, and
-  # under `set -u` an undefined RECEIPT would abort the run instead (cycle 5: CX-03).
-  RECEIPT="$PREFIX.childexit"
-  start_supervised_group "$PREFIX.childexit" "${ARGV[@]}" < "$PROMPT_FILE" > "$PREFIX.joblog" 2>> "$PREFIX.stderr" &
-  CHILD=$!
-  sleep 1
-  PGID=$(pgid_of "$CHILD")
-  if [ "$PGID" != "$CHILD" ]; then
-    # Either the child already exited (fast failure — let the normal path report it) or the
-    # group could not be established; the latter is never left running.
-    if kill -0 "$CHILD" 2>/dev/null; then
-      # pgid == pid by construction (setpgrp before exec), so signal the group by that number too: a
-      # child the fake/gateway forked must not outlive this branch (a stray `sleep` was observed).
-      pgid_is_signalable "$CHILD" "$CHILD" && kill -KILL -- "-$CHILD" 2>/dev/null
-      kill -KILL "$CHILD" 2>/dev/null; wait "$CHILD" 2>/dev/null
-      echo "$(elapsed)s LAUNCH: process group of pid $CHILD could not be read (got '$PGID'); child killed" >> "$PREFIX.progress"
-      printf 'outcome=UNCONFIRMED-CANCEL\nbackend=ccr\nalias=%s\npid=%s\npgid=unknown\nlast_error=process group unreadable\nmode=%s\nprompt_file=%s\ncommand=%s\ncancel_confirmed=no\n' "$ALIAS" "$CHILD" "$MODE" "$PROMPT_FILE" "$CMD" > "$PREFIX.meta"
-      : > "$PREFIX.stdout"; echo 5 > "$PREFIX.exit"; echo "codex-run.sh: process group unreadable; child killed (exit 5)" >&2; exit 5
-    fi
-    PGID="$CHILD"
+  ADMISSION_WAIT=$(( MAX_MIN*60 - $(elapsed) ))
+  [ "$ADMISSION_WAIT" -gt 0 ] || ADMISSION_WAIT=1
+  [ "$ADMISSION_WAIT" -le 30 ] || ADMISSION_WAIT=30
+  RECEIPT_JSON=$(python3 "$CCR_HELPER" admit "$PREFIX" "$ALIAS" "$CLAUDE_MODEL" "$MAX_TURNS" "$0" "$MODEL_JSON" "$CCR_VER" "$ADMISSION_WAIT" "${ARGV[@]}")
+  LRC=$?
+  if [ "$LRC" != 0 ]; then
+    echo "$(elapsed)s ADMISSION-UNKNOWN: retain claim; no terminal outcome; never automatically resubmit" >> "$PREFIX.progress"
+    unlock_claim
+    exit 6
   fi
-  echo "$(elapsed)s launched backend=ccr pid=$CHILD pgid=$PGID alias=$ALIAS" >> "$PREFIX.progress"
+  JOB_ID=$(ccr_job_field "$RECEIPT_JSON" job_id)
+  CCR_SESSION=$(ccr_job_field "$RECEIPT_JSON" session_id)
+  # Keep the collector lock through this watch. A dead collector can be reclaimed; a live one cannot.
+  echo "$(elapsed)s launched backend=ccr job=$JOB_ID session=$CCR_SESSION alias=$ALIAS" >> "$PREFIX.progress"
  fi
+ # CCR writes the job's stream-json to its own job directory. The runner mirrors it to
+ # <prefix>.joblog on every poll so that every existing consumer — stream_field, the stall
+ # detector, the phase gates — keeps reading the sidecar it always read.
+ JOB_JSON=$(ccr_job_json "$JOB_ID"); JOB_LOG=$(ccr_job_field "$JOB_JSON" log)
+ mirror_joblog() { python3 "$CCR_HELPER" mirror "$PREFIX" "$JOB_ID" >/dev/null 2>&1 || true; }
+ mirror_joblog
 
   OUTCOME=""; LAST_ACTIVITY=$(now); PREV_SIG=""; IDLE=0
   while :; do
     sleep "$POLL"
-    SIG=$(fsig "$PREFIX.joblog"); LASTLINE=$(tail -n 1 "$PREFIX.joblog" 2>/dev/null | cut -c1-140)
+    JOB_JSON=$(ccr_job_json "$JOB_ID")
+    [ -z "$(ccr_job_field "$JOB_JSON" log)" ] || JOB_LOG=$(ccr_job_field "$JOB_JSON" log)
+    mirror_joblog
+    SIG=$(fsig "$JOB_LOG"); LASTLINE=$(tail -n 1 "$PREFIX.joblog" 2>/dev/null | cut -c1-140)
     if [ "$SIG" != "$PREV_SIG" ]; then LAST_ACTIVITY=$(now); PREV_SIG="$SIG"; fi
     IDLE=$(( $(now) - LAST_ACTIVITY ))
-    if [ "$ATTACH" = 1 ]; then
-      # Not our child: `kill -0` would answer for whatever holds the number now, so the pid is
-      # paired with its start time. A number that is gone, or that has been reused, both mean our
-      # execution ended — and neither may be signalled.
-      identity_state "$CHILD" "$IDENT"; IDENT_STATE=$?
-      case "$IDENT_STATE" in
-        0) STATUS=running;;
-        # The number is gone or contested. That is not proof the job finished — only the receipt
-        # is. With a receipt the execution is genuinely over and we collect; without one the
-        # attempt stays in flight and this watch re-detaches at the bound (see below).
-        1|2) ALIVE=0
-             if [ -s "$RECEIPT" ]; then STATUS=exited
-             elif [ -n "$PGID" ] && group_is_empty "$PGID"; then
-               # The identity is gone AND the whole process group is empty. Group emptiness is
-               # sound in this direction — pgid reuse can only make a dead group look alive — so
-               # the execution really is over, and the collector below closes the attempt with the
-               # status recorded as unknown rather than watching a dead job to the bound.
-               STATUS=exited; IDENT_NOTE="identity unresolved (state $IDENT_STATE) and process group $PGID is empty; the execution ended without a receipt"
-             else STATUS=running; IDENT_NOTE="identity unresolved (state $IDENT_STATE) and no supervisor receipt yet; not concluding the job ended"; fi;;
-      esac
-    elif kill -0 "$CHILD" 2>/dev/null; then STATUS=running
-    else
-      # $CHILD is the SUPERVISOR, not the work. Its death is not the job's: the gateway child is
-      # reparented and keeps running in the same process group. Reading "supervisor gone" as
-      # "attempt over" published a terminal .exit for a live job and freed the prefix for a second
-      # one — the same defect the attach branch above was fixed for in cycle 4, left standing on
-      # the ORIGINAL launcher's path (cycle 5: CX-03). The launcher now uses the identical
-      # predicate: a receipt, or a provably empty group, and nothing else ends the attempt.
-      if [ -s "$RECEIPT" ]; then STATUS=exited
-      elif [ -n "$PGID" ] && group_is_empty "$PGID"; then
-        STATUS=exited; IDENT_NOTE="the supervisor is gone and process group $PGID is empty; the execution ended without a receipt"
-      else
-        STATUS=running
-        IDENT_NOTE="the supervisor (pid $CHILD) is gone but process group ${PGID:-<unrecorded>} is not provably empty and there is no receipt; not concluding the job ended"
-      fi
-    fi
+    # One question, one authority, and the same answer on both paths: a launcher and an attach are
+    # equally not the job's parent now, so both simply ask CCR. The three cycles of defects this
+    # replaces all came from inferring the answer — a pid that might be reused, a process group
+    # that might be unreadable, a supervisor whose death said nothing about its child.
+    case "$(ccr_job_state "$JOB_JSON")" in
+      running) STATUS=running; ALIVE=1;;
+      ended)   STATUS=exited; ALIVE=0;;
+      *)       # CCR could not be asked, or answered something this version does not know. That is
+               # not evidence the job ended: stay in flight and let the watch bound detach.
+               STATUS=running; ALIVE=0
+               IDENT_NOTE="ccr status for job $JOB_ID is unreadable or unrecognised (got '$(ccr_job_field "$JOB_JSON" status)'); not concluding the job ended";;
+    esac
     echo "$(elapsed)s status=$STATUS idle=${IDLE}s | $LASTLINE" >> "$PREFIX.progress"
     [ "$STATUS" = running ] || { OUTCOME=EXITED; break; }
     if [ "$IDLE" -ge $(( STALL_MIN * 60 )) ]; then OUTCOME=STALLED; break; fi
@@ -1053,23 +833,23 @@ if [ "$BACKEND" = ccr ]; then
     # values this process cannot know (cycle 2: CL-04). So an attach copies them forward
     # verbatim; only a launch writes them.
     if [ "$ATTACH" = 1 ]; then
-      D_IDENT="$IDENT"; D_MODEL=$(detached_field claude_model_id); D_SHA=$(detached_field prompt_sha256); D_TURNS=$(detached_field max_turns)
-      D_AT=$(detached_field detached_at); D_JOBLOG="${LOGFILE:-$PREFIX.joblog}"; D_RECEIPT="${RECEIPT:-$PREFIX.childexit}"
+      D_MODEL=$(detached_field claude_model_id); D_SHA=$(detached_field prompt_sha256); D_TURNS=$(detached_field max_turns)
+      D_AT=$(detached_field detached_at); D_JOBLOG="${JOB_LOG:-}"
       ATTACH_CMD=$(detached_field attach_command); CANCEL_CMD=$(detached_field cancel_command)
     else
-      D_IDENT=$(proc_identity "$CHILD"); D_MODEL="$CLAUDE_MODEL"; D_SHA=$(prompt_digest "$PROMPT_FILE"); D_TURNS="$MAX_TURNS"
-      D_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ); D_JOBLOG="$PREFIX.joblog"; D_RECEIPT="$PREFIX.childexit"
+      D_MODEL="$CLAUDE_MODEL"; D_SHA=$(prompt_digest "$PROMPT_FILE"); D_TURNS="$MAX_TURNS"
+      D_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ); D_JOBLOG="${JOB_LOG:-}"
       ATTACH_CMD="$0 $PREFIX --attach --stall-min $STALL_MIN --max-min $MAX_MIN --poll-sec $POLL"
-      CANCEL_CMD="$0 $PREFIX --attach --cancel   # identity-checked; never kill -$PGID directly, that number may name something else by now"
+      CANCEL_CMD="$0 $PREFIX --attach --cancel   # cancels job $JOB_ID through its owner (ccr cancel $JOB_ID); no pid or process group is ever signalled"
     fi
-    echo "$(elapsed)s DETACHED → watch bound reached with the job still running; nothing signalled (pgid $PGID left alive)" >> "$PREFIX.progress"
+    echo "$(elapsed)s DETACHED → watch bound reached with the job still running; nothing signalled (job $JOB_ID left running under its owner)" >> "$PREFIX.progress"
     # ORDER MATTERS: .detached is what admits an --attach, so it is written LAST, after every other
     # sidecar this attempt owns. Publishing it first opened a window in which an attach could be
     # admitted, collect the job and write .exit, and then have this block's .meta land on top of
     # the terminal record with outcome=DETACHED (cycle 3: CX-07).
     {
       echo "outcome=DETACHED"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "detached=yes"; echo "attached=${ATTEMPTS:-0}"
-      echo "pid=$CHILD"; echo "pgid=$PGID"; echo "thread=$(stream_field "$PREFIX.joblog" init-session)"
+      echo "job=$JOB_ID"; echo "session=$CCR_SESSION"; echo "thread=$(stream_field "$PREFIX.joblog" init-session)"
       echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "max_turns=$MAX_TURNS"
       echo "mode=$MODE"; echo "prompt_file=$PROMPT_FILE"; echo "command=$CMD"
       echo "attach_command=$ATTACH_CMD"; echo "cancel_command=$CANCEL_CMD"
@@ -1078,74 +858,82 @@ if [ "$BACKEND" = ccr ]; then
 backend=ccr
 alias=$ALIAS
 claude_model_id=$D_MODEL
-pid=$CHILD
-pgid=$PGID
-identity=$D_IDENT
+provider=$PROVIDER
+provider_model=$PROVIDER_MODEL
+compatibility=$COMPAT
+ccr_version=$CCR_VER
+command=$CMD
+job=$JOB_ID
+session=$CCR_SESSION
 joblog=$D_JOBLOG
-receipt=$D_RECEIPT
 mode=$MODE
 max_turns=$D_TURNS
 prompt_sha256=$D_SHA
+prompt_file=$PROMPT_FILE
 detached_at=$D_AT
 attach_command=$ATTACH_CMD
 cancel_command=$CANCEL_CMD
 EOD
     # NO .exit: an existing .exit tells every review gate the attempt finished, and it would then
     # rotate the claim and authorize a second launch against this still-running job.
-    echo "codex-run.sh: DETACHED backend=ccr alias=$ALIAS pgid=$PGID elapsed=$(elapsed)s — the job is still running."
+    echo "codex-run.sh: DETACHED backend=ccr alias=$ALIAS job=$JOB_ID elapsed=$(elapsed)s — the job is still running."
     echo "  attach: $ATTACH_CMD"
     echo "  cancel: $CANCEL_CMD"
     exit 6
   fi
   UNCONFIRMED_CANCEL=0
-  if [ "$OUTCOME" = STALLED ] && [ "$ATTACH" = 1 ] && [ "${ALIVE:-1}" != 1 ]; then
+  if [ "$OUTCOME" = STALLED ] && [ "${ALIVE:-1}" != 1 ]; then
     # The stall bound elapsed on an attach that has already logged that the recorded identity is
     # unresolved — the pid is unreadable, or it now names a different execution. The one rule
     # identity IS authoritative for is that nothing may be signalled unless the number still names
     # our execution, and TERM/KILLing the recorded group here would break it against a process we
     # have no reason to believe is ours (cycle 2: CL-01, CX-01). Nothing is signalled and nothing
     # terminal is published: the attempt stays in flight and the recovery is another attach.
+    # The stall bound elapsed while CCR could not be asked about the job. Cancelling now would be
+    # a request about a job whose state we cannot read; nothing is requested and nothing terminal
+    # is published. The attempt stays in flight and the recovery is another attach.
     OUTCOME=DETACHED
-    REDETACH_REASON="stall bound reached but the recorded identity is unresolved (state ${IDENT_STATE:-?}); nothing was signalled"
-    echo "$(elapsed)s STALLED → identity unresolved (state ${IDENT_STATE:-?}); refusing to signal pgid $PGID — re-detaching instead" >> "$PREFIX.progress"
+    REDETACH_REASON="stall bound reached but ccr could not be asked about job $JOB_ID; no cancellation requested"
+    echo "$(elapsed)s STALLED → job state unreadable; not requesting cancellation of $JOB_ID — re-detaching instead" >> "$PREFIX.progress"
   elif [ "$OUTCOME" = STALLED ]; then
-    if kill_group "$PGID" "$CHILD"; then
-      echo "$(elapsed)s $OUTCOME → process group $PGID terminated (confirmed: no member left)" >> "$PREFIX.progress"
+    # Cancellation is a REQUEST TO THE OWNER, by job id. This runner sends no signal, derives no
+    # pid and names no process group; CCR decides what to terminate and reports what it observed.
+    ccr_job_cancel "$JOB_ID" >/dev/null 2>>"$PREFIX.stderr" || true
+    CWAIT=0
+    while [ "$CWAIT" -lt 30 ]; do
+      JOB_JSON=$(ccr_job_json "$JOB_ID")
+      [ "$(ccr_job_state "$JOB_JSON")" = running ] || break
+      sleep 1; CWAIT=$((CWAIT+1))
+    done
+    CLEAN_COV=$(ccr_job_field "$JOB_JSON" cleanup.coverage)
+    CLEAN_SURV=$(ccr_job_field "$JOB_JSON" cleanup.survivors)
+    if [ "$(ccr_job_state "$JOB_JSON")" = ended ]; then
+      echo "$(elapsed)s $OUTCOME → job $JOB_ID cancelled by its owner (cleanup coverage=${CLEAN_COV:-unknown} survivors=${CLEAN_SURV:-[]})" >> "$PREFIX.progress"
     else
+      # CCR did not report the job terminal within the bound. That is exactly the "could not
+      # determine" case: it is never reported as a completed cancel.
       UNCONFIRMED_CANCEL=1
-      echo "$(elapsed)s $OUTCOME → cancel of process group $PGID NOT confirmed; a process may still be running" >> "$PREFIX.progress"
-      echo "codex-run.sh: cancel of process group $PGID not confirmed; DO NOT retry — check with: ps -o pid,pgid,command -g $PGID" >&2
+      echo "$(elapsed)s $OUTCOME → cancellation of job $JOB_ID NOT confirmed; it may still be running" >> "$PREFIX.progress"
+      echo "codex-run.sh: cancellation of job $JOB_ID not confirmed; DO NOT retry — check with: ccr status $JOB_ID --json" >&2
     fi
   fi
-  if [ "$ATTACH" = 1 ]; then
-    # An attaching process cannot wait() for a child it did not fork. The supervisor's receipt is
-    # exactly why it exists: the success predicate below keeps its exit-status condition.
-    CHILD_RC=$(awk -F= '$1=="child_exit"{print $2; exit}' "$RECEIPT" 2>/dev/null)
-    if [ -z "$CHILD_RC" ] && [ -n "$PGID" ] && group_is_empty "$PGID"; then
-      # No receipt, and the recorded process group is EMPTY. That is a proof of termination in the
-      # one direction that is sound: a pgid can be reused, which can only make a dead group look
-      # alive, never a live one look dead. So the execution is over and its exit status is
-      # unknowable — the supervisor was killed (SIGKILL, OOM, a host crash) before it could reap.
-      # Without this branch the prefix wedged permanently: the attach re-detached forever, the
-      # cancel refused to signal an unprovable identity, `release` refused a detached prefix and
-      # the taken claim refused a relaunch (cycle 3: CL-01/CX-06, executed). The attempt is closed
-      # as a FAILURE with the status recorded as unknown — never manufactured as success.
-      CHILD_RC=unknown
-      echo "$(elapsed)s no supervisor receipt at $RECEIPT and process group $PGID is empty; the execution ended without publishing a status — closing the attempt as FAILED with child_exit=unknown" >> "$PREFIX.progress"
-      LAST_ERROR_OVERRIDE="supervisor left no receipt and process group $PGID is provably empty; the exit status of this attempt is unknown"
-    fi
-    if [ -z "$CHILD_RC" ]; then
-      # No receipt means the owner has not reaped the child, so this attempt has NOT ended —
-      # whatever the pid looks like. Publishing a terminal failure here would delete .detached,
-      # free the claim and let a second job be launched against the one still running: the exact
-      # failure this change exists to prevent, reintroduced one level up.
-      OUTCOME=DETACHED
-      echo "$(elapsed)s no supervisor receipt at $RECEIPT; the attempt has not ended — re-detaching rather than publishing a terminal outcome" >> "$PREFIX.progress"
-      # A more specific reason already set upstream (a refused stall signal) is the one to keep.
-      REDETACH_REASON="${REDETACH_REASON:-no supervisor receipt; identity state ${IDENT_STATE:-0}}"
-    fi
-  else
-    wait "$CHILD" 2>/dev/null; CHILD_RC=$?
+  # The exit status comes from the job's OWNER, on both paths. A launcher is no more the job's
+  # parent than an attach is, so neither wait()s for anything: CCR reaped the workload and records
+  # what it reaped. This keeps the success predicate's exit-status condition without a receipt
+  # protocol of our own, and it is the same answer whichever process asks.
+  JOB_JSON=$(ccr_job_json "$JOB_ID")
+  CHILD_RC=$(ccr_job_field "$JOB_JSON" exit_code)
+  JOB_STATE=$(ccr_job_state "$JOB_JSON")
+  CLEAN_COV=$(ccr_job_field "$JOB_JSON" cleanup.coverage); CLEAN_COV=${CLEAN_COV:-unknown}
+  CLEAN_SURV=$(ccr_job_field "$JOB_JSON" cleanup.survivors); CLEAN_SURV=${CLEAN_SURV:-[]}
+  CLEAN_REASON=$(ccr_job_field "$JOB_JSON" cleanup.reason)
+  if [ "$JOB_STATE" != ended ]; then
+    # Not provably over. Publishing a terminal outcome here would delete .detached, free the claim
+    # and let a second job be launched against the one still running.
+    OUTCOME=DETACHED
+    echo "$(elapsed)s ccr does not report job $JOB_ID as ended (status '$(ccr_job_field "$JOB_JSON" status)'); the attempt has not ended — re-detaching rather than publishing a terminal outcome" >> "$PREFIX.progress"
+    # A more specific reason already set upstream (an unconfirmed cancel) is the one to keep.
+    REDETACH_REASON="${REDETACH_REASON:-ccr does not report job $JOB_ID as ended}"
   fi
   # A collector that cannot prove the attempt ended publishes nothing terminal. It refreshes the
   # detached record and leaves with exit 6, so .exit stays absent, the claim stays closed, and the
@@ -1156,7 +944,7 @@ EOD
     echo "$(elapsed)s DETACHED (re-detached): $REDETACH_REASON" >> "$PREFIX.progress"
     {
       echo "outcome=DETACHED"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "detached=yes"; echo "attached=$ATTEMPTS"
-      echo "pid=$DPID"; echo "pgid=$PGID"; echo "elapsed_sec=$(elapsed)"
+      echo "job=$JOB_ID"; echo "session=$CCR_SESSION"; echo "elapsed_sec=$(elapsed)"
       echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "mode=$MODE"; echo "prompt_file=$PROMPT_FILE"
       echo "command=$CMD"; echo "redetach_reason=$REDETACH_REASON"
       echo "attach_command=$ATTACH_CMD"; echo "cancel_command=$CANCEL_CMD"
@@ -1166,6 +954,11 @@ EOD
     echo "  attach: $ATTACH_CMD"
     exit 6
   fi
+  [ -n "${HELD_LOCK:-}" ] || publish_lock --must
+  FROZEN=$(python3 "$CCR_HELPER" freeze "$PREFIX" "$JOB_ID") || {
+    echo "codex-run.sh: result observation unresolved; retain attempt for investigation" >&2
+    exit 6
+  }
   SESSION_ID=$(stream_field "$PREFIX.joblog" init-session); ROUTED_MODEL=$(stream_field "$PREFIX.joblog" init-model)
   HAS_RESULT=$(stream_field "$PREFIX.joblog" has-result)
   stream_field "$PREFIX.joblog" result-text > "$PREFIX.stdout"
@@ -1175,14 +968,14 @@ EOD
     # failed attempt even if the child exited 0 (review round 1: F-10).
     # `child_exit=unknown` (a supervisor that died before reaping, above) is not zero, so this
     # predicate closes such an attempt as FAILED without ever manufacturing a success.
-    if [ "$CHILD_RC" = 0 ] && [ "$HAS_RESULT" = yes ] && [ "$(stream_field "$PREFIX.joblog" result-ok)" = yes ]; then OUTCOME=COMPLETED; else OUTCOME=FAILED; fi
+    if [ "$(ccr_job_field "$FROZEN" successful)" = True ]; then OUTCOME=COMPLETED; else OUTCOME=FAILED; fi
   fi
   # The configured alias is CCR input. `CLAUDE_MODEL` is the generated model ID
   # CCR promised for it; the child independently reports `ROUTED_MODEL` at init.
   # A mismatch is a route/configuration failure, never a reason to try Claude or
   # another alias. This comparison is local metadata only — no extra ccr call.
   ROUTE_OK=unknown
-  if [ "$OUTCOME" = COMPLETED ]; then
+  if [ "$OUTCOME" = COMPLETED ] || [ "$(ccr_job_field "$FROZEN" error_code)" = route_identity_mismatch ]; then
     # On an attach, the expected model is the one recorded at launch. Judging a finished execution
     # by whatever the alias resolves to NOW would turn an ordinary config change into UNAVAILABLE
     # for an answer that was already produced correctly.
@@ -1199,17 +992,22 @@ EOD
     fi
   fi
   # The attach path already holds this lock from admission; a launch takes it here.
-  [ "$ATTACH" = 1 ] || publish_lock --must
-  [ "$OUTCOME" != COMPLETED ] || [ -z "$SESSION_ID" ] || printf '%s\n' "$SESSION_ID" > "$DIR/.ccr-last-session"
+  [ "$OUTCOME" != COMPLETED ] || [ -z "$SESSION_ID" ] || { printf '%s\n' "$SESSION_ID" > "$DIR/.ccr-last-session"; printf '%s\n' "$JOB_ID" > "$DIR/.ccr-last-job"; }
   {
     echo "outcome=$OUTCOME"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "detached=no"; echo "attached=${ATTEMPTS:-0}"
     [ -z "${IDENT_NOTE:-}" ] || echo "identity_note=$IDENT_NOTE"; echo "provider=$PROVIDER"; echo "provider_model=$PROVIDER_MODEL"
     echo "claude_model_id=$CLAUDE_MODEL"; echo "routed_model=${ROUTED_MODEL:-unknown}"; echo "route_identity=$ROUTE_OK"; echo "compatibility=$COMPAT"; echo "ccr_version=$CCR_VER"
-    echo "pid=$CHILD"; echo "pgid=$PGID"; echo "child_exit=$CHILD_RC"; echo "thread=${SESSION_ID:-unknown}"
+    echo "job=$JOB_ID"; echo "session=$CCR_SESSION"; echo "child_exit=$CHILD_RC"; echo "thread=${SESSION_ID:-unknown}"
+    # CCR reports what it cleaned up separately from what the workload returned, and an empty
+    # survivor list is NOT a claim that everything was cleaned up. Both facts are recorded here
+    # verbatim: partial coverage is a real limit of the host, not a failure of this attempt, and
+    # it must not be silently rounded to "clean" by anything that reads this file.
+    echo "cleanup_coverage=$CLEAN_COV"; echo "cleanup_survivors=$CLEAN_SURV"
+    [ -z "${CLEAN_REASON:-}" ] || echo "cleanup_reason=$CLEAN_REASON"
     echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "max_turns=$MAX_TURNS"
     echo "mode=$MODE"; [ "$MODE" != "--resume-session" ] || echo "resume_session=$RESUME_SESSION"; echo "prompt_file=$PROMPT_FILE"; echo "result_event=$(stream_field "$PREFIX.joblog" result-subtype)"
     echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
-    LASTERR=$(grep -E 'error|Error|exit status' "$PREFIX.stderr" | tail -1 | cut -c1-300)
+  LASTERR=$(sed '/^[[:space:]]*$/d' "$PREFIX.stderr" | tail -1 | cut -c1-300)
     echo "last_error=${LAST_ERROR_OVERRIDE:-${LASTERR:-none}}"; echo "cancel_confirmed=$([ "$UNCONFIRMED_CANCEL" = 1 ] && echo no || echo "$([ "$OUTCOME" = STALLED ] && echo yes || echo n/a)")"
   } > "$PREFIX.meta"
   # TIMEOUT/3 is RETIRED: no path assigns OUTCOME=TIMEOUT any more — a watch bound that elapses
@@ -1339,6 +1137,7 @@ worker_pid=$D_WPID
 worker_identity=$D_WIDENT
 mode=$MODE
 prompt_sha256=$D_SHA
+prompt_file=$PROMPT_FILE
 detached_at=$D_AT
 attach_command=$ATTACH_CMD
 cancel_command=$CANCEL_CMD

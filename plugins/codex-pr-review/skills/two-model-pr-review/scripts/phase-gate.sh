@@ -18,6 +18,7 @@
 # atomic claim as their last step — pre-codex one per participant of 00-participants.tsv
 # (prefixes 02-p1..02-pN). See SKILL.md §Phase gate and §Participants.
 set -u
+umask 077
 USAGE='usage: phase-gate.sh pre-codex <ART> <REPO> | phase-gate.sh pre-phase3|pre-consultation|pre-verification|pre-resolution|pre-report|post-join <ART> | phase-gate.sh release|confirm-terminated <ART> <prefix>'
 die2() { echo "phase-gate.sh: $1" >&2; echo "$USAGE" >&2; exit 2; }
 CMD="${1:-}"; ART="${2:-}"; REPO="${3:-}"
@@ -48,7 +49,7 @@ PST=""              # terminal state of the phase last parsed by phase_status
 PST_POLICY=""       # the tier token a NOT_RUN_POLICY line cited, empty for every other state
 HELD_LOCK=""        # claim lock held by claim_lock, released by claim_unlock or on_exit
 PKT_TMP=""          # packet build/recheck scratch file, removed by on_exit on any failure
-on_exit() { rm -f "$SCRATCH" "$PKT_TMP" 2>/dev/null; [ -z "$HELD_LOCK" ] || { rm -f "$HELD_LOCK/holder" 2>/dev/null; rmdir "$HELD_LOCK" 2>/dev/null; }; [ "$LEAD_WAS_SEALED" = 1 ] && chmod 000 "$ART/01-lead.md" 2>/dev/null; :; }
+on_exit() { rm -f "$SCRATCH" "$PKT_TMP" 2>/dev/null; exec 9>&-; HELD_LOCK=""; [ "$LEAD_WAS_SEALED" = 1 ] && chmod 000 "$ART/01-lead.md" 2>/dev/null; :; }
 trap on_exit EXIT
 # A launch claim whose runner has not yet written .progress is still in flight
 # for this long (the gate -> runner handoff is seconds, but a consent prompt can
@@ -796,108 +797,19 @@ refuse_relaunch() {  # refuse_relaunch <prefix> <terminal.md> <next-gate>
 # <prefix>.claim/ only after confirming that launcher, its runner and its Codex
 # job are all dead.
 CLAIM_SPENT_MAX=9
-# Rotating or creating a claim and a runner taking one are serialized by
-# <prefix>.claim.lock (an atomic mkdir held for milliseconds), so a runner can
-# never take a claim the gate is rotating out from under it (round-38 CX-03).
-# The runner uses the same lock, and it does NOT hold it for milliseconds: an --attach holds it
-# for its whole watch, up to twenty-five minutes, so that the collection of one job cannot be
-# interleaved with a second collector or a release. That makes "older than a minute" the wrong
-# test — it would reclaim the lock out from under a perfectly healthy attach and admit exactly the
-# concurrency this lock exists to exclude (review cycle 2: CL-02). Staleness is a property of the
-# HOLDER: the holder records its pid and start-time identity inside the lock, and the lock is
-# reclaimed only once that execution is provably no longer running. The clock decides one case
-# only — a lock with no holder record, which is either a pre-change lock or the millisecond window
-# between the mkdir and the record being written.
-CLAIM_LOCK_STALE_SEC=60
-lock_identity() {  # <pid> -> start time, pinned to UTC so it does not depend on who is looking
-  TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//'
-}
-# Emptiness of a job's process group, asked by READING the process table — this gate never signals
-# a group, and `kill -0 -- "-N"` would in any case answer for N=0 (this shell's own group) and N=1
-# (every process this user owns). Returns 0 ONLY on proof: a non-numeric or sentinel pgid, or a ps
-# that told us nothing, is undetermined and returns 1 so callers stay refused. Sound one way only —
-# a reused pgid can make a dead group look alive, never a live one look dead.
-# Two false-"empty" paths closed in cycle 5 (CX-04): `ps … | tr …` reported TR's status, so a ps
-# that failed — or died part-way through printing — read as a complete answer; and the pgid was
-# compared as text, so a zero-padded id never matched the table's unpadded form. ps is now run on
-# its own with its status checked, the table is sanity-checked by looking for a group that must be
-# in it (ours), and both sides of the comparison are base-10 integers.
-group_is_empty() {  # <pgid>
-  local pg="$1" raw rc norm self
-  case "$pg" in ''|*[!0-9]*) return 1;; esac
-  pg=$((10#$pg))
-  [ "$pg" -ge 2 ] 2>/dev/null || return 1
-  raw=$(ps -Ao pgid= 2>/dev/null); rc=$?
-  [ "$rc" = 0 ] || return 1
-  norm=$(printf '%s\n' "$raw" | tr -d ' ' | grep -E '^[0-9]+$' | sed 's/^0*\([0-9]\)/\1/')
-  [ -n "$norm" ] || return 1
-  self=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
-  case "$self" in ''|*[!0-9]*) return 1;; esac
-  printf '%s\n' "$norm" | grep -qx -- "$((10#$self))" || return 1   # truncated table: undetermined
-  printf '%s\n' "$norm" | grep -qx -- "$pg" && return 1
-  return 0
-}
-# Reclaiming is a race: testing the holder and deleting it are two steps, so a second reclaimer
-# could delete the REPLACEMENT holder and two processes would both hold the lock (review cycle 3:
-# CL-04/CX-04). The rename serializes it — only one contender can move the holder file away — and
-# the mover then verifies that what it moved is the very record it judged stale, restoring it if a
-# live process has replaced it in the meantime. A holder file that cannot be READ (empty, or
-# truncated by an interrupted write) is not evidence of a dead holder; it falls through to the
-# clock, which must delete the file too, because `rmdir` cannot remove a directory that still
-# contains it — that pair wedged the lock permanently (cycle 3: CX-05).
-reclaim_lock() {  # <lock> <the exact holder record judged stale> -> 0 when the lock is now free
-  local lock="$1" want="$2" tmp="$1/holder.dead.$$"
-  mv "$lock/holder" "$tmp" 2>/dev/null || return 1
-  if [ "$(cat "$tmp" 2>/dev/null)" = "$want" ]; then
-    rm -f "$tmp"; rmdir "$lock" 2>/dev/null && return 0
-    return 1
+# Share the runner's kernel lock and keep its inode stable across attempts.
+# Legacy directory locks do not grant authority to reclaim another collector.
+claim_lock() {  # <prefix>
+  local lock="$ART/$1.claim.lock"
+  [ ! -d "$lock" ] || fail "legacy collector lock $lock: drain old runners before upgrading"
+  exec 9>>"$lock" || fail "cannot open collector lock $lock"
+  if ! python3 "$ROOT/../../scripts/ccr-job.py" lock 9 5; then
+    exec 9>&-
+    fail "$1.claim.lock is held by a live collector or locking is unavailable; retry later"
   fi
-  mv "$tmp" "$lock/holder" 2>/dev/null || rm -f "$tmp"
-  return 1
-}
-claim_lock() {  # claim_lock <prefix>
-  local lock="$ART/$1.claim.lock" i=0 now hrec hpid hident hlive d dp
-  while ! mkdir "$lock" 2>/dev/null; do
-    hrec=$(cat "$lock/holder" 2>/dev/null)
-    hpid=$(printf '%s\n' "$hrec" | awk -F= '$1=="pid"{print $2; exit}')
-    hident=$(printf '%s\n' "$hrec" | awk -F= '$1=="identity"{sub(/^[^=]*=/,""); print; exit}')
-    if [ -n "$hpid" ]; then
-      hlive=$(lock_identity "$hpid")
-      # An empty identity means either "the holder is gone" or "`ps` could not answer", and reading
-      # the second as the first took the lock from a live collector (cycle 5: CX-05). An absence is
-      # only believed when `ps` demonstrably works — asked about this process, which certainly
-      # exists. A MISMATCH needs no such proof: it is a positive answer about a different execution.
-      if [ "$hlive" != "$hident" ] && { [ -n "$hlive" ] || [ -n "$(lock_identity "$$")" ]; }; then
-        reclaim_lock "$lock" "$hrec" && continue
-      fi
-    else
-      now=$(date +%s)
-      if [ $(( now - $(mtime "$lock" || echo "$now") )) -ge "$CLAIM_LOCK_STALE_SEC" ]; then
-        # rmdir refuses a directory that still contains anything, so the clock clears every file a
-        # lock can hold — `holder`, and a `holder.dead.<pid>` left behind by a reclaim_lock killed
-        # between its rename and its rm. Clearing only `holder` wedged the lock permanently, the
-        # same shape cycle 3 fixed for `holder` itself (cycle 4: CX-05).
-        # But that file is only abandoned once the reclaimer named in it is gone: while that process
-        # runs, it is a live holder record moved aside and still restorable, and deleting it let a
-        # third contender take a lock a second one owned (cycle 5: CX-06). The name carries the pid,
-        # so the question is asked rather than inferred from the directory's age.
-        for d in "$lock"/holder.dead.*; do
-          [ -e "$d" ] || continue
-          dp=${d##*.}
-          case "$dp" in ''|*[!0-9]*) rm -f "$d" 2>/dev/null; continue;; esac
-          kill -0 "$dp" 2>/dev/null || rm -f "$d" 2>/dev/null
-        done
-        rm -f "$lock/holder" 2>/dev/null
-        rmdir "$lock" 2>/dev/null && continue   # an unremovable stale lock is retried like a held one (bounded)
-      fi
-    fi
-    i=$((i+1)); [ "$i" -lt 50 ] || fail "$1.claim.lock is held by a live launcher, runner or attach (a claim is being taken or rotated, or a detached job is being collected — an attach holds it for its whole watch); retry in a moment"
-    sleep 0.1
-  done
-  printf 'pid=%s\nidentity=%s\n' "$$" "$(lock_identity "$$")" > "$lock/holder" 2>/dev/null || true
   HELD_LOCK="$lock"
 }
-claim_unlock() { [ -z "$HELD_LOCK" ] || { rm -f "$HELD_LOCK/holder" 2>/dev/null; rmdir "$HELD_LOCK" 2>/dev/null; }; HELD_LOCK=""; }
+claim_unlock() { exec 9>&-; HELD_LOCK=""; }
 rotate_claim() {  # rotate_claim <prefix>: <prefix>.claim -> <prefix>.claim.spentN (never deleted; a runner-taken one stays a counted launch)
   local prefix="$1" claim="$ART/$1.claim" n=1
   while [ -e "$claim.spent$n" ]; do n=$((n+1)); done
@@ -919,20 +831,9 @@ descendants_alive() {  # descendants_alive <pid>: 0 when any descendant is alive
   for c in $kids; do kill -0 "$c" 2>/dev/null && return 0; descendants_alive "$c" && return 0; done
   return 1
 }
-ccr_release_check() {  # ccr_release_check <prefix> <launch line>
-  local prefix="$1" launch="$2" pid pgid left
-  pid=$(printf '%s' "$launch" | grep -oE ' pid=[0-9]+' | head -1 | cut -d= -f2)
-  pgid=$(printf '%s' "$launch" | grep -oE ' pgid=[0-9]+' | head -1 | cut -d= -f2)
-  [ -n "$pgid" ] || fail "release: ccr launch record of $prefix has no pgid= (launch line: ${launch:0:120}); cancel the process tree by hand (ps -o pid,pgid,command | grep 'ccr launch'), then re-run the gate"
-  # Asked by reading, not by probing: `kill -0 -- "-N"` is a permission test, and for N=1 it tests
-  # every process this user owns and would answer "alive" for a group that never existed, wedging
-  # release against a truncated or hand-edited record. group_is_empty answers from the process
-  # table and returns "not empty" for the sentinels, so this still fails closed.
-  if ! group_is_empty "$pgid"; then
-    left=$(ps -o pid= -g "$pgid" 2>/dev/null | tr -d ' \n')
-    fail "release: process group $pgid of $prefix is not provably empty (members: ${left:-unreadable}; $(ps -o pid=,command= -g "$pgid" 2>/dev/null | head -3 | tr '\n' ';')); cancel it first"
-  fi
-  if [ -n "$pid" ] && descendants_alive "$pid"; then fail "release: a descendant of pid $pid ($prefix) is still alive; cancel it first"; fi
+ccr_release_check() {  # private admitted context is the sole workload authority
+  local helper="$ROOT/../../scripts/ccr-job.py"
+  python3 "$helper" stopped "$ART/$1" >/dev/null || fail "release: CCR stop evidence for $1 is unresolved; restore CCR and attach. Legacy PID records cannot grant control."
 }
 release_claim() {
   local prefix="$1" claim="$ART/$1.claim" pid job st root launch backend alias
@@ -959,24 +860,8 @@ release_claim() {
     # itself a reason to refuse — an unfinished job is, and that is what the proof below asks.
     if [ "$d_backend" = codex ]; then
       : # fall through to the companion proof; it fails closed if the job is not provably finished
-    elif [ "$d_backend" = ccr ] && [ -n "$d_pid" ]; then
-      # TZ=UTC, exactly as the runner records it: `ps -o lstart=` renders the start time in the
-      # OBSERVING shell's local time, so without it this gate would read a live, matching process
-      # as unidentifiable whenever it runs under a different TZ than the launcher did.
-      d_live=$(TZ=UTC ps -o lstart= -p "$d_pid" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//')
-      if [ -n "$d_live" ] && [ "$d_live" = "$d_ident" ]; then
-        fail "release: $prefix is detached and its job is still alive (pid $d_pid, identity verified); attach to collect it, or cancel it — never release a running job"
-      fi
-      # Either the process is gone or the number now names something else. Neither is proof the
-      # WORK stopped — the supervisor's child is reparented and keeps running in the same process
-      # group — so the group is read directly. An empty group is proof in the one sound direction;
-      # anything else stays refused, and the message now names a recovery that is reachable rather
-      # than pointing back at the attach (cycle 4: CL-05).
-      if [ -n "$d_pgid" ] && group_is_empty "$d_pgid"; then
-        : # nothing of that job is left: fall through to the generic checks below
-      else
-        fail "release: $prefix is detached and its execution is no longer identifiable (pid $d_pid) and process group ${d_pgid:-(unrecorded)} is not provably empty; run its attach command first so the outcome is published, then release. If the attach cannot reach its backend at all, the two exits are: restore the backend and re-run the attach, or abandon this prefix — record the phase FAILED and start a fresh run directory. Check for survivors first: ps -o pid,pgid,command -g ${d_pgid:-<pgid>}"
-      fi
+    elif [ "$d_backend" = ccr ]; then
+      ccr_release_check "$prefix" ""
     else
       fail "release: $prefix is detached (backend=$d_backend); run its attach command to publish an outcome before releasing the claim. If the attach cannot reach its backend at all, the two exits are: restore the backend and re-run the attach, or abandon this prefix — record the phase FAILED and start a fresh run directory. Never hand-free a claim whose job may still be running."
     fi
@@ -997,12 +882,10 @@ release_claim() {
   # participant's row (02-p<k>) or the exchange participant's (04-/06-).
   case "$prefix" in 02-*) backend=$(participant_field "${prefix#02-}" backend); alias=$(participant_field "${prefix#02-}" alias);;
     *) backend=$(participant_field "$(cat "$ART/02-exchange-participant" 2>/dev/null)" backend); alias=$(participant_field "$(cat "$ART/02-exchange-participant" 2>/dev/null)" alias);; esac
-  if [ -n "$launch" ]; then
+  if [ -n "$launch" ] || [ -e "$ART/$prefix.ccr-attempt.json" ]; then
     ccr_release_check "$prefix" "$launch"   # never consults the companion: there is no Codex job
   elif [ -z "$job" ] && [ -e "$ART/$prefix.progress" ] && [ "$backend" = ccr ]; then
-    # .progress exists with no launch line: a ccr runner killed between creating the file and
-    # recording the launch. Fail closed while any ccr launch for that alias is running.
-    ! pgrep -f "ccr launch --model ${alias:-__none__} " >/dev/null 2>&1 || fail "release: $prefix.progress records no launch line, and a ccr launch for alias ${alias} is still running (ps -o pid,pgid,command | grep 'ccr launch --model ${alias}'); cancel it first"
+    ccr_release_check "$prefix" ""
   elif [ -n "$job" ] || [ -e "$ART/$prefix.progress" ]; then
     # A job was launched, or may have been (the runner creates .progress just
     # before `task` and records the job id just after it, so a runner killed in
@@ -1134,14 +1017,7 @@ confirm_terminated() {  # <prefix>; only a current exit-5/cancel-confirmed=no at
   backend=$(awk -F= '$1 == "backend" {print $2; exit}' "$stem.meta")
   case "$backend" in
     ccr)
-      pid=$(awk -F= '$1 == "pid" {print $2; exit}' "$stem.meta"); pgid=$(awk -F= '$1 == "pgid" {print $2; exit}' "$stem.meta")
-      # An unreadable pgid caused the runner to kill the child directly. It is
-      # already a terminal safety failure, but cannot be proven dead later by a
-      # fabricated group id; require a real recorded group for recovery.
-      case "$pid" in ''|*[!0-9]*) fail "confirm-terminated: $prefix ccr attempt has no numeric pid";; esac
-      case "$pgid" in ''|unknown|*[!0-9]*) fail "confirm-terminated: $prefix ccr attempt has no numeric pgid";; esac
-      kill -0 "$pid" 2>/dev/null && fail "confirm-terminated: runner pid $pid is still alive"
-      ccr_release_check "$prefix" "0s launched backend=ccr pid=$pid pgid=$pgid"
+      ccr_release_check "$prefix" ""
       ;;
     codex)
       job=$(awk -F= '$1 == "job" {print $2; exit}' "$stem.meta")

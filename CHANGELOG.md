@@ -2,6 +2,31 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [shared runner — CCR durable job ownership] - 2026-09-11
+
+`codex-pr-review` 6.0.0 · `codex-deep-plan` 3.0.0 · `codex-debate` 2.0.0.
+
+### Changed
+- Requires CCR 0.5.1 for the CCR review backend. Launch, smoke, watch, attach,
+  cancellation, claim release, and termination confirmation use durable CCR jobs.
+- CCR resume is temporarily unavailable: both resume options return exit 4 before
+  admission or claim mutation. Explicitly record unavailable continuity and use a
+  self-contained fresh exchange for subsequent CCR rounds. Codex resume is unchanged.
+- Drain legacy process-based attempts with the original runner before upgrading.
+  The new runner never derives workload cancellation authority from PID/PGID records.
+
+### Fixed
+- Persist attempt inputs and the receipt before releasing admission ownership.
+  A dead watcher is immediately attachable; missing receipts remain unresolved and
+  never permit automatic resubmission or terminal claim release.
+- Require positive exit and cleanup evidence separately from successful output.
+  Unknown cleanup and observed survivors keep the attempt open; partial coverage
+  remains visible. A failed job cannot promote a successful-looking result event.
+- Bind accepted output to job/session/model identity and committed log bytes.
+  Changed or truncated result evidence fails validation; later appends cannot
+  replace the result. Attach retains the launch's original control context.
+- Detect activity on CCR's source log, so polling copies do not mask a stalled job.
+
 ## [shared runner — detach on the watch bound; tri-state availability] - 2026-09-09
 
 `codex-pr-review` 5.1.0 · `codex-deep-plan` 2.4.0 · `codex-debate` 1.3.0 — the runner is shipped
