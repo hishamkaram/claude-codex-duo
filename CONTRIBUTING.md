@@ -54,8 +54,10 @@ the cancellation helper enforces the same identity before requesting cancellatio
 Both CCR and Codex collectors retain their lease through final or detached
 publication. A terminal backend job alone does not authorize prefix replacement.
 Argument errors preserve durable admission records, including smokes whose
-receipt was lost. Test teardown never signals a group from saved metadata;
-fixtures have finite lifetimes when ownership cannot be confirmed.
+receipt was lost. Empty or incomplete legacy progress also blocks admission
+until the legacy attempt is drained; missing identity never authorizes rotation.
+Test fixtures stop cooperatively through private stop files, with finite lifetimes
+if the test collector disappears. Teardown never signals a saved PID or group.
 An unconfirmed write-runner cancellation returns exit5 without waiting for an
 unproven stop or staging/committing files that the workload may still change.
 

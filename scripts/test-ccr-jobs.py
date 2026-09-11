@@ -509,6 +509,19 @@ os.execv('/bin/ps', ['ps'] + sys.argv[1:])
         self.assertFalse(Path(str(self.prefix) + ".attempt1.progress").exists())
         self.assertEqual(list((self.root / "store/fake-ccr-jobs").glob("*.json")), before)
 
+    def test_incomplete_legacy_progress_never_rotates_or_admits(self):
+        for content in ("", "0s preparing legacy workload\n", "0s launched back"):
+            with self.subTest(content=content):
+                progress = Path(str(self.prefix) + ".progress")
+                progress.write_text(content)
+                result = self.launch()
+                self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+                self.assertIn("no verifiable workload identity", result.stderr)
+                self.assertEqual(progress.read_text(), content)
+                self.assertFalse(Path(str(self.prefix) + ".attempt1.progress").exists())
+                self.assertFalse(Path(str(self.prefix) + ".ccr-attempt.json").exists())
+                self.assertFalse(Path(str(self.prefix) + ".exit").exists())
+
     def test_kernel_lock_blocks_even_when_process_inspection_fails(self):
         ps = self.root / "ps"
         ps.write_text("#!/bin/sh\nexit 1\n")
@@ -631,6 +644,35 @@ os.execv('/bin/ps', ['ps'] + sys.argv[1:])
 
 
 class ConsumerSafetyTests(unittest.TestCase):
+    def test_fixture_stop_is_cooperative_and_releases_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stop, ready, lease_path = (root / name for name in ("stop", "ready", "lease"))
+            fixture = Path(__file__).resolve().parent / "fixture-process.py"
+            process = subprocess.Popen([sys.executable, str(fixture), str(stop), "--lease", str(lease_path), "--ready", str(ready), "--lifetime", "5"])
+            try:
+                deadline = time.monotonic() + 3
+                while not ready.exists():
+                    self.assertIsNone(process.poll(), "fixture failed before readiness")
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(.02)
+                with lease_path.open("a") as lease:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    stop.touch()
+                    self.assertEqual(process.wait(timeout=3), 0)
+                    fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # Expired fixtures require no signal, even if teardown arrives late.
+                stop.touch()
+                script = (fixture.parent / "test-args.sh").read_text()
+                self.assertNotIn("signal_pid", script)
+                for variable in ("CJOB", "WPID", "GH"):
+                    self.assertNotRegex(script, r"kill[^\n]*\$" + variable)
+            finally:
+                stop.touch()
+                process.wait(timeout=6)
+
+
     def test_unconfirmed_fixture_cleanup_never_signals_saved_group(self):
         source = (ROOT / "scripts/test-args.sh").read_text()
         helpers = ""

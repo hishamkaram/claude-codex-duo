@@ -67,14 +67,8 @@ fixture_prov() {  # what Phase 3 writes beside the matrix: one raiser row per or
 # `kill -KILL "${VAR:-0}"` is a session-wide kill wearing a per-pid disguise, and the value it
 # defaults from is read out of a sidecar that need not contain it: a LAUNCH-ERROR `.meta` carries
 # no `pid=` at all, so one failed fixture launch turns a teardown into `kill -KILL 0`
-# (cycle 5: CL-01/CX-01, reproduced). Every per-pid signal and probe in this suite goes through
-# these two, which refuse empty, non-numeric, 0, 1 and this shell itself.
-signal_pid() {  # <pid> <signal> -> 0 when it was sent, 1 when the target was refused
-  case "${1:-}" in ''|*[!0-9]*) return 1;; esac
-  [ "$1" -ge 2 ] 2>/dev/null || return 1
-  [ "$1" != "$$" ] || return 1
-  kill "-$2" "$1" 2>/dev/null || true
-}
+# (cycle 5: CL-01/CX-01, reproduced). The remaining read-only probe rejects invalid PID values. Fixture teardown
+# uses private cooperative stop files and never signals a saved PID.
 pid_alive() {  # <pid> -> 0 only when a plausible, non-sentinel pid is running
   case "${1:-}" in ''|*[!0-9]*) return 1;; esac
   [ "$1" -ge 2 ] 2>/dev/null || return 1
@@ -386,7 +380,7 @@ chk "T-30: empty legacy holder fails closed" 4 "legacy collector lock" env PATH=
 # job beside it. codex-debate and codex-deep-plan pass no --claim, so this guard is their only
 # protection. A record whose worker is provably alive must refuse the launch.
 CP13="$CCRD/p-codexlive"
-sleep 300 & CJOB=$!
+python3 scripts/fixture-process.py "$CP13.stop" & CJOB=$!
 { printf 'backend=codex\njob=task-fake-live\nthread=t\njoblog=\n'
   printf 'worker_pid=%s\nworker_identity=%s\n' "$CJOB" "$(TZ=UTC ps -o lstart= -p "$CJOB" | tr -s ' ' | sed 's/^ *//;s/ *$//')"
   printf 'mode=--fresh\nattach_command=ATTACH-CODEX\ncancel_command=CANCEL-CODEX\n'; } > "$CP13.detached"
@@ -396,7 +390,7 @@ out=$(bash "$R" "$CP13" --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$
   && [ -e "$CP13.detached" ] && [ ! -e "$CP13.attempt1.detached" ] \
   && printf '  ok    %-42s\n' "T-31: a codex relaunch is refused while alive" \
   || { printf '  FAIL  T-31: rc=%s rotated=%s out=%s\n' "$rc" "$([ -e "$CP13.attempt1.detached" ] && echo yes || echo no)" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
-signal_pid "$CJOB" TERM; wait "$CJOB" 2>/dev/null
+: > "$CP13.stop"; wait "$CJOB" 2>/dev/null
 
 # T-16: a refused attach must never rewrite a terminal .exit — the result it would destroy is the
 # whole point of the change.
@@ -1566,9 +1560,9 @@ chk "release: job without a reachable codex plugin refused" 1 "cannot locate the
 FAKE="$TMP/fakehome/.claude/plugins/cache/openai-codex/codex/9.9.9/scripts"; mkdir -p "$FAKE"
 printf 'if (process.argv.includes("--all")) { console.log(JSON.stringify({running: process.env.FAKE_RUNNING ? [{id:"task-live-1", workspaceRoot: process.env.FAKE_RUNNING}] : []})); } else { console.log(JSON.stringify({job:{status:process.env.FAKE_STATUS||"running"}})); }\n' > "$FAKE/codex-companion.mjs"
 chk "release: running job refused" 1 "not provably finished" env HOME="$TMP/fakehome" FAKE_STATUS=running bash "$PG" release "$PC5" 02-p1
-( exec -a "task-worker --job-id task-fake-job1" sleep 30 ) & WPID=$!; sleep 1
+python3 scripts/fixture-process.py "$PC5/worker.stop" task-worker --job-id task-fake-job1 & WPID=$!; sleep 1
 chk "release: live worker process refused" 1 "worker process for job task-fake-job1 is still alive" env HOME="$TMP/fakehome" FAKE_STATUS=completed bash "$PG" release "$PC5" 02-p1
-signal_pid "$WPID" TERM; wait "$WPID" 2>/dev/null
+: > "$PC5/worker.stop"; wait "$WPID" 2>/dev/null
 chk "release: finished job rotates the claim" 0 "RELEASED 02-p1 -> 02-p1.claim.spent" env HOME="$TMP/fakehome" FAKE_STATUS=completed bash "$PG" release "$PC5" 02-p1
 [ ! -d "$PC5/02-p1.claim" ] && ls -d "$PC5"/02-p1.claim.spent*/runner >/dev/null 2>&1 && grep -q '^released_by=phase-gate.sh release' "$PC5"/02-p1.claim.spent*/owner && printf '  ok    %-42s\n' "release: rotated claim keeps runner/ (still a counted launch)" || { printf '  FAIL  release: claim not rotated with runner\n'; FAIL=1; }
 chk "release: nothing live to release" 1 "no live claim" bash "$PG" release "$PC5" 02-p1
@@ -1761,18 +1755,12 @@ out=$(env HOME="$TMP/nohome" bash "$PG" release "$PD" 02-p1 2>&1); rc=$?
   || { printf '  FAIL  T-24g2: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -2 | tr '\n' ' ')"; FAIL=1; }
 printf '%s\n' "$$" > "$PD/02-p1.claim/runner/pid"
 # A real kernel lease blocks the gate until its holder dies. No PID identity record.
-python3 - "$PD/02-p1.claim.lock" "$PD/lease-ready" <<'PYLOCK' &
-import fcntl,pathlib,sys,time
-with open(sys.argv[1],'a') as f:
-    fcntl.flock(f,fcntl.LOCK_EX)
-    pathlib.Path(sys.argv[2]).touch()
-    time.sleep(300)
-PYLOCK
+python3 scripts/fixture-process.py "$PD/lease.stop" --lease "$PD/02-p1.claim.lock" --ready "$PD/lease-ready" &
 GH=$!
 for _ in $(seq 1 50); do [ ! -e "$PD/lease-ready" ] || break; sleep 0.1; done
 [ -e "$PD/lease-ready" ] || { printf '  FAIL  kernel lease fixture never ready\n'; FAIL=1; }
 chk "T-25g: live kernel lease blocks gate" 1 "claim.lock is held by a live" bash "$PG" release "$PD" 02-p1
-signal_pid "$GH" TERM; wait "$GH" 2>/dev/null
+: > "$PD/lease.stop"; wait "$GH" 2>/dev/null
 out=$(bash "$PG" release "$PD" 02-p1 2>&1)
 printf '%s' "$out" | grep -q 'claim.lock is held' && { printf '  FAIL  T-25g: dead holder retained lease\n'; FAIL=1; }
 lock_free "$PD/02-p1.claim.lock" || { printf '  FAIL  T-25g: kernel lease not released\n'; FAIL=1; }

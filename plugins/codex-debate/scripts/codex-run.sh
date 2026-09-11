@@ -536,6 +536,8 @@ refuse_if_in_flight() {
         else
           mlive="the codex companion could not be consulted for job $ljob"
         fi
+      else
+        mlive="unfinished legacy attempt has no verifiable workload identity; drain it before upgrading"
       fi
     fi
     if [ -n "$mlive" ]; then
