@@ -72,3 +72,11 @@ Only the original prompt contains the random marker; the fixture returns it only
 real Claude request carries that history. Each continuation resolves its authoritative head
 before creating the prompt. `continuation.json` records distinct jobs sharing one session.
 Configured-provider acceptance complements this deterministic gate before release.
+
+Admission lookup and replay responses are retained as private content-addressed
+`.ccr-observation.*` artifacts before validation. Every attempt reader compares
+these observations, the original receipt, and legacy replay evidence before
+binding or controlling a job. A conflict remains unresolved across collector
+loss even if no diagnostic marker was published. Fresh attempt rotation preserves
+these observations with the old attempt. CCR's SQLite registry remains the sole
+admission authority; runner observations never authorize execution themselves.

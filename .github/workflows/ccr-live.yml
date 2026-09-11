@@ -23,11 +23,11 @@ jobs:
             containment: process-group
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Check out CCR 0.6.0 candidate
+      - name: Check out CCR 0.6.0 release
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: hishamkaram/claude-code-router
-          ref: 44b27c47fb363b7ba93308cf98f23d1bd689a0ec
+          ref: 9552ec162a2f78df47e567fcbf70e4461f52ef64
           path: .live-ccr
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
@@ -37,7 +37,7 @@ jobs:
         working-directory: .live-ccr
         run: |
           mkdir -p "$RUNNER_TEMP/ccr-bin"
-          go build -ldflags '-X github.com/hishamkaram/claude-code-router/internal/buildinfo.Version=0.6.0-dev -X github.com/hishamkaram/claude-code-router/internal/buildinfo.Commit=44b27c47fb363b7ba93308cf98f23d1bd689a0ec' -o "$RUNNER_TEMP/ccr-bin/ccr" ./cmd/ccr
+          go build -ldflags '-X github.com/hishamkaram/claude-code-router/internal/buildinfo.Version=0.6.0 -X github.com/hishamkaram/claude-code-router/internal/buildinfo.Commit=9552ec162a2f78df47e567fcbf70e4461f52ef64' -o "$RUNNER_TEMP/ccr-bin/ccr" ./cmd/ccr
           echo "$RUNNER_TEMP/ccr-bin" >> "$GITHUB_PATH"
           npm install --global @anthropic-ai/claude-code@latest
       - name: Provision Linux user manager

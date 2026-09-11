@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -103,6 +104,108 @@ esac
         self.assertNotEqual(value["receipt"]["job_id"], previous["job_id"])
         self.assertEqual(value["expected_parent_job"], previous["job_id"])
         self.assertFalse(value["fresh_decision"])
+
+    def test_persisted_replay_conflict_survives_collector_loss(self):
+        self.assertEqual(self.launch().returncode, 0)
+        original_value = job.load(str(self.prefix) + ".ccr-attempt.json")
+        original = original_value["receipt"]
+        replacement = dict(original, job_id="ccr-" + str(uuid.uuid4()))
+        for boundary in (".ccr-observation.resubmission_receipt.", ".ccr-recovery-receipt.json"):
+            with self.subTest(boundary=boundary):
+                prefix = str(self.root / ("crash[" + str(len(list(self.root.iterdir()))) + "]"))
+                job.atomic(prefix + ".ccr-attempt.json", job.encode(original_value))
+                before = job.encode(original)
+                job.atomic(prefix + ".ccr-receipt.json", before)
+                job.atomic(prefix + ".ccr-prompt", self.prompt.read_bytes())
+                atomic = job.atomic
+
+                class CollectorLoss(Exception):
+                    pass
+
+                def interrupted(path, raw):
+                    atomic(path, raw)
+                    if boundary in str(path):
+                        raise CollectorLoss()
+
+                def response(argv, **kwargs):
+                    if argv[1] == "status":
+                        return subprocess.CompletedProcess(argv, 0, job.encode(dict(original, admission_state="prepared")))
+                    kwargs["stdout"].write(job.encode(replacement))
+                    return subprocess.CompletedProcess(argv, 0)
+
+                with mock.patch.object(job, "atomic", side_effect=interrupted), mock.patch.object(job.subprocess, "run", side_effect=response):
+                    with self.assertRaises(CollectorLoss):
+                        job.complete_admission(prefix)
+                self.assertFalse(Path(prefix + ".ccr-admission-conflict.json").exists())
+                evidence = {path: path.read_bytes() for path in job.observation_paths(prefix)}
+                self.assertIn(job.encode(replacement), evidence.values())
+                for operation, args in (("recover", []), ("complete-admission", []),
+                                        ("verify-attempt", [original["job_id"]]), ("cancel-attempt", []),
+                                        ("freeze", [original["job_id"]]), ("stopped", [])):
+                    with mock.patch.object(job.subprocess, "run", side_effect=AssertionError("must not invoke CCR")):
+                        with self.assertRaises(ValueError, msg=operation):
+                            job.dispatch(operation, prefix, args)
+                    self.assertEqual(Path(prefix + ".ccr-receipt.json").read_bytes(), before)
+                    self.assertEqual({path: path.read_bytes() for path in job.observation_paths(prefix)}, evidence)
+                    self.assertFalse(Path(prefix + ".exit").exists())
+
+    def test_complete_bad_lookup_remains_unresolved_after_matching_retry(self):
+        self.assertEqual(self.launch().returncode, 0)
+        for operation in ("recover", "complete-admission"):
+            for field, replacement in (("submission_id", "different"),
+                                       ("session_id", str(uuid.uuid4())), ("job_id", 123)):
+                with self.subTest(operation=operation, field=field):
+                    prefix = str(self.root / (operation + field))
+                    value = job.load(str(self.prefix) + ".ccr-attempt.json")
+                    original = value.pop("receipt")
+                    value["requested_resume_session"] = original["session_id"]
+                    value["argv"].append("--resume=" + original["session_id"])
+                    job.atomic(prefix + ".ccr-attempt.json", job.encode(value))
+                    job.atomic(prefix + ".ccr-receipt.json", job.encode(original))
+                    command = ["python3", str(RUNNER.with_name("ccr-job.py")), operation, prefix]
+                    bad = subprocess.run(command, env=dict(self.env, FAKE_CCR_BAD_STATUS=json.dumps({field: replacement})),
+                                         capture_output=True, timeout=10)
+                    self.assertEqual(bad.returncode, 6, bad.stderr)
+                    evidence = {path: path.read_bytes() for path in job.observation_paths(prefix)}
+                    self.assertTrue(any(json.loads(raw).get(field) == replacement for raw in evidence.values()))
+                    # Even loss of the optional diagnostic marker cannot clear evidence.
+                    Path(prefix + ".ccr-admission-conflict.json").unlink(missing_ok=True)
+                    retry = subprocess.run(command, env=self.env, capture_output=True, timeout=10)
+                    self.assertEqual(retry.returncode, 6, retry.stderr)
+                    self.assertEqual({path: path.read_bytes() for path in job.observation_paths(prefix)}, evidence)
+                    self.assertEqual(job.load(prefix + ".ccr-receipt.json"), original)
+                    self.assertFalse(Path(prefix + ".exit").exists())
+
+    def test_fresh_attempt_rotation_preserves_old_observations(self):
+        self.assertEqual(self.launch().returncode, 0)
+        prefix = str(self.prefix)
+        previous = {path.name: path.read_bytes() for path in job.observation_paths(prefix)}
+        self.assertTrue(previous)
+        self.assertEqual(self.launch().returncode, 0)
+        for name, raw in previous.items():
+            rotated = self.root / name.replace("attempt.", "attempt.attempt1.", 1)
+            self.assertEqual(rotated.read_bytes(), raw)
+        self.assertNotEqual(job.load(prefix + ".ccr-attempt.json")["receipt"],
+                            job.load(prefix + ".attempt1.ccr-attempt.json")["receipt"])
+
+    def test_submission_identity_validation_has_no_other_receipt_dependency(self):
+        admitted = dict(submission_id="unexpected", job_id="ccr-" + str(uuid.uuid4()), session_id=str(uuid.uuid4()))
+        with self.assertRaises(ValueError):
+            job.admission_identity(dict(schema=2, submission_id="expected"), admitted)
+
+    def test_observation_retention_is_idempotent_and_detects_changed_bytes(self):
+        prefix = str(self.root / "prefix[with]glob")
+        admitted = dict(submission_id="s", job_id="ccr-" + str(uuid.uuid4()), session_id=str(uuid.uuid4()))
+        raw = job.encode(admitted)
+        for _ in range(3):
+            job.retain_observation(prefix, "submission_lookup", raw)
+        paths = job.observation_paths(prefix)
+        self.assertEqual(len(paths), 1)
+        value = dict(schema=2, submission_id="s")
+        job.validate_observations(prefix, value)
+        paths[0].write_bytes(job.encode(dict(admitted, submission_id="changed")))
+        with self.assertRaises(ValueError):
+            job.validate_observations(prefix, value)
 
     def test_recovery_preserves_conflicting_complete_receipt(self):
         self.assertEqual(self.launch().returncode, 0)
