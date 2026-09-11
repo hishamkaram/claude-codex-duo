@@ -65,3 +65,10 @@ The separate write runner checks the recorded owner identity again before forcef
 escalation. If the leader disappears or its identity changes, cancellation remains
 unconfirmed and the runner does not wait or commit the live worktree. Saved Codex
 recovery commands quote every argument, including installation and artifact paths.
+
+The real lifecycle gate also runs an original session followed by review consultation,
+residual resolution, debate, and deep-plan continuations through all three packaged runners.
+Only the original prompt contains the random marker; the fixture returns it only when the
+real Claude request carries that history. Each continuation resolves its authoritative head
+before creating the prompt. `continuation.json` records distinct jobs sharing one session.
+Configured-provider acceptance complements this deterministic gate before release.
