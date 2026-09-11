@@ -51,6 +51,11 @@ or remove artifacts also retain it until they finish. This prevents an orphaned
 mutator from overwriting a replacement attempt after collector loss. Saved recovery
 commands bind the original job: `--expected-job` on attach rejects prefix reuse;
 the cancellation helper enforces the same identity before requesting cancellation.
+Both CCR and Codex collectors retain their lease through final or detached
+publication. A terminal backend job alone does not authorize prefix replacement.
+Argument errors preserve durable admission records, including smokes whose
+receipt was lost. Test teardown never signals a group from saved metadata;
+fixtures have finite lifetimes when ownership cannot be confirmed.
 An unconfirmed write-runner cancellation returns exit5 without waiting for an
 unproven stop or staging/committing files that the workload may still change.
 

@@ -380,7 +380,7 @@ CLAIM_MODE=0; CLAIM_TOKEN=""; for _a in "$@"; do [ "$_a" = "--claim" ] && CLAIM_
 # present in the window between a launch starting and its first outcome — the window an --attach
 # that arrives too early lands in (cycle 2: CL-05). An argument error is a fact about THIS
 # invocation, so when any of them is present it is reported and nothing is published.
-die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || [ -e "${PREFIX:-/nonexistent}.exit" ] || [ -e "${PREFIX:-/nonexistent}.detached" ] || [ -e "${PREFIX:-/nonexistent}.progress" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
+die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || [ -e "${PREFIX:-/nonexistent}.exit" ] || [ -e "${PREFIX:-/nonexistent}.detached" ] || [ -e "${PREFIX:-/nonexistent}.progress" ] || [ -e "${PREFIX:-/nonexistent}.ccr-attempt.json" ] || [ -e "${PREFIX:-/nonexistent}.ccr-receipt.json" ] || [ -e "${PREFIX:-/nonexistent}.claim.lock" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
 need() { [ $# -ge 2 ] || die4 "$1 requires a value"; case "$2" in -*) die4 "$1 requires a value (got option $2)";; esac; }
 MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""; ATTACH=0; VIA_SET=0; CANCEL_ONLY=0; EXPECTED_JOB=""
 while [ $# -gt 0 ]; do
@@ -618,7 +618,7 @@ stamp_claim() {
   # or rotate each other's files (round-28 CX-02, round-29 CX-02). The loser
   # exits 4 and writes nothing under the prefix.
   # The lock is taken FIRST and unconditionally, because what it serializes is not only the claim:
-  # every caller runs `stamp_claim; rotate_previous_attempt; unlock_claim`, so returning early from
+  # every caller runs `stamp_claim; rotate_previous_attempt`, so returning early from
   # here left the in-flight check and the sidecar rotation completely unserialized. On the default
   # path of codex-debate and codex-deep-plan — no claim directory and no --claim — that early
   # return was ALWAYS taken, so two launches racing on one prefix could both read "not in flight"
@@ -667,7 +667,7 @@ HELD_LOCK=""
 unlock_claim() { publish_unlock; }   # one release for one acquisition: the holder record goes too
 # A launch error after the claim is owned: sidecars record it (outcome=LAUNCH-ERROR, .exit=4).
 launch_error() {  # <message> <command>
-  stamp_claim; rotate_previous_attempt; unlock_claim
+  stamp_claim; rotate_previous_attempt
   echo "codex-run.sh: $1" >&2; printf 'LAUNCH-ERROR\n%s\n' "$1" > "$PREFIX.stderr"; printf '0s LAUNCH-ERROR: %s\n' "$1" > "$PREFIX.progress"
   printf 'outcome=LAUNCH-ERROR\nbackend=%s\nlast_error=%s\nmode=%s\nprompt_file=%s\ncommand=%s\n' "$BACKEND" "$1" "$MODE" "$PROMPT_FILE" "$2" > "$PREFIX.meta"; echo 4 > "$PREFIX.exit"; exit 4
 }
@@ -1052,10 +1052,12 @@ if [ "$ATTACH" = 1 ]; then
   PROMPT_FILE=$(exec 9>&-; awk -F= '$1=="prompt_file"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
   echo "$(exec 9>&-; elapsed)s attached job=$JOB" >> "$PREFIX.progress"
 else
-stamp_claim; rotate_previous_attempt; unlock_claim
+# Keep collector ownership through admission, observation, and every publication.
+# A completed companion job does not mean this collector has finished writing.
+stamp_claim; rotate_previous_attempt
 : > "$PREFIX.progress"; : > "$PREFIX.stderr"
 CMD="task $MODE --background --prompt-file $PROMPT_FILE"
-LAUNCH=$(exec 9>&-; cc task "$MODE" --background --prompt-file "$PROMPT_FILE" 2>>"$PREFIX.stderr") || true
+LAUNCH=$(cc task "$MODE" --background --prompt-file "$PROMPT_FILE" 2>>"$PREFIX.stderr") || true
 JOB=$(exec 9>&-; printf '%s' "$LAUNCH" | grep -oE 'task-[a-z0-9]+-[a-z0-9]+' | head -1)
 if [ -z "$JOB" ]; then
   printf 'LAUNCH-ERROR\n%s\n' "$LAUNCH" >> "$PREFIX.stderr"
@@ -1193,7 +1195,6 @@ if [ "$MODE" = "--resume-last" ] && [ "$OUTCOME" = COMPLETED ] && [ -n "$THREAD"
     echo "codex-run.sh: $THREAD_NOTE" >> "$PREFIX.stderr"
   fi
 fi
-[ "$ATTACH" = 1 ] || publish_lock --must
 {
   echo "outcome=$OUTCOME"; echo "backend=codex"; echo "job=$JOB"; echo "thread=${THREAD:-unknown}"
   echo "detached=no"; echo "attached=${ATTEMPTS:-0}"; [ -z "$THREAD_NOTE" ] || echo "thread_note=$THREAD_NOTE"

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -151,6 +152,25 @@ else:
         attach = self.run_runner(str(self.prefix), "--attach")
         self.assertEqual(attach.returncode, 6)
         self.assertEqual(list((self.root / "store/fake-ccr-jobs").glob("*.json")), before)
+
+    def test_invalid_attach_preserves_unresolved_smoke_admission(self):
+        result = self.run_runner("--probe", "--via", "ccr:x", "--record-dir", str(self.root),
+                                 FAKE_CCR_MODE="receipt_lost")
+        self.assertNotEqual(result.returncode, 0)
+        evidence = next(line.removeprefix("CCR smoke evidence: ") for line in result.stderr.splitlines()
+                        if line.startswith("CCR smoke evidence: "))
+        prefix = str(Path(evidence) / "run")
+        self.addCleanup(shutil.rmtree, evidence)
+        self.assertTrue(Path(prefix + ".ccr-attempt.json").exists())
+        self.assertFalse(Path(prefix + ".progress").exists())
+        rejected = self.run_runner(prefix, "--attach", "--poll-sec", "0")
+        self.assertEqual(rejected.returncode, 4)
+        self.assertFalse(Path(prefix + ".exit").exists())
+        attach = self.run_runner(prefix, "--attach")
+        self.assertEqual(attach.returncode, 6)
+        retry = self.run_runner(prefix, "--via", "ccr:x", "--prompt-file", str(self.prompt))
+        self.assertEqual(retry.returncode, 4)
+        self.assertFalse(Path(prefix + ".exit").exists())
 
     def test_admission_lease_survives_collector_through_receipt_binding(self):
         wrapper = self.root / "admission-helper.py"
@@ -611,6 +631,23 @@ os.execv('/bin/ps', ['ps'] + sys.argv[1:])
 
 
 class ConsumerSafetyTests(unittest.TestCase):
+    def test_unconfirmed_fixture_cleanup_never_signals_saved_group(self):
+        source = (ROOT / "scripts/test-args.sh").read_text()
+        helpers = ""
+        if "signal_group() {" in source:
+            helpers = source[source.index("signal_group() {"):source.index("# Group liveness")]
+        branch = next(line for line in source.splitlines() if "T-15(stall): rc=" in line)
+        script = helpers + '''
+ps() { return 1; }
+kill() { printf 'SIGNAL %s\\n' "$*"; }
+rc=5; PG=424242; FAIL=0
+''' + branch + '\n[ "$FAIL" = 1 ]\n'
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("FAIL", result.stdout)
+        self.assertNotIn("SIGNAL", result.stdout)
+        self.assertNotIn("command not found", result.stderr)
+
     def test_write_escalation_requires_original_owner_identity(self):
         source = (ROOT / "plugins/codex-deep-plan/scripts/implement-run.sh").read_text()
         functions = source[source.index("pgid_of()"):source.index("stream_field()")]
@@ -660,6 +697,66 @@ kill_group 333333 333333 admitted
         self.assertEqual(shlex.split(attach), [runner, prefix, "--attach", "--stall-min", "1",
                                                "--max-min", "2", "--poll-sec", "3"])
         self.assertEqual(shlex.split(cancel), ["node", plugin + "/scripts/codex-companion.mjs", "cancel", "task-123"])
+
+
+class CodexCollectorTests(unittest.TestCase):
+    def test_completed_result_publication_excludes_replacement(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            (home / ".claude/plugins").mkdir(parents=True)
+            plugin = root / "plugin"
+            (plugin / "scripts").mkdir(parents=True)
+            (plugin / "scripts/codex-companion.mjs").write_text("fixture")
+            (home / ".claude/plugins/installed_plugins.json").write_text(json.dumps({"plugins": {
+                "codex@openai-codex": [{"installPath": str(plugin)}]}}))
+            binary = root / "node"
+            binary.write_text("#!" + sys.executable + "\n" + '''
+import pathlib,sys,json,time,os
+root=pathlib.Path(os.environ["FIXTURE"]); args=sys.argv[2:]
+if args[0]=="task":
+    counter=root/"count"; n=int(counter.read_text())+1 if counter.exists() else 1
+    counter.write_text(str(n)); print("task-fake-"+str(n))
+elif args[0]=="status":
+    print(json.dumps({"job":{"status":"completed","logFile":str(root/"log")}}))
+elif args[0]=="result":
+    (root/"result-ready").touch(); deadline=time.monotonic()+15
+    while not (root/"result-go").exists() and time.monotonic()<deadline: time.sleep(.01)
+    print("completed result")
+''')
+            binary.chmod(0o700)
+            (root / "prompt").write_text("fixture")
+            (root / "log").write_text("fixture log")
+            env = dict(os.environ, HOME=str(home), FIXTURE=str(root),
+                       PATH=str(root) + os.pathsep + os.environ["PATH"])
+            command = ["bash", str(RUNNER), str(root / "attempt"), "--prompt-file",
+                       str(root / "prompt"), "--poll-sec", "1"]
+            first = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            try:
+                deadline = time.monotonic() + 8
+                while not (root / "result-ready").exists():
+                    self.assertLess(time.monotonic(), deadline, "first result never became ready")
+                    time.sleep(.01)
+                try:
+                    replacement = subprocess.run(command, env=env, capture_output=True, text=True, timeout=8)
+                except subprocess.TimeoutExpired:
+                    self.assertEqual((root / "count").read_text(), "1",
+                                     "replacement workload launched while first publication was pending")
+                    raise
+                self.assertEqual(replacement.returncode, 4, replacement.stdout + replacement.stderr)
+                self.assertEqual((root / "count").read_text(), "1")
+                self.assertFalse((root / "attempt.exit").exists())
+                (root / "result-go").touch()
+                out, err = first.communicate(timeout=5)
+                self.assertEqual(first.returncode, 0, out + err)
+                self.assertEqual((root / "attempt.exit").read_text(), "0\n")
+                self.assertEqual((root / "attempt.stdout").read_text(), "completed result\n")
+                self.assertIn("job=task-fake-1\n", (root / "attempt.meta").read_text())
+            finally:
+                (root / "result-go").touch()
+                if first.poll() is None:
+                    first.kill()
+                first.communicate(timeout=5)
 
 
 class ShellMutationLeaseTests(unittest.TestCase):

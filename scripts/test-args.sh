@@ -59,18 +59,8 @@ fixture_prov() {  # what Phase 3 writes beside the matrix: one raiser row per or
   [ -e "$1/03-matrix.tsv" ] && [ ! -e "$1/03-provenance.tsv" ] || return 0
   awk -F'\t' '$2=="BOTH"||$2=="CONFLICT"{printf "%s\tlead\tCL-%02d\n%s\tp1\tCX-%02d\n",$1,NR,$1,NR; next} $2=="CLAUDE-ONLY"{printf "%s\tlead\tCL-%02d\n",$1,NR; next} $2=="CODEX-ONLY"{printf "%s\tp1\tCX-%02d\n",$1,NR}' "$1/03-matrix.tsv" > "$1/03-provenance.tsv"
 }
-# Cleanup in this suite must never issue a session-wide signal. `kill -- "-0"` targets the suite's
-# OWN process group (this shell and every sibling job) and `kill -- "-1"` targets every process
-# this user owns — on macOS that ends the login session. A `${VAR:-0}` default turns an unset pgid
-# into the first, and a fixture that records `pgid=1` into the second. Every teardown kill goes
-# through here, which refuses both and anything that is not a plausible group id.
-signal_group() {  # <pgid> <signal> — refuses 0, 1, empty, non-numeric and our own group
-  case "${1:-}" in ''|*[!0-9]*) return 0;; esac
-  [ "$1" -ge 2 ] 2>/dev/null || return 0
-  [ "$1" != "$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')" ] || return 0
-  kill "-$2" -- "-$1" 2>/dev/null || true
-}
-reap_group() { signal_group "${1:-}" KILL; }   # teardown
+# No group signal fallback is allowed from saved fixture metadata. An uncertain
+# owner remains uncertain in test teardown; finite fixtures expire on their own.
 # The PER-PID form of the same trap, and the one this suite actually fell into. POSIX kill(2) gives
 # pid 0 the meaning "every process in the SENDER's process group" — the invoking shell, validate.sh
 # and every sibling job in that terminal — and pid -1 "every process this user may signal". So
@@ -89,25 +79,6 @@ pid_alive() {  # <pid> -> 0 only when a plausible, non-sentinel pid is running
   case "${1:-}" in ''|*[!0-9]*) return 1;; esac
   [ "$1" -ge 2 ] 2>/dev/null || return 1
   kill -0 "$1" 2>/dev/null
-}
-# Deferred teardown needs more than the shape checks above. A pgid recorded minutes ago, for a job
-# that has since exited, may name a group the kernel has handed to something else — so a late
-# cleanup must re-prove ownership first (cycle 4: CX-01). The pgid alone cannot carry that proof:
-# every fixture's supervisor leads its own group, so pid == pgid, and a recycled pid that becomes a
-# group leader passes a pgid-only test while naming a completely unrelated group (cycle 5: CX-02).
-# Ownership is therefore the recorded pid's START TIME as well — the same identity pairing the
-# runner itself uses — and an owner that cannot be identified signals nothing.
-proc_ident() {  # <pid> -> UTC start time, the suite's copy of the runner's proc_identity
-  TZ=UTC ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ *//;s/ *$//'
-}
-reap_owned_group() {  # <pgid> <owner-pid> [recorded-owner-identity]
-  case "${1:-}" in ''|*[!0-9]*) return 0;; esac
-  case "${2:-}" in ''|*[!0-9]*) return 0;; esac
-  local live; live=$(proc_ident "$2")
-  [ -n "$live" ] || return 0                       # owner gone or unreadable: prove nothing, signal nothing
-  [ -z "${3:-}" ] || [ "$live" = "$3" ] || return 0  # the number was reused: not our job
-  [ "$(ps -o pgid= -p "$2" 2>/dev/null | tr -d ' ')" = "$1" ] || return 0
-  reap_group "$1"
 }
 # Group liveness, asked by READING the process table. `kill -0 -- "-N"` sends nothing, but it is
 # still a group-negative kill with a group-negative kill's blind spots: for N=1 it is a permission
@@ -294,7 +265,7 @@ case "${1:-}" in
       write) echo hello > smoke-write.txt;;
       fail) printf '{"type":"assistant","message":{"content":[{"type":"text","text":"boom"}]}}\n'; echo "waiting for Claude Code: exit status 1" >&2; exit 1;;
       noresult) printf '{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}\n'; exit 0;;
-      sleep) sleep 600; exit 0;;
+      sleep) sleep 120; exit 0;;
       # Outlives a short watch bound and then finishes on its own, so a detached job can be
       # attached to and collected — the whole point of exit 6.
       slowok) sleep "${FAKE_CCR_SLEEP:-75}";;
@@ -409,7 +380,6 @@ done
 CP12="$CCRD/p-emptyholder"
 mkdir -p "$CP12.claim.lock"; : > "$CP12.claim.lock/holder"; touch -t 200001010000 "$CP12.claim.lock"
 chk "T-30: empty legacy holder fails closed" 4 "legacy collector lock" env PATH="$CCRBIN:$PATH" bash "$R" "$CP12" --attach
-reap_group "$(awk -F= '$1=="pgid"{print $2}' "$CP12.meta" 2>/dev/null)"
 
 # T-31 (CL-03/CX-02): the relaunch guard was dead code on the codex backend — its detach record
 # carried no identity at all, so a relaunch rotated a LIVE job's record away and started a second
@@ -1015,7 +985,7 @@ out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=fail bash "$IM" "$IP3" --via ccr:x --re
 IP4="$IMD/fourth/implement"
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=sleep bash "$IM" "$IP4" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/stall --plan "$IMD/PLAN.md" --stall-min 1 --poll-sec 5 --max-min 5 2>&1); rc=$?
 PG=$(awk -F= '$1=="pgid"{print $2}' "$IP4.meta")
-[ "$rc" = 2 ] && grep -q '^outcome=STALLED' "$IP4.meta" && [ -n "$PG" ] && ! group_has_members "$PG" && [ -d "$(cat "$IP4.worktree")" ] && printf '  ok    %-42s\n' "T-15: stall → exit 2, group killed, worktree kept" || { printf '  FAIL  T-15(stall): rc=%s\n' "$rc"; reap_group "$PG"; FAIL=1; }
+[ "$rc" = 2 ] && grep -q '^outcome=STALLED' "$IP4.meta" && [ -n "$PG" ] && ! group_has_members "$PG" && [ -d "$(cat "$IP4.worktree")" ] && printf '  ok    %-42s\n' "T-15: stall → exit 2, group killed, worktree kept" || { printf '  FAIL  T-15(stall): rc=%s\n' "$rc"; FAIL=1; }
 for b in impl/hello impl/fail impl/stall; do w=$(git -C "$G2" worktree list | awk -v b="[$b]" '$3==b{print $1}'); [ -n "$w" ] && git -C "$G2" worktree remove --force "$w" >/dev/null 2>&1; git -C "$G2" branch -D "$b" >/dev/null 2>&1; done
 
 
