@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -659,6 +660,79 @@ kill_group 333333 333333 admitted
         self.assertEqual(shlex.split(attach), [runner, prefix, "--attach", "--stall-min", "1",
                                                "--max-min", "2", "--poll-sec", "3"])
         self.assertEqual(shlex.split(cancel), ["node", plugin + "/scripts/codex-companion.mjs", "cancel", "task-123"])
+
+
+class ShellMutationLeaseTests(unittest.TestCase):
+    def wait_path(self, path):
+        deadline = time.monotonic() + 10
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertTrue(path.exists(), str(path))
+
+    def test_orphaned_shell_publishers_keep_the_lease(self):
+        runner = RUNNER.read_text()
+        gate = (ROOT / "plugins/codex-pr-review/skills/two-model-pr-review/scripts/phase-gate.sh").read_text()
+        publication = runner[runner.index("write_detached() {"):runner.index("detached_field() {")]
+        rotation = gate[gate.index("rotate_claim() {"):gate.index("# release <ART>")]
+        removal = next(line for line in runner.splitlines() if line.strip().startswith("rm ")
+                       and '"$PREFIX.detached"' in line)
+        companion = next(line for line in runner.splitlines() if line.startswith("cc()"))
+        cases = [("publish", "mv", publication + '\nwrite_detached <<EOF\njob=old\nEOF\n'),
+                 ("claim-rotation", "mv", rotation + '\nrotate_claim attempt\n'),
+                 ("terminal-removal", "rm", removal + '\n'),
+                 ("companion-result", "node", companion + '\ncc result task-fixture > "$PREFIX.stdout"\n')]
+        for name, command, operation in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                prefix = root / "attempt"
+                Path(str(prefix) + ".claim").mkdir()
+                Path(str(prefix) + ".detached").write_text("old")
+                wrapper = root / command
+                wrapper.write_text("#!" + sys.executable + "\n" + '''
+import pathlib, subprocess, sys, time
+root = pathlib.Path(__file__).parent
+(root / "ready").touch()
+deadline = time.monotonic() + 10
+while not (root / "go").exists() and time.monotonic() < deadline: time.sleep(.01)
+if not (root / "go").exists(): sys.exit(2)
+if pathlib.Path(__file__).name == "node": print("old result")
+else: subprocess.run(["/bin/" + pathlib.Path(__file__).name, *sys.argv[1:]], check=True)
+(root / "done").touch()
+''')
+                wrapper.chmod(0o700)
+                with open(str(prefix) + ".claim.lock", "a+") as lease:
+                    fcntl.flock(lease, fcntl.LOCK_EX)
+                    fd = lease.fileno()
+                    script = (f'exec 9>&{fd}; exec {fd}>&-\n'
+                              'PREFIX="$1"; ART="$2"; CLAIM_SPENT_MAX=10\n'
+                              'fail() { echo "$*" >&2; exit 1; }\n' + operation + '\ntrue\n')
+                    process = subprocess.Popen(["bash", "-c", script, "collector", str(prefix), str(root)],
+                                               env=dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"]),
+                                               pass_fds=(fd,), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                               start_new_session=True)
+                try:
+                    self.wait_path(root / "ready")
+                    process.kill()
+                    process.wait(timeout=5)
+                    with open(str(prefix) + ".claim.lock", "a+") as replacement:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(replacement, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=5)
+                    (root / "go").touch()
+                    self.wait_path(root / "done")
+                with open(str(prefix) + ".claim.lock", "a+") as replacement:
+                    deadline = time.monotonic() + 5
+                    while True:
+                        try:
+                            fcntl.flock(replacement, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if time.monotonic() >= deadline:
+                                self.fail("finished shell mutator retained the lease")
+                            time.sleep(.01)
 
 
 class StopEvidenceTests(unittest.TestCase):

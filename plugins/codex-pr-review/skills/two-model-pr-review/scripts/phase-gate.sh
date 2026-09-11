@@ -49,7 +49,7 @@ PST=""              # terminal state of the phase last parsed by phase_status
 PST_POLICY=""       # the tier token a NOT_RUN_POLICY line cited, empty for every other state
 HELD_LOCK=""        # claim lock held by claim_lock, released by claim_unlock or on_exit
 PKT_TMP=""          # packet build/recheck scratch file, removed by on_exit on any failure
-on_exit() { rm 9>&- -f "$SCRATCH" "$PKT_TMP" 2>/dev/null; exec 9>&-; HELD_LOCK=""; [ "$LEAD_WAS_SEALED" = 1 ] && chmod 9>&- 000 "$ART/01-lead.md" 2>/dev/null; :; }
+on_exit() { rm -f "$SCRATCH" "$PKT_TMP" 2>/dev/null; exec 9>&-; HELD_LOCK=""; [ "$LEAD_WAS_SEALED" = 1 ] && chmod 000 "$ART/01-lead.md" 2>/dev/null; :; }
 trap on_exit EXIT
 # A launch claim whose runner has not yet written .progress is still in flight
 # for this long (the gate -> runner handoff is seconds, but a consent prompt can
@@ -285,7 +285,7 @@ unseal_lead_for_hash() {
   LEAD_WAS_SEALED=0
   case "$(exec 9>&-; mode "$ART/01-lead.md" 2>/dev/null)" in
     0|000)
-      chmod 9>&- 400 "$ART/01-lead.md" || fail "could not unseal 01-lead.md to compute review seal"
+      chmod 400 "$ART/01-lead.md" || fail "could not unseal 01-lead.md to compute review seal"
       LEAD_WAS_SEALED=1  # on_exit reseals it if this call fails before reseal_lead_after_hash
       ;;
   esac
@@ -305,7 +305,7 @@ review_seal() {
   tmp=$(exec 9>&-; mktemp "$ART/.review-seal.XXXXXX") || { reseal_lead_after_hash; fail "could not allocate review-seal scratch file"; }
   seal_contents "$tmp" || { rm -f "$tmp"; reseal_lead_after_hash; fail "cannot hash initial review bodies"; }
   cmp -s "$seal" "$tmp" || { rm -f "$tmp"; reseal_lead_after_hash; fail "initial review bodies changed since JOIN-OK"; }
-  rm 9>&- -f "$tmp"
+  rm -f "$tmp"
   reseal_lead_after_hash
 }
 # ---- Accept ledger (round-27 debate, amended option B) -------------------
@@ -366,8 +366,8 @@ write_review_seal() {  # pre-phase3: mint the seal once; on re-entry regenerate 
   if [ "$ST" = COMPLETE ]; then [ -s "$ART/02-$EXCH.stdout" ] || { reseal_lead_after_hash; fail "02-$EXCH.stdout missing or empty"; }; fi
   tmp=$(exec 9>&-; mktemp "$ART/.review-seal.XXXXXX") || { reseal_lead_after_hash; fail "could not allocate review-seal scratch file"; }
   seal_contents "$tmp" || { rm -f "$tmp"; reseal_lead_after_hash; fail "cannot hash initial review bodies"; }
-  chmod 9>&- 400 "$tmp" || { rm -f "$tmp"; reseal_lead_after_hash; fail "could not make review seal read-only"; }
-  mv 9>&- "$tmp" "$seal" || { rm -f "$tmp"; reseal_lead_after_hash; fail "could not install review seal"; }
+  chmod 400 "$tmp" || { rm -f "$tmp"; reseal_lead_after_hash; fail "could not make review seal read-only"; }
+  mv "$tmp" "$seal" || { rm -f "$tmp"; reseal_lead_after_hash; fail "could not install review seal"; }
   reseal_lead_after_hash
 }
 ledger_row() { awk -v n="$1" '$2 == n {print; exit}' "$LEDGER" 2>/dev/null; }
@@ -431,8 +431,8 @@ accept() {  # accept <artifact> final|draft   (gate = $CMD)
   fi
   tmp=$(exec 9>&-; mktemp "$ART/.accepted.XXXXXX") || fail "could not allocate ledger scratch file"
   { [ -s "$LEDGER" ] && awk -v n="$name" '$2 != n' "$LEDGER"; printf '%s  %s  %s  %s\n' "$digest" "$name" "$CMD" "$kind"; } > "$tmp"
-  chmod 9>&- 400 "$tmp" || { rm -f "$tmp"; fail "could not make the accept ledger read-only"; }
-  mv 9>&- -f "$tmp" "$LEDGER" || { rm -f "$tmp"; fail "could not install the accept ledger"; }
+  chmod 400 "$tmp" || { rm -f "$tmp"; fail "could not make the accept ledger read-only"; }
+  mv -f "$tmp" "$LEDGER" || { rm -f "$tmp"; fail "could not install the accept ledger"; }
 }
 retire() {  # retire <artifact>: drop a draft row of this gate whose artifact was legitimately removed
   local name="$1" row tmp
@@ -441,8 +441,8 @@ retire() {  # retire <artifact>: drop a draft row of this gate whose artifact wa
   [ "$4" = draft ] && [ "$3" = "$CMD" ] && ! later_artifact_exists "$CMD" || fail "$name was accepted by $3 but is missing"
   tmp=$(exec 9>&-; mktemp "$ART/.accepted.XXXXXX") || fail "could not allocate ledger scratch file"
   awk -v n="$name" '$2 != n' "$LEDGER" > "$tmp"
-  chmod 9>&- 400 "$tmp" || { rm -f "$tmp"; fail "could not make the accept ledger read-only"; }
-  mv 9>&- -f "$tmp" "$LEDGER" || { rm -f "$tmp"; fail "could not install the accept ledger"; }
+  chmod 400 "$tmp" || { rm -f "$tmp"; fail "could not make the accept ledger read-only"; }
+  mv -f "$tmp" "$LEDGER" || { rm -f "$tmp"; fail "could not install the accept ledger"; }
 }
 selection_count() {
   local selection="$ART/03-debate-selection.tsv" count
@@ -521,7 +521,7 @@ attempt_usable() {
   [ -s "$stem.exit" ] && [ "$(exec 9>&-; cat "$stem.exit")" = 0 ] || return 1
   [ -s "$stem.stdout" ] || return 1
   if [ $# -gt 0 ]; then
-    python3 9>&- "$VALIDATOR" "$@" --extract "$stem.stdout" --out "$SCRATCH" >/dev/null 2>&1 || return 1
+    python3 "$VALIDATOR" "$@" --extract "$stem.stdout" --out "$SCRATCH" >/dev/null 2>&1 || return 1
   fi
   case "$prefix" in 04-consultation|06-resolution) ;; *) return 0;; esac
   # An exchange whose runner could not record its Codex thread (thread=unknown)
@@ -549,7 +549,7 @@ attempt_schema_invalid() {  # <stem> <validator args...>
   [ -s "$stem.exit" ] && [ "$(exec 9>&-; cat "$stem.exit")" = 0 ] || return 1
   [ -s "$stem.stdout" ] || return 1
   [ $# -gt 0 ] || return 1
-  python3 9>&- "$VALIDATOR" "$@" --extract "$stem.stdout" --out "$SCRATCH" >/dev/null 2>&1 && return 1
+  python3 "$VALIDATOR" "$@" --extract "$stem.stdout" --out "$SCRATCH" >/dev/null 2>&1 && return 1
   return 0
 }
 schema_invalid_count() {  # <prefix>; validator args are derived from present phase inputs
@@ -593,8 +593,8 @@ write_schema_repair_prompt() {  # <prefix>; write retry instructions plus valida
   fi
   tmp=$(exec 9>&-; mktemp "$tmp") || fail "could not allocate $prefix repair prompt"
   { cat "$ART/$prefix.prompt.md"; printf '\n\n## Canonical response repair\nYour prior response completed but was rejected by the local canonical validator. Reply again with exactly one corrected fenced `json` object and nothing else. Preserve the requested phase and exact IDs; do not discuss this notice or the diagnostic.\n\nValidator diagnostic:\n```text\n%s\n```\n' "$diagnostic"; } > "$tmp" || { rm -f "$tmp"; fail "could not write $prefix.prompt.retry.md"; }
-  chmod 9>&- 400 "$tmp" 2>/dev/null || { rm -f "$tmp"; fail "could not seal $prefix.prompt.retry.md"; }
-  mv 9>&- -f "$tmp" "$prompt" || { rm -f "$tmp"; fail "could not install $prefix.prompt.retry.md"; }
+  chmod 400 "$tmp" 2>/dev/null || { rm -f "$tmp"; fail "could not seal $prefix.prompt.retry.md"; }
+  mv -f "$tmp" "$prompt" || { rm -f "$tmp"; fail "could not install $prefix.prompt.retry.md"; }
   accept "$(exec 9>&-; basename "$prompt")" final
 }
 # Once a malformed completed response triggers a repair, every subsequent
@@ -687,8 +687,8 @@ write_thread_anchor() {
   [ -n "$thread" ] && [ "$thread" != unknown ] || fail "04-consultation.meta has no accepted Codex thread"
   temporary=$(exec 9>&-; mktemp "$ART/.consultation-thread.XXXXXX") || fail "could not allocate consultation thread scratch file"
   printf '%s\n' "$thread" > "$temporary"
-  chmod 9>&- 400 "$temporary" || { rm -f "$temporary"; fail "could not make consultation thread anchor read-only"; }
-  mv 9>&- "$temporary" "$ART/04-consultation.thread" || { rm -f "$temporary"; fail "could not install consultation thread anchor"; }
+  chmod 400 "$temporary" || { rm -f "$temporary"; fail "could not make consultation thread anchor read-only"; }
+  mv "$temporary" "$ART/04-consultation.thread" || { rm -f "$temporary"; fail "could not install consultation thread anchor"; }
 }
 check_budget() {
   local attempts responses phase4 phase6
@@ -746,9 +746,9 @@ build_packets() {  # build_packets <out> ; uses $ST and $consultation
   [ -x "$PACKET_BUILDER" ] || fail "verifier packet builder missing or not executable: $PACKET_BUILDER"
   if [ "$ST" = COMPLETE ] && [ "$consultation" = COMPLETE ]; then
     [ -s "$ART/04-consultation.json" ] || fail "04-consultation.json missing after completed consultation"
-    python3 9>&- "$PACKET_BUILDER" --matrix "$ART/03-matrix.tsv" --base "$ART/03-findings.ndjson" --consultation "$ART/04-consultation.json" --out "$out" >/dev/null || fail "could not build verifier packets from 03-findings.ndjson and 04-consultation.json"
+    python3 "$PACKET_BUILDER" --matrix "$ART/03-matrix.tsv" --base "$ART/03-findings.ndjson" --consultation "$ART/04-consultation.json" --out "$out" >/dev/null || fail "could not build verifier packets from 03-findings.ndjson and 04-consultation.json"
   else
-    python3 9>&- "$PACKET_BUILDER" --matrix "$ART/03-matrix.tsv" --base "$ART/03-findings.ndjson" --out "$out" >/dev/null || fail "could not build verifier packets from 03-findings.ndjson"
+    python3 "$PACKET_BUILDER" --matrix "$ART/03-matrix.tsv" --base "$ART/03-findings.ndjson" --out "$out" >/dev/null || fail "could not build verifier packets from 03-findings.ndjson"
   fi
 }
 check_packets() {  # the installed packet file must equal a fresh rebuild
@@ -759,7 +759,7 @@ check_packets() {  # the installed packet file must equal a fresh rebuild
   PKT_TMP="$rebuilt"
   build_packets "$rebuilt"
   cmp -s "$rebuilt" "$ART/05-verifier-packets.ndjson" || { rm -f "$rebuilt"; fail "05-verifier-packets.ndjson differs from the packets built from 03-findings.ndjson and the consultation response (it is generated by pre-verification and never edited; a mismatch after Phase 5 began means the consultation's terminal status or the base packets were changed after acceptance, which the gates forbid — start a fresh run directory)"; }
-  rm 9>&- -f "$rebuilt"; PKT_TMP=""
+  rm -f "$rebuilt"; PKT_TMP=""
 }
 write_packets() {  # pre-verification: install the generated packets, or verify an existing copy
   local built
@@ -767,8 +767,8 @@ write_packets() {  # pre-verification: install the generated packets, or verify 
   built=$(exec 9>&-; mktemp "$ART/.packets-build.XXXXXX") || fail "could not allocate packet build file"
   PKT_TMP="$built"
   build_packets "$built"
-  chmod 9>&- 444 "$built" 2>/dev/null
-  mv 9>&- "$built" "$ART/05-verifier-packets.ndjson" || { rm -f "$built"; fail "could not install 05-verifier-packets.ndjson"; }
+  chmod 444 "$built" 2>/dev/null
+  mv "$built" "$ART/05-verifier-packets.ndjson" || { rm -f "$built"; fail "could not install 05-verifier-packets.ndjson"; }
   PKT_TMP=""
 }
 # A launch gate must never authorize a second launch for a phase that already
@@ -814,7 +814,7 @@ rotate_claim() {  # rotate_claim <prefix>: <prefix>.claim -> <prefix>.claim.spen
   local prefix="$1" claim="$ART/$1.claim" n=1
   while [ -e "$claim.spent$n" ]; do n=$((n+1)); done
   [ "$n" -le "$CLAIM_SPENT_MAX" ] || fail "$prefix has $CLAIM_SPENT_MAX spent claims already ($prefix.claim.spent1..$CLAIM_SPENT_MAX): this phase has been relaunched too often; start a fresh run directory"
-  mv 9>&- "$claim" "$claim.spent$n" || fail "could not rotate the spent $prefix claim"
+  mv "$claim" "$claim.spent$n" || fail "could not rotate the spent $prefix claim"
   ROTATED_TO="$prefix.claim.spent$n"
 }
 # release <ART> <prefix>: the only recovery for a claim whose runner started
@@ -938,7 +938,7 @@ claim_phase() {  # claim_phase <prefix> <terminal.md>
   claim_lock "$prefix"
   claim_in_flight_check "$prefix" "$terminal"
   [ ! -d "$claim" ] || rotate_claim "$prefix"
-  mkdir 9>&- "$claim" 2>/dev/null || fail "$prefix was claimed concurrently by another launcher; do not launch"
+  mkdir "$claim" 2>/dev/null || fail "$prefix was claimed concurrently by another launcher; do not launch"
   # The token binds one runner to THIS claim: the runner is launched with
   # --claim <token> and refuses a claim whose owner file does not carry it, so a
   # delayed runner cannot attach to a replacement claim (round-36 CX-03).
@@ -1039,8 +1039,8 @@ except Exception: print("")')
   esac
   tmp=$(exec 9>&-; mktemp "$ART/.cancel-resolved.XXXXXX") || fail "confirm-terminated: could not allocate receipt"
   printf 'confirmed=%s\nconfirmed_by=phase-gate.sh confirm-terminated\nbackend=%s\nexit_sha256=%s\nmeta_sha256=%s\n' "$(exec 9>&-; date -u +%Y-%m-%dT%H:%M:%SZ)" "$backend" "$(exec 9>&-; sha "$stem.exit")" "$(exec 9>&-; sha "$stem.meta")" > "$tmp" || { rm -f "$tmp"; fail "confirm-terminated: could not write receipt"; }
-  chmod 9>&- 400 "$tmp" || { rm -f "$tmp"; fail "confirm-terminated: could not seal receipt"; }
-  mv 9>&- "$tmp" "$stem.cancel-resolved" || { rm -f "$tmp"; fail "confirm-terminated: could not install receipt"; }
+  chmod 400 "$tmp" || { rm -f "$tmp"; fail "confirm-terminated: could not seal receipt"; }
+  mv "$tmp" "$stem.cancel-resolved" || { rm -f "$tmp"; fail "confirm-terminated: could not install receipt"; }
   accept "$(exec 9>&-; basename "$stem.cancel-resolved")" final
   echo "TERMINATION-CONFIRMED $prefix backend=$backend receipt=$(exec 9>&-; basename "$stem.cancel-resolved")"
 }
@@ -1209,7 +1209,7 @@ pre-phase3)
   if [ -s "$LEDGER" ] && [ -z "$(exec 9>&-; ledger_row 02-review-seal.sha256)" ]; then
     tmp=$(exec 9>&-; mktemp "$ART/.accepted.XXXXXX") || fail "could not allocate ledger scratch file"
     awk '$2 != "00-schema" && $2 != "02-exchange-participant"' "$LEDGER" > "$tmp"
-    chmod 9>&- 400 "$tmp" && mv -f "$tmp" "$LEDGER" || { rm -f "$tmp"; fail "could not install the accept ledger"; }
+    chmod 400 "$tmp" && mv -f "$tmp" "$LEDGER" || { rm -f "$tmp"; fail "could not install the accept ledger"; }
   fi
   accept 00-repo.txt final
   accept 00-brief.md.scope.json final
@@ -1283,7 +1283,7 @@ pre-verification)
       fi
       check_thread 04-consultation
       [ -s "$ART/04-consultation.stdout" ] || fail "04-consultation.stdout missing after completed consultation"
-      python3 9>&- "$VALIDATOR" --manifest "$ART/03-matrix.tsv" --selection "$ART/03-debate-selection.tsv" --phase consultation --extract "$ART/04-consultation.stdout" --out "$ART/04-consultation.json" >/dev/null || fail "consultation response is invalid"
+      python3 "$VALIDATOR" --manifest "$ART/03-matrix.tsv" --selection "$ART/03-debate-selection.tsv" --phase consultation --extract "$ART/04-consultation.stdout" --out "$ART/04-consultation.json" >/dev/null || fail "consultation response is invalid"
       write_thread_anchor
       # The accepted response, its normalized form and the thread anchor are final.
       accept 04-consultation.stdout final
@@ -1438,7 +1438,7 @@ pre-report)
       check_thread 06-resolution
       [ -s "$ART/06-resolution-selection.ids" ] || fail "06-resolution-selection.ids missing after completed resolution"
       [ -s "$ART/06-resolution.stdout" ] || fail "06-resolution.stdout missing after completed resolution"
-      python3 9>&- "$VALIDATOR" --manifest "$ART/03-matrix.tsv" --verdicts "$ART/05-verdicts.tsv" --ids "$ART/06-resolution-selection.ids" --phase resolution --extract "$ART/06-resolution.stdout" --out "$ART/06-resolution.json" >/dev/null || fail "resolution response is invalid"
+      python3 "$VALIDATOR" --manifest "$ART/03-matrix.tsv" --verdicts "$ART/05-verdicts.tsv" --ids "$ART/06-resolution-selection.ids" --phase resolution --extract "$ART/06-resolution.stdout" --out "$ART/06-resolution.json" >/dev/null || fail "resolution response is invalid"
       # The accepted residual response is final (round-27 CX-03).
       accept 06-resolution.stdout final
       accept 06-resolution.json final
@@ -1501,7 +1501,7 @@ pre-report)
       --out "$ART/05-scope-attribution.tsv"
     [ -s "$ART/05-verifier-packets.ndjson" ] && set -- "$@" --packets "$ART/05-verifier-packets.ndjson"
     [ -e "$ART/05-final-severity.tsv" ] && set -- "$@" --final-severities "$ART/05-final-severity.tsv"
-    python3 9>&- "$SCOPE_ATTRIBUTION" "$@" >/dev/null || fail "could not write 05-scope-attribution.tsv"
+    python3 "$SCOPE_ATTRIBUTION" "$@" >/dev/null || fail "could not write 05-scope-attribution.tsv"
   fi
   accept 05-scope-attribution.tsv final
   check_budget

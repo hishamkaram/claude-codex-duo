@@ -290,7 +290,7 @@ raise SystemExit(rc)'
       trap 'echo "CCR smoke evidence: $SMOKE" >&2' EXIT
       CCR_ATTEMPT_PREFIX="$SMOKE/run"
       git init -q "$SMOKE/repo" 2>/dev/null || mkdir -p "$SMOKE/repo"
-      mkdir 9>&- -p "$SMOKE/outside"
+      mkdir -p "$SMOKE/outside"
       printf '%s\n' "Smoke test. Do exactly these three things, then reply with the single word DONE:" \
         "1. Use the Write tool to create a file named smoke-write.txt containing hello in the current directory." \
         "2. Use the Bash tool to run: echo hello > smoke-bash.txt" \
@@ -326,7 +326,7 @@ raise SystemExit(rc)'
       fi
       SFROZEN=$(exec python3 "$CCR_HELPER" freeze "$CCR_ATTEMPT_PREFIX" "$SJOB") || { echo "PROBE UNDETERMINED: workload stop/result unproven; evidence=$SMOKE"; exit 1; }
       [ "$(exec 9>&-; ccr_job_field "$SFROZEN" successful)" = True ] || { echo "PROBE UNAVAILABLE: unsuccessful workload result; evidence=$SMOKE"; exit 1; }
-      cp 9>&- "$CCR_ATTEMPT_PREFIX.joblog" "$SMOKE/stream.jsonl"
+      cp "$CCR_ATTEMPT_PREFIX.joblog" "$SMOKE/stream.jsonl"
       SRC=$(exec 9>&-; ccr_job_field "$SJSON" exit_code); SRC=${SRC:-1}
       CREATED=$(exec 9>&-;  { cd "$SMOKE/repo" && find . -path ./.git -prune -o -type f -print | sed 's|^\./||'; cd "$SMOKE/outside" && find . -type f -print | sed 's|^\./|outside/|'; } 2>/dev/null)
       if [ -n "$CREATED" ]; then
@@ -450,8 +450,8 @@ fi
 # claim and authorize a second launch against the job that is still running.
 write_detached() {  # key=value lines on stdin
   local tmp="$PREFIX.detached.tmp"
-  cat 9>&- > "$tmp"
-  mv 9>&- "$tmp" "$PREFIX.detached"
+  cat > "$tmp"
+  mv "$tmp" "$PREFIX.detached"
 }
 detached_field() { awk -F= -v k="$1" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$PREFIX.detached" 2>/dev/null; }
 quote_command() { python3 -c 'import shlex,sys; print(shlex.join(sys.argv[1:]))' "$@"; }
@@ -461,6 +461,8 @@ prompt_digest() { { shasum -a 256 "$1" 2>/dev/null || sha256sum "$1" 2>/dev/null
 # close it, including their command-substitution shells. Admission execs its
 # helper with the lease through receipt binding. Every mutating helper keeps
 # that lease through its final artifact write, including after collector loss.
+# External shell mutators inherit it too: a rename, copy, or removal can still
+# be pending after its shell dies. Only observation children may discard it.
 # Keep the lock inode permanently: unlinking it would split future contenders.
 # Old directory locks must drain under the old runner before upgrading.
 publish_lock() {  # [--must], bounded acquisition for every caller
@@ -598,7 +600,7 @@ rotate_previous_attempt() {
     # .detached and .childexit belong to the attempt too: a record left behind would make a bogus
     # --attach admissible against the NEXT, live attempt, and a stale receipt would let it publish
     # a terminal outcome from the previous run's exit status.
-    for ext in stdout stderr progress joblog meta exit detached childexit ccr-attempt.json ccr-receipt.json ccr-prompt ccr-result.json ccr-errorlog ccr-submit.stderr; do [ -e "$PREFIX.$ext" ] && mv 9>&- "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
+    for ext in stdout stderr progress joblog meta exit detached childexit ccr-attempt.json ccr-receipt.json ccr-prompt ccr-result.json ccr-errorlog ccr-submit.stderr; do [ -e "$PREFIX.$ext" ] && mv "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
     echo "codex-run.sh: previous attempt rotated to $PREFIX.attempt$N.*"
   fi
 }
@@ -651,7 +653,7 @@ stamp_claim() {
     echo "codex-run.sh: $PREFIX.claim does not carry token $CLAIM_TOKEN (the claim was rotated or replaced since the gate printed it); re-run the launch gate and use its new token (no sidecar was written)" >&2
     exit 4
   fi
-  if ! mkdir 9>&- "$PREFIX.claim/runner" 2>/dev/null; then
+  if ! mkdir "$PREFIX.claim/runner" 2>/dev/null; then
     publish_unlock
     echo "codex-run.sh: $PREFIX.claim is already taken by runner $(exec 9>&-; cat "$PREFIX.claim/runner/pid" 2>/dev/null || echo unknown); re-run the launch gate before launching again (no sidecar was written)" >&2
     exit 4
@@ -726,7 +728,7 @@ if [ "$ATTACH" = 1 ]; then
   if [ "$CANCEL_ONLY" = 1 ]; then
     if [ "$BACKEND" = codex ]; then
       CODEX_ROOT=$(exec 9>&-; codex_root); [ -n "$CODEX_ROOT" ] || die4 "--attach --cancel: cannot locate the codex plugin"
-      node 9>&- "$CODEX_ROOT/scripts/codex-companion.mjs" cancel "$JOB" >>"$PREFIX.stderr" 2>&1 || true
+      node "$CODEX_ROOT/scripts/codex-companion.mjs" cancel "$JOB" >>"$PREFIX.stderr" 2>&1 || true
       echo "codex-run.sh: cancel requested for job $JOB"
     elif [ "$ALIVE" = 1 ]; then
       # A request to the owner, by job id. Nothing is signalled, no pid is derived and no process
@@ -1016,7 +1018,7 @@ EOD
   [ "$UNCONFIRMED_CANCEL" = 1 ] && RC=5
   # Terminal, in this order: the attempt stops being detached before it is marked finished, so no
   # gate ever sees both markers, and none sees .exit while .detached still says a job may run.
-  rm 9>&- -f "$PREFIX.detached"
+  rm -f "$PREFIX.detached"
   echo "$RC" > "$PREFIX.exit"
   publish_unlock
   echo "codex-run.sh: $OUTCOME backend=ccr alias=$ALIAS session=${SESSION_ID:-unknown} elapsed=$(exec 9>&-; elapsed)s stdout=$(exec 9>&-; wc -c < "$PREFIX.stdout" | tr -d ' ')B → $PREFIX.{stdout,progress,meta}"
@@ -1039,7 +1041,7 @@ if [ -z "$CODEX_ROOT" ] || [ ! -f "$CODEX_ROOT/scripts/codex-companion.mjs" ]; t
   fi
   launch_error "cannot locate the codex plugin (installed_plugins.json or ~/.claude/plugins/cache/openai-codex/codex/*)" "task $MODE --background --prompt-file $PROMPT_FILE"
 fi
-cc() { node 9>&- "$CODEX_ROOT/scripts/codex-companion.mjs" "$@"; }
+cc() { node "$CODEX_ROOT/scripts/codex-companion.mjs" "$@"; }
 jobfield() { python3 -c "import sys,json;d=json.load(sys.stdin);j=d.get('job') or {};print(j.get('$1') or '')" 2>/dev/null; }
 
 if [ "$ATTACH" = 1 ]; then
@@ -1175,7 +1177,7 @@ fi
 if [ "${UNCONFIRMED_CANCEL:-0}" = "1" ]; then : > "$PREFIX.stdout"
 else cc result "$JOB" > "$PREFIX.stdout" 2>>"$PREFIX.stderr" || true
 fi
-[ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && cp 9>&- "$LOGFILE" "$PREFIX.joblog" 2>/dev/null
+[ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && cp "$LOGFILE" "$PREFIX.joblog" 2>/dev/null
 THREAD=$(exec 9>&-; grep -oE 'Codex session ID: [0-9a-f-]+' "$PREFIX.stdout" | head -1 | awk '{print $4}')
 # A resumed run must land in the thread it named. The companion offers no way to ask for a thread
 # by id — --resume-last takes the newest eligible one — so the binding can only be checked after
@@ -1205,7 +1207,7 @@ case "$OUTCOME" in COMPLETED) RC=0;; FAILED) RC=1;; STALLED) RC=2;; TIMEOUT) RC=
 # An unconfirmed cancel outranks the outcome: 1, 2 and 3 all invite a retry or
 # treat the job as finished, and neither is safe while a worker may be alive.
 [ "${UNCONFIRMED_CANCEL:-0}" = "1" ] && RC=5
-rm 9>&- -f "$PREFIX.detached"
+rm -f "$PREFIX.detached"
 echo "$RC" > "$PREFIX.exit"
 publish_unlock
 echo "codex-run.sh: $OUTCOME job=$JOB elapsed=$(exec 9>&-; elapsed)s stdout=$(exec 9>&-; wc -c < "$PREFIX.stdout" | tr -d ' ')B → $PREFIX.{stdout,progress,meta}"

@@ -46,8 +46,9 @@ The collector lease is explicitly closed in observation command substitutions an
 external polling children. Admission uses an `exec` handoff to its helper, which
 retains the inherited lease through receipt binding. Every mutating helper retains
 the same prefix lease through its final artifact write; standalone helper calls
-acquire that lease themselves. This prevents an orphaned helper from overwriting
-a replacement attempt after collector loss. Saved recovery
+acquire that lease themselves. External shell commands that publish, rotate, copy,
+or remove artifacts also retain it until they finish. This prevents an orphaned
+mutator from overwriting a replacement attempt after collector loss. Saved recovery
 commands bind the original job: `--expected-job` on attach rejects prefix reuse;
 the cancellation helper enforces the same identity before requesting cancellation.
 An unconfirmed write-runner cancellation returns exit5 without waiting for an
