@@ -52,8 +52,10 @@ debate (artifacts: `runner-hard-negatives-20260909-140134`, termination T1).
   `.exit`, because `phase-gate.sh` reads an existing `.exit` as a finished attempt and would
   rotate the claim and authorize a **second concurrent launch against the still-running job** —
   the second model's X-2, confirmed against the code. The gate now reads `.detached` with no
-  `.exit` as still in flight, and `release` refuses a detached prefix until an attach has
-  published an outcome.
+  `.exit` as still in flight. `release` refuses a detached prefix while its job is not PROVABLY
+  finished — a matching recorded identity, a process group that is not provably empty, or a
+  companion that cannot be consulted — and releases one whose job is provably over, so a prefix
+  cannot wedge when the attach itself cannot reach its backend.
 - **Identity before action.** A recorded pid or pgid is never signalled on the strength of the
   record alone: it is paired with the process's start time and re-proved first. A start-time
   mismatch means the number now names a different execution — nothing is signalled; a matching
@@ -98,12 +100,21 @@ debate (artifacts: `runner-hard-negatives-20260909-140134`, termination T1).
   returns "not confirmed" **having signalled nothing**, so callers treat it as a failed cancel
   rather than a completed kill; `group_alive` is gated the same way, because `kill -0 -- "-1"` is
   a permission probe against the whole machine that would answer "alive" for a group that does not
-  exist. The same gate is in `implement-run.sh`. Audited: no other executable path in this
-  repository sends a signal to a *process-group* target — `phase-gate.sh` and `scripts/test-args.sh`
-  do invoke `kill` and `pkill`, but only as `kill -0`, per-pid kills of a pid they created, and (in
-  the tests) group teardowns re-proved against the recorded owner pid; nothing in the repository
-  invokes `killall`, `launchctl`, `osascript` or `pmset`, and the only configured hook (`impeccable`)
-  sends no signals.
+  exist. The same gate is in `implement-run.sh`. The audit that used to stand here claimed more
+  than it had checked — it said no other path signals a process-group target while
+  `scripts/test-args.sh` held a `kill -KILL "${VAR:-0}"`, which POSIX makes a signal to the
+  sender's whole process group, and it described every test teardown as ownership-proved when only
+  three of twelve were. What is true after this release is narrower and mechanically enforced:
+  every signal in `scripts/test-args.sh` goes through one of three guarded helpers — `signal_group`
+  (refuses 0, 1, empty, non-numeric and our own group), `signal_pid` (the same refusals for the
+  per-pid form, where 0 means the sender's group) and `pid_alive` — and the suite's own S-08 sweep
+  now fails on any `kill` or `pkill` outside those three bodies, so a new call site is a failure by
+  default rather than by regex coverage. `phase-gate.sh` sends no signal at all: its four `kill`
+  calls are `kill -0` liveness probes of a single pid (verified at this release by `git grep`), and
+  group emptiness is read from the process table rather than probed with `kill -0 -- "-N"`, which
+  for `N=1` tests every process the user owns and answers "alive" for a group that never existed.
+  Nothing in the repository invokes `killall`, `launchctl`, `osascript` or `pmset`,
+  and the only configured hook (`impeccable`) sends no signals.
 
   Forensics on the machine where this was found: `kill_group` had only ever been invoked on two
   pgids, both from the validated launch path, and the one attach that did run against the `pgid=1`

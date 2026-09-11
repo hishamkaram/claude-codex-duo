@@ -817,13 +817,24 @@ lock_identity() {  # <pid> -> start time, pinned to UTC so it does not depend on
 # (every process this user owns). Returns 0 ONLY on proof: a non-numeric or sentinel pgid, or a ps
 # that told us nothing, is undetermined and returns 1 so callers stay refused. Sound one way only —
 # a reused pgid can make a dead group look alive, never a live one look dead.
+# Two false-"empty" paths closed in cycle 5 (CX-04): `ps … | tr …` reported TR's status, so a ps
+# that failed — or died part-way through printing — read as a complete answer; and the pgid was
+# compared as text, so a zero-padded id never matched the table's unpadded form. ps is now run on
+# its own with its status checked, the table is sanity-checked by looking for a group that must be
+# in it (ours), and both sides of the comparison are base-10 integers.
 group_is_empty() {  # <pgid>
-  local pg="$1" table
+  local pg="$1" raw rc norm self
   case "$pg" in ''|*[!0-9]*) return 1;; esac
+  pg=$((10#$pg))
   [ "$pg" -ge 2 ] 2>/dev/null || return 1
-  table=$(ps -Ao pgid= 2>/dev/null | tr -d ' ') || return 1
-  [ -n "$table" ] || return 1
-  printf '%s\n' "$table" | grep -qx -- "$pg" && return 1
+  raw=$(ps -Ao pgid= 2>/dev/null); rc=$?
+  [ "$rc" = 0 ] || return 1
+  norm=$(printf '%s\n' "$raw" | tr -d ' ' | grep -E '^[0-9]+$' | sed 's/^0*\([0-9]\)/\1/')
+  [ -n "$norm" ] || return 1
+  self=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+  case "$self" in ''|*[!0-9]*) return 1;; esac
+  printf '%s\n' "$norm" | grep -qx -- "$((10#$self))" || return 1   # truncated table: undetermined
+  printf '%s\n' "$norm" | grep -qx -- "$pg" && return 1
   return 0
 }
 # Reclaiming is a race: testing the holder and deleting it are two steps, so a second reclaimer
@@ -845,14 +856,18 @@ reclaim_lock() {  # <lock> <the exact holder record judged stale> -> 0 when the 
   return 1
 }
 claim_lock() {  # claim_lock <prefix>
-  local lock="$ART/$1.claim.lock" i=0 now hrec hpid hident hlive
+  local lock="$ART/$1.claim.lock" i=0 now hrec hpid hident hlive d dp
   while ! mkdir "$lock" 2>/dev/null; do
     hrec=$(cat "$lock/holder" 2>/dev/null)
     hpid=$(printf '%s\n' "$hrec" | awk -F= '$1=="pid"{print $2; exit}')
     hident=$(printf '%s\n' "$hrec" | awk -F= '$1=="identity"{sub(/^[^=]*=/,""); print; exit}')
     if [ -n "$hpid" ]; then
       hlive=$(lock_identity "$hpid")
-      if [ -z "$hlive" ] || [ "$hlive" != "$hident" ]; then
+      # An empty identity means either "the holder is gone" or "`ps` could not answer", and reading
+      # the second as the first took the lock from a live collector (cycle 5: CX-05). An absence is
+      # only believed when `ps` demonstrably works — asked about this process, which certainly
+      # exists. A MISMATCH needs no such proof: it is a positive answer about a different execution.
+      if [ "$hlive" != "$hident" ] && { [ -n "$hlive" ] || [ -n "$(lock_identity "$$")" ]; }; then
         reclaim_lock "$lock" "$hrec" && continue
       fi
     else
@@ -862,7 +877,17 @@ claim_lock() {  # claim_lock <prefix>
         # lock can hold — `holder`, and a `holder.dead.<pid>` left behind by a reclaim_lock killed
         # between its rename and its rm. Clearing only `holder` wedged the lock permanently, the
         # same shape cycle 3 fixed for `holder` itself (cycle 4: CX-05).
-        rm -f "$lock/holder" "$lock"/holder.dead.* 2>/dev/null
+        # But that file is only abandoned once the reclaimer named in it is gone: while that process
+        # runs, it is a live holder record moved aside and still restorable, and deleting it let a
+        # third contender take a lock a second one owned (cycle 5: CX-06). The name carries the pid,
+        # so the question is asked rather than inferred from the directory's age.
+        for d in "$lock"/holder.dead.*; do
+          [ -e "$d" ] || continue
+          dp=${d##*.}
+          case "$dp" in ''|*[!0-9]*) rm -f "$d" 2>/dev/null; continue;; esac
+          kill -0 "$dp" 2>/dev/null || rm -f "$d" 2>/dev/null
+        done
+        rm -f "$lock/holder" 2>/dev/null
         rmdir "$lock" 2>/dev/null && continue   # an unremovable stale lock is retried like a held one (bounded)
       fi
     fi

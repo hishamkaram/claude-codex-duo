@@ -192,10 +192,16 @@ younger than the ten-minute handoff grace window
 There are no process-liveness heuristics in the launch gates. Past the grace
 window an unstarted claim is reclaimed. A claim whose attempt is DETACHED —
 `<prefix>.detached` present and no `.exit`, the runner's exit 6 — is in flight
-whatever its age: the job is still running and still spending tokens, so the
-gate refuses to advance, `release` refuses it, and the only recovery is the
-`attach_command` the record carries (never a relaunch, which would start a
-second job against the live one). An attach either publishes the terminal
+whatever its age: the job may still be running and still spending tokens, so the
+gate refuses to advance and the normal recovery is the `attach_command` the
+record carries (never a relaunch, which would start a second job against the
+live one). `release` refuses it too while its job is not PROVABLY finished — a
+recorded identity that still matches, a process group that is not provably
+empty, or a companion that cannot be consulted. Detachment alone is not the
+refusal: a detached attempt whose job is provably over (an empty process group,
+or a companion reporting the job completed/failed/cancelled) is released
+normally, which is what stops a prefix wedging when the attach cannot reach its
+backend. An attach either publishes the terminal
 outcome or re-detaches with exit 6; it never frees the claim on a guess. A
 started claim whose runner died without writing `.exit` and that is NOT detached
 is recovered only by

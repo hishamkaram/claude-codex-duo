@@ -228,6 +228,22 @@ identity_state() {  # <pid> <recorded identity>
   [ "$live" = "$2" ] || return 2
   return 0
 }
+# The comment above says an empty `ps` may mean inspection FAILED rather than the process exited —
+# and then every caller collapsed that into state 1 and acted on it. For the collector that is
+# safe (it refuses either way), but the lock reclaimer read state 1 as "the holder is dead" and
+# took a live collector's lock, admitting a second one (cycle 5: CX-05). This separates the two:
+# process inspection is proved to WORK, by asking it about a process that certainly exists — this
+# one — before an absent answer about someone else is allowed to mean absence.
+identity_is_readable() {  # 0 when `ps` can identify a process we know is alive
+  [ -n "$(proc_identity "$$")" ]
+}
+holder_is_provably_gone() {  # <pid> <recorded identity> -> 0 only on a PROVEN absence or reuse
+  identity_state "$1" "$2" && return 1     # state 0: alive and ours — definitely not gone
+  case $? in
+    2) return 0;;                          # the number now names a different execution: ours ended
+    *) identity_is_readable;;              # state 1: absence counts only if `ps` is working at all
+  esac
+}
 pgid_of() { ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
 # ============================================================================================
 # THE ONLY GATE THROUGH WHICH THIS SCRIPT MAY SIGNAL A PROCESS GROUP
@@ -283,13 +299,32 @@ group_alive() {  # <pgid> [owner-pid] -> 0 only when the group is BOTH signalabl
 # a dead group look alive but never a live one look dead. Undetermined answers — a non-numeric or
 # sentinel pgid, or a ps that told us nothing — return 1 (not provably empty), so callers stay in
 # flight rather than closing on an unproven termination.
+# Two ways this predicate could have said "empty" about a live group, both fixed here
+# (cycle 5: CX-04). (1) `ps … | tr …` reports TR's status, so a ps that failed — or that died
+# part-way through printing, leaving a partial table that happens to omit this group — was read as
+# a complete answer; the raw ps output is now captured on its own and its status checked, and a
+# truncated-looking table is treated as undetermined. (2) The pgid was compared as TEXT, so a
+# zero-padded `012345` passed the numeric guard and then matched nothing in a table that says
+# `12345`. Both are normalized to base-10 integers before the comparison. Every uncertain answer
+# is 1 (NOT provably empty), which keeps callers in flight rather than closing a running job.
 group_is_empty() {  # <pgid> -> 0 only when the process table proves no member is left
-  local pg="$1" table
+  local pg="$1" raw rc norm self
   case "$pg" in ''|*[!0-9]*) return 1;; esac
+  pg=$((10#$pg))                      # 012345 and 12345 are the same group; the table prints one form
   [ "$pg" -ge 2 ] 2>/dev/null || return 1
-  table=$(ps -Ao pgid= 2>/dev/null | tr -d ' ') || return 1
-  [ -n "$table" ] || return 1
-  printf '%s\n' "$table" | grep -qx -- "$pg" && return 1
+  raw=$(ps -Ao pgid= 2>/dev/null); rc=$?
+  [ "$rc" = 0 ] || return 1           # ps failed: undetermined, never "empty"
+  # Both sides are normalized to base-10 before anything is compared, so the answer is about the
+  # group and not about how its number happens to be spelled.
+  norm=$(printf '%s\n' "$raw" | tr -d ' ' | grep -E '^[0-9]+$' | sed 's/^0*\([0-9]\)/\1/')
+  [ -n "$norm" ] || return 1
+  # A working `ps -A` always lists at least this shell, and our own group is the cheapest thing to
+  # look for: a table that does not contain it is truncated or filtered, not a description of the
+  # machine, and nothing may be concluded from it.
+  self=$(pgid_of "$$")
+  case "$self" in ''|*[!0-9]*) return 1;; esac
+  printf '%s\n' "$norm" | grep -qx -- "$((10#$self))" || return 1
+  printf '%s\n' "$norm" | grep -qx -- "$pg" && return 1
   return 0
 }
 # TERM then KILL the whole group; return 0 when nothing in it is left, 1 when something survives.
@@ -600,13 +635,16 @@ reclaim_lock() {  # <lock> <the exact holder record judged stale> -> 0 when the 
 PUBLISH_WAIT_MAX=$(( 30 * 60 * 10 ))   # 0.1 s ticks
 publish_lock() {  # [--must]
   local must=0; [ "${1:-}" != --must ] || must=1
-  local lock="$PREFIX.claim.lock" i=0 waited=0 now m hpid hident hrec
+  local lock="$PREFIX.claim.lock" i=0 waited=0 now m hpid hident hrec d dp
   while ! mkdir "$lock" 2>/dev/null; do
     hrec=$(cat "$lock/holder" 2>/dev/null)
     hpid=$(printf '%s\n' "$hrec" | awk -F= '$1=="pid"{print $2; exit}')
     hident=$(printf '%s\n' "$hrec" | awk -F= '$1=="identity"{sub(/^[^=]*=/, ""); print; exit}')
     if [ -n "$hpid" ]; then
-      if ! identity_state "$hpid" "$hident"; then
+      # Reclaim only on a PROVEN absence. `identity_state` returns 1 both when the holder is gone
+      # and when `ps` could not answer, and reading the second as the first let a contender take a
+      # live collector's lock during a transient inspection failure (cycle 5: CX-05).
+      if holder_is_provably_gone "$hpid" "$hident"; then
         reclaim_lock "$lock" "$hrec" && continue
       elif [ "$must" = 1 ]; then
         waited=$((waited+1))
@@ -620,7 +658,20 @@ publish_lock() {  # [--must]
       # EVERY file a lock can hold — including a `holder.dead.<pid>` left by a reclaim_lock that
       # was killed between its rename and its rm. Clearing only `holder` wedged the lock forever
       # in exactly the shape cycle 3 fixed for `holder` itself (cycle 4: CX-05).
-      if [ $(( now - m )) -ge 60 ]; then rm -f "$lock/holder" "$lock"/holder.dead.* 2>/dev/null; rmdir "$lock" 2>/dev/null && continue; fi
+      # But `holder.dead.<pid>` is only abandoned once <pid> is gone: while that reclaimer is still
+      # running, the file is a LIVE holder record it has moved aside and may still put back, and
+      # deleting it let a third contender take a lock a second one legitimately owned (cycle 5:
+      # CX-06). The name carries the reclaimer's pid, so the question is answerable — and it is
+      # asked, rather than assumed from the directory's age.
+      if [ $(( now - m )) -ge 60 ]; then
+        for d in "$lock"/holder.dead.*; do
+          [ -e "$d" ] || continue
+          dp=${d##*.}
+          case "$dp" in ''|*[!0-9]*) rm -f "$d" 2>/dev/null; continue;; esac
+          kill -0 "$dp" 2>/dev/null || rm -f "$d" 2>/dev/null   # its reclaimer is gone: abandoned
+        done
+        rm -f "$lock/holder" 2>/dev/null; rmdir "$lock" 2>/dev/null && continue
+      fi
     fi
     # One bound for both shapes of failure: a lock a live holder legitimately owns, and a stale one
     # that cannot be removed (a directory with something else inside it). Neither may spin forever.
@@ -632,7 +683,57 @@ publish_lock() {  # [--must]
 }
 publish_unlock() { [ -z "${HELD_LOCK:-}" ] || { rm -f "$HELD_LOCK/holder" 2>/dev/null; rmdir "$HELD_LOCK" 2>/dev/null; }; HELD_LOCK=""; }
 
-rotate_previous_attempt() {
+# The in-flight refusals, split out of rotate_previous_attempt so they can run BEFORE the claim is
+# taken. They used to run after: stamp_claim did `mkdir <prefix>.claim/runner` and wrote its pid,
+# and only then did rotation ask whether the prefix already held an unfinished attempt. A refusal
+# therefore left a taken claim behind — which `phase-gate.sh` counts against the four-launch budget
+# and reports as a runner in flight for a process that has exited — so four refusals could exhaust
+# a review's budget without a single job being launched (cycle 5: CL-05). This function only ever
+# reads and refuses; it never rotates or writes.
+refuse_if_in_flight() {
+  # A RUNNING attempt that has not detached yet is in flight too. `.detached` is only written when
+  # a watch bound elapses, so between launch and that bound the prefix has `.progress` and a `.meta`
+  # naming a live pid and pgid, and no `.detached` at all — and the guard below, keyed on
+  # `.detached`, did not look. A second launch on the same prefix therefore rotated a still-running
+  # attempt's sidecars away and started a job beside it, with both supervisors writing the same
+  # paths. Taking the lock serialized the two rotations but established no ownership that outlives
+  # it, which is the whole defect: the claim-less path of codex-debate and codex-deep-plan has no
+  # claim directory to carry that ownership either (cycle 5: CX-07). The live attempt's own `.meta`
+  # is that record, and it is now consulted first.
+  # A running attempt has not written `.meta` yet — that is a terminal-or-detach act — so the only
+  # record it leaves is the launch line in `.progress`, the same line `phase-gate.sh` reads.
+  if [ ! -e "$PREFIX.exit" ] && [ ! -e "$PREFIX.detached" ] && [ -e "$PREFIX.progress" ]; then
+    local lline lpgid ljob lstat lroot mlive=""
+    lline=$(grep -E '^[0-9]+s launched backend=ccr ' "$PREFIX.progress" 2>/dev/null | tail -1)
+    if [ -n "$lline" ]; then
+      lpgid=$(printf '%s' "$lline" | sed -n 's/.* pgid=\([0-9]*\).*/\1/p')
+      # The pid on that line is the SUPERVISOR and its child outlives it, so the group — not the
+      # pid — is what says whether work is still happening. Only a provably empty group clears it.
+      if [ -n "$lpgid" ] && ! group_is_empty "$lpgid"; then
+        mlive="process group $lpgid still has members"
+      fi
+    else
+      ljob=$(grep -oE 'launched job=task-[a-z0-9-]+' "$PREFIX.progress" 2>/dev/null | head -1 | cut -d= -f2)
+      if [ -n "$ljob" ]; then
+        lroot=$(codex_root)
+        if [ -n "$lroot" ] && [ -f "$lroot/scripts/codex-companion.mjs" ]; then
+          lstat=$(node "$lroot/scripts/codex-companion.mjs" status "$ljob" --json 2>/dev/null \
+                  | python3 -c "import sys,json;d=json.load(sys.stdin);print((d.get('job') or {}).get('status') or '')" 2>/dev/null)
+          case "$lstat" in
+            completed|failed|cancelled|canceled) ;;                      # over: rotate
+            "") mlive="the companion did not answer for job $ljob";;      # fail closed
+            *)  mlive="job $ljob is $lstat";;
+          esac
+        else
+          mlive="the codex companion could not be consulted for job $ljob"
+        fi
+      fi
+    fi
+    if [ -n "$mlive" ]; then
+      echo "codex-run.sh: $PREFIX.progress names an attempt that has not ended — $mlive. It has not detached, so there is no attach command yet: launching here would rotate a running job's sidecars away and start a second job against the same prefix. Wait for it, or cancel it first." >&2
+      exit 4
+    fi
+  fi
   # A detached attempt with no .exit is IN FLIGHT. Rotating its record away would strand the job:
   # nothing could attach to it or cancel it again, and its process group would keep running
   # unowned while a second job started against the same prefix (cycle 2: CL-07). Refuse while the
@@ -696,6 +797,11 @@ rotate_previous_attempt() {
       exit 4
     fi
   fi
+}
+rotate_previous_attempt() {
+  # Re-asked here as well as in stamp_claim: this is the last moment before the previous attempt's
+  # sidecars are moved, and the two callers that reach rotation without a claim must still refuse.
+  refuse_if_in_flight
   # never clobber a previous attempt: rotate its sidecars to <prefix>.attemptN.*
   # A launch error leaves .exit without .meta, and a runner killed mid-flight
   # leaves .progress without either, so all three are attempt markers and an
@@ -735,6 +841,9 @@ stamp_claim() {
   # and how a holder file this function could not `rmdir` could wedge it (review cycle 3).
   publish_lock
   local lock="$HELD_LOCK"
+  # Under the lock, and BEFORE anything is claimed or written: a launch that is going to be refused
+  # must not first consume the claim that refusal makes unusable (cycle 5: CL-05).
+  refuse_if_in_flight
   if [ ! -d "$PREFIX.claim" ]; then
     if [ "$CLAIM_MODE" = 1 ]; then
       publish_unlock
@@ -862,6 +971,10 @@ if [ "$BACKEND" = ccr ]; then
   stamp_claim; rotate_previous_attempt; unlock_claim
   : > "$PREFIX.progress"; : > "$PREFIX.stderr"; : > "$PREFIX.joblog"
   rm -f "$PREFIX.childexit" "$PREFIX.childexit.tmp"
+  # The launcher needs the receipt path by the same name the attach path reads it under: its
+  # monitor now uses the identical "receipt or provably empty group" termination predicate, and
+  # under `set -u` an undefined RECEIPT would abort the run instead (cycle 5: CX-03).
+  RECEIPT="$PREFIX.childexit"
   start_supervised_group "$PREFIX.childexit" "${ARGV[@]}" < "$PROMPT_FILE" > "$PREFIX.joblog" 2>> "$PREFIX.stderr" &
   CHILD=$!
   sleep 1
@@ -909,7 +1022,22 @@ if [ "$BACKEND" = ccr ]; then
                STATUS=exited; IDENT_NOTE="identity unresolved (state $IDENT_STATE) and process group $PGID is empty; the execution ended without a receipt"
              else STATUS=running; IDENT_NOTE="identity unresolved (state $IDENT_STATE) and no supervisor receipt yet; not concluding the job ended"; fi;;
       esac
-    elif kill -0 "$CHILD" 2>/dev/null; then STATUS=running; else STATUS=exited; fi
+    elif kill -0 "$CHILD" 2>/dev/null; then STATUS=running
+    else
+      # $CHILD is the SUPERVISOR, not the work. Its death is not the job's: the gateway child is
+      # reparented and keeps running in the same process group. Reading "supervisor gone" as
+      # "attempt over" published a terminal .exit for a live job and freed the prefix for a second
+      # one — the same defect the attach branch above was fixed for in cycle 4, left standing on
+      # the ORIGINAL launcher's path (cycle 5: CX-03). The launcher now uses the identical
+      # predicate: a receipt, or a provably empty group, and nothing else ends the attempt.
+      if [ -s "$RECEIPT" ]; then STATUS=exited
+      elif [ -n "$PGID" ] && group_is_empty "$PGID"; then
+        STATUS=exited; IDENT_NOTE="the supervisor is gone and process group $PGID is empty; the execution ended without a receipt"
+      else
+        STATUS=running
+        IDENT_NOTE="the supervisor (pid $CHILD) is gone but process group ${PGID:-<unrecorded>} is not provably empty and there is no receipt; not concluding the job ended"
+      fi
+    fi
     echo "$(elapsed)s status=$STATUS idle=${IDLE}s | $LASTLINE" >> "$PREFIX.progress"
     [ "$STATUS" = running ] || { OUTCOME=EXITED; break; }
     if [ "$IDLE" -ge $(( STALL_MIN * 60 )) ]; then OUTCOME=STALLED; break; fi
