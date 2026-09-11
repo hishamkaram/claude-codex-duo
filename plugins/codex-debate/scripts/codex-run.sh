@@ -548,10 +548,10 @@ refuse_if_in_flight() {
   # A detached attempt with no .exit is IN FLIGHT. Rotating its record away would strand the job:
   # nothing could attach to it or cancel it again, and its process group would keep running
   # unowned while a second job started against the same prefix (cycle 2: CL-07). Refuse while the
-  # recorded identity is provably still running; an unprovable one is allowed to rotate so a dead
-  # record can never deadlock the prefix.
+  # owner cannot positively confirm termination. Missing or malformed backend
+  # metadata is unresolved and cannot authorize replacement.
   if [ -e "$PREFIX.detached" ] && [ ! -e "$PREFIX.exit" ]; then
-    local dbackend dpid dident djob dstatus droot dlive=no
+    local dbackend dpid dident djob dstatus droot dlive="undetermined (detached backend is missing or unrecognized)"
     dbackend=$(exec 9>&-; detached_field backend)
     case "$dbackend" in
       ccr)
@@ -1121,7 +1121,7 @@ if [ "$OUTCOME" = "DETACHED" ]; then
     # job is still running rather than assume it (cycle 3: CL-03/CX-02). The companion remains the
     # authority; this is the cheap local check, and `job=` is what a relaunch consults.
     D_WPID="${PID:-}"; D_WIDENT=$(exec 9>&-; proc_identity "${PID:-0}")
-    ATTACH_CMD=$(exec 9>&-; quote_command "$CCR_RUNNER" "$PREFIX" --attach --stall-min "$STALL_MIN" --max-min "$MAX_MIN" --poll-sec "$POLL")
+    ATTACH_CMD=$(exec 9>&-; quote_command "$CCR_RUNNER" "$(exec 9>&-; python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$PREFIX")" --attach --stall-min "$STALL_MIN" --max-min "$MAX_MIN" --poll-sec "$POLL")
     CANCEL_CMD=$(exec 9>&-; quote_command node "$CODEX_ROOT/scripts/codex-companion.mjs" cancel "$JOB")
   fi
   echo "$(exec 9>&-; elapsed)s DETACHED → watch bound reached with job $JOB still running; not cancelled" >> "$PREFIX.progress"

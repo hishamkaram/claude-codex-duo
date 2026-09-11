@@ -665,6 +665,48 @@ os.execv('/bin/ps', ['ps'] + sys.argv[1:])
 
 
 class ConsumerSafetyTests(unittest.TestCase):
+    def test_unknown_detached_backend_cannot_authorize_replacement(self):
+        source = RUNNER.read_text()
+        guard = source[source.index("refuse_if_in_flight() {"):source.index("rotate_previous_attempt() {")]
+        for backend in ("", "unknown"):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as directory:
+                prefix = str(Path(directory) / "attempt")
+                detached = Path(prefix + ".detached")
+                detached.write_text("backend=" + backend + "\n")
+                Path(prefix + ".progress").write_text("work still unresolved\n")
+                before = detached.read_bytes()
+                script = guard + """
+detached_field() { awk -F= -v key="$1" '$1==key{print $2;exit}' "$PREFIX.detached"; }
+refuse_if_in_flight
+printf replacement > "$PREFIX.launched"
+"""
+                result = subprocess.run(["bash", "-c", script], env=dict(os.environ, PREFIX=prefix),
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 4, result.stderr)
+                self.assertFalse(Path(prefix + ".launched").exists())
+                self.assertFalse(Path(prefix + ".exit").exists())
+                self.assertEqual(detached.read_bytes(), before)
+
+    def test_saved_codex_command_resolves_relative_prefix_before_cwd_changes(self):
+        source = RUNNER.read_text().splitlines()
+        quote = next(line for line in source if line.startswith("quote_command()"))
+        assignment = next(line.strip() for line in source if "ATTACH_CMD=" in line and "$PREFIX" in line and "--stall-min" in line)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            other = root / "other"
+            other.mkdir()
+            runner = root / "capture"
+            runner.write_text("#!/bin/sh\n[ -f \"$1.detached\" ]\n")
+            runner.chmod(0o700)
+            (root / "relative.detached").write_text("owned attempt")
+            env = dict(os.environ, CCR_RUNNER=str(runner), PREFIX="relative", STALL_MIN="1", MAX_MIN="2", POLL="3")
+            result = subprocess.run(["bash", "-c", quote + "\n" + assignment + '\nprintf "%s\\n" "$ATTACH_CMD"'],
+                                    cwd=root, env=env, capture_output=True, text=True, check=True)
+            command = shlex.split(result.stdout)
+            self.assertTrue(Path(command[1]).is_absolute())
+            attached = subprocess.run(command, cwd=other, capture_output=True, text=True)
+            self.assertEqual(attached.returncode, 0, attached.stderr)
+
     def test_fixture_stop_is_cooperative_and_releases_lease(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
