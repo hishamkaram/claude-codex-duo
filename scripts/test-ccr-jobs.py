@@ -151,23 +151,205 @@ else:
         self.assertEqual(attach.returncode, 6)
         self.assertEqual(list((self.root / "store/fake-ccr-jobs").glob("*.json")), before)
 
+    def test_admission_lease_survives_collector_until_attempt_is_durable(self):
+        wrapper = self.root / "admission-helper.py"
+        helper = RUNNER.with_name("ccr-job.py")
+        wrapper.write_text("""import importlib.util, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('helper', HELPER)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+root = Path(__file__).parent
+original = m.atomic
+blocked = False
+def atomic(path, data):
+    global blocked
+    if str(path).endswith('.ccr-attempt.json') and not blocked:
+        blocked = True
+        (root / 'before-attempt').write_text('ready')
+        end = time.monotonic() + 10
+        while not (root / 'release-attempt').exists():
+            if time.monotonic() > end:
+                raise RuntimeError('test release missing')
+            time.sleep(.02)
+    original(path, data)
+m.atomic = atomic
+try:
+    m.main()
+finally:
+    (root / 'helper-done').write_text('done')
+""".replace("HELPER", repr(str(helper))))
+        lock = self.root / "admission-lease"
+        prefix = str(self.root / "admission")
+        variables = dict(CCR_HELPER=str(wrapper), PREFIX=prefix, ALIAS="x",
+                         CLAUDE_MODEL="anthropic.ccr.x", MAX_TURNS="3", MODEL_JSON='{"provider":"fixture"}',
+                         CCR_VER="0.5.1", ADMISSION_WAIT="2")
+        assignment = next(line for line in RUNNER.read_text().splitlines()
+                          if line.strip().startswith("RECEIPT_JSON="))
+        script = "exec 9>>" + shlex.quote(str(lock)) + "\n"
+        script += shlex.join(["python3", str(helper), "lock", "9", "5"]) + "\n"
+        script += "\n".join(key + "=" + shlex.quote(value) for key, value in variables.items()) + "\n"
+        script += "ARGV=(" + shlex.join(["ccr", "launch", "--model", "x", "--detach", "--prompt-file", str(self.prompt)]) + ")\n"
+        script += assignment + "\n"
+        process = subprocess.Popen(["bash", "-c", script], env=dict(self.env, FAKE_CCR_HANG_RECEIPT="valid"),
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ready, release, done = [self.root / name for name in ("before-attempt", "release-attempt", "helper-done")]
+        try:
+            deadline = time.monotonic() + 8
+            while not ready.exists():
+                self.assertLess(time.monotonic(), deadline, "admission never reached preparation")
+                time.sleep(.02)
+            process.kill()
+            process.wait()
+            with lock.open("rb") as handle:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                release.write_text("release")
+                deadline = time.monotonic() + 3
+                while True:
+                    try:
+                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        self.assertLess(time.monotonic(), deadline, "admission retained lease after durable attempt")
+                        time.sleep(.02)
+                self.assertTrue(Path(prefix + ".ccr-attempt.json").exists())
+                receipt_path = Path(prefix + ".ccr-receipt.json")
+                deadline = time.monotonic() + 1
+                while not receipt_path.exists() or not receipt_path.stat().st_size:
+                    self.assertLess(time.monotonic(), deadline, "workload admission never returned a receipt")
+                    time.sleep(.02)
+                self.assertIn("job_id", json.loads(receipt_path.read_text()))
+                self.assertFalse(done.exists(), "admission must still be observing the delayed receipt")
+        finally:
+            release.write_text("release")
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            deadline = time.monotonic() + 5
+            while ready.exists() and not done.exists():
+                self.assertLess(time.monotonic(), deadline, "owned admission helper did not finish")
+                time.sleep(.02)
+
     def test_watcher_death_is_immediately_attachable(self):
+        ready, release = self.root / "poll-ready", self.root / "poll-release"
+        # The owned polling child announces actual entry and remains alive until
+        # after attach, so killing the collector before it sleeps cannot pass.
+        sleeper = self.root / "sleep"
+        sleeper.write_text("""#!/usr/bin/env python3
+import pathlib, sys, time
+root = pathlib.Path(__file__).parent
+if sys.argv[1:] == ['20']:
+    (root / 'poll-ready').write_text('ready')
+    end = time.monotonic() + 20
+    while not (root / 'poll-release').exists() and time.monotonic() < end:
+        time.sleep(.02)
+    (root / 'poll-done').write_text('done')
+else:
+    time.sleep(float(sys.argv[1]))
+""")
+        sleeper.chmod(0o755)
         process = subprocess.Popen(["bash", str(RUNNER), str(self.prefix), "--via", "ccr:x",
-                                    "--prompt-file", str(self.prompt), "--poll-sec", "5"],
+                                    "--prompt-file", str(self.prompt), "--poll-sec", "20"],
                                    env=self.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.monotonic() + 8
-            while not Path(str(self.prefix) + ".detached").exists():
-                self.assertLess(time.monotonic(), deadline, "admission never became attachable")
+            while not ready.exists():
+                self.assertLess(time.monotonic(), deadline, "collector never entered polling sleep")
                 time.sleep(.05)
             process.kill()
             process.wait(timeout=3)
             result = self.run_runner(str(self.prefix), "--attach", "--poll-sec", "1")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse((self.root / "poll-done").exists(), "polling child exited before recovery")
         finally:
+            release.write_text("release")
             if process.poll() is None:
                 process.kill()
                 process.wait()
+            deadline = time.monotonic() + 3
+            while ready.exists() and not (self.root / "poll-done").exists():
+                self.assertLess(time.monotonic(), deadline, "owned polling fixture did not finish")
+                time.sleep(.02)
+
+    def test_saved_commands_cannot_operate_on_replacement_attempt(self):
+        self.assertEqual(self.bounded_launch(FAKE_CCR_MODE="sleep").returncode, 6)
+        fields = dict(line.split("=", 1) for line in Path(str(self.prefix) + ".detached").read_text().splitlines())
+        old_job = fields["job"]
+        self.assertEqual(self.run_runner(str(self.prefix), "--attach", "--cancel").returncode, 0)
+        self.assertEqual(self.run_runner(str(self.prefix), "--attach", "--poll-sec", "1").returncode, 1)
+        self.assertEqual(self.bounded_launch(FAKE_CCR_MODE="sleep").returncode, 6)
+        current = job.load(str(self.prefix) + ".ccr-attempt.json")["receipt"]["job_id"]
+        self.assertNotEqual(old_job, current)
+        for key in ["attach_command", "cancel_command"]:
+            with self.subTest(command=key):
+                result = subprocess.run(["bash", "-c", fields[key]], env=self.env,
+                                        capture_output=True, text=True, timeout=10)
+                self.assertIn(result.returncode, (4, 6), result.stdout + result.stderr)
+                self.assertEqual(job.load(self.root / "store/fake-ccr-jobs" / (current + ".json"))["status"], "running")
+        self.assertEqual(self.run_runner(str(self.prefix), "--attach", "--cancel").returncode, 0)
+
+    def test_write_cancel_refusal_returns_without_wait_or_commit(self):
+        repo = self.root / "repository"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                        "commit", "--allow-empty", "-qm", "base"], check=True)
+        head = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        ready, release, done = [self.root / x for x in ("write-ready", "write-release", "write-done")]
+        worker = self.root / "write-worker.py"
+        worker.write_text("""import pathlib, time
+root = pathlib.Path(__file__).parent
+pathlib.Path('uncommitted.txt').write_text('work in progress')
+(root / 'write-ready').write_text('ready')
+end = time.monotonic() + 20
+while not (root / 'write-release').exists() and time.monotonic() < end:
+    time.sleep(.02)
+(root / 'write-done').write_text('done')
+""")
+        ccr = self.root / "ccr"
+        ccr.write_text(ccr.read_text().replace('*) exec python3 ',
+                       'launch) exec python3 ' + shlex.quote(str(worker)) + ';;\n*) exec python3 '))
+        # Initial ownership lookup succeeds; only cancellation-time owner lookup
+        # fails. No arbitrary PID/group is ever signalled by this fixture.
+        inspector = self.root / "ps"
+        inspector.write_text("""#!/usr/bin/env python3
+import os, pathlib, sys
+root = pathlib.Path(__file__).parent
+if sys.argv[1:3] == ['-o', 'pgid=']:
+    counter = root / 'ps-count'
+    n = int(counter.read_text()) + 1 if counter.exists() else 1
+    counter.write_text(str(n))
+    if n >= 3:
+        raise SystemExit(1)
+os.execv('/bin/ps', ['ps'] + sys.argv[1:])
+""")
+        inspector.chmod(0o755)
+        self.fast_clock()
+        prefix = self.root / "write" / "attempt"
+        runner = ROOT / "plugins/codex-deep-plan/scripts/implement-run.sh"
+        process = subprocess.Popen(["bash", str(runner), str(prefix), "--via", "ccr:x", "--repo", str(repo),
+                                    "--base", head, "--branch", "impl/refusal", "--plan", str(self.prompt),
+                                    "--poll-sec", "1", "--stall-min", "1", "--max-min", "1"],
+                                   env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            out, err = process.communicate(timeout=12)
+            self.assertEqual(process.returncode, 5, out + err)
+            self.assertTrue(ready.exists())
+            self.assertFalse(done.exists(), "workload must still be alive at unconfirmed return")
+            self.assertEqual(Path(str(prefix) + ".exit").read_text().strip(), "5")
+            self.assertIn("launcher_commit=not_attempted", Path(str(prefix) + ".meta").read_text())
+            worktree = str(self.root / "write" / "worktree")
+            self.assertEqual(subprocess.check_output(["git", "-C", worktree, "rev-parse", "HEAD"], text=True).strip(), head)
+            self.assertIn("?? uncommitted.txt", subprocess.check_output(["git", "-C", worktree, "status", "--porcelain"], text=True))
+        finally:
+            release.write_text("release")
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+            deadline = time.monotonic() + 3
+            while ready.exists() and not done.exists():
+                self.assertLess(time.monotonic(), deadline, "owned write fixture did not finish")
+                time.sleep(.02)
 
     def test_failed_job_cannot_promote_successful_text(self):
         result = self.launch(FAKE_CCR_BAD_STATUS='{"status":"failed","exit_code":0}')

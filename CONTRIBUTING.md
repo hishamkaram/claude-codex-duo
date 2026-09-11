@@ -41,3 +41,11 @@ and [Apple flock](https://developer.apple.com/library/archive/documentation/Syst
 The shell retains its inherited open-file description. The lock file persists;
 never unlink it to recover a collector. Legacy directory locks must drain before
 upgrading. Workload cancellation always uses CCR's admitted job identity.
+
+The collector lease is explicitly closed in observation command substitutions and
+external polling children. Admission uses an `exec` handoff to its helper, which
+retains the inherited lease until the attempt record is durable. Saved recovery
+commands bind the original job: `--expected-job` on attach rejects prefix reuse;
+the cancellation helper enforces the same identity before requesting cancellation.
+An unconfirmed write-runner cancellation returns exit5 without waiting for an
+unproven stop or staging/committing files that the workload may still change.

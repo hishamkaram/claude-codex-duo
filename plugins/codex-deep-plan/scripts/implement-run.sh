@@ -235,6 +235,14 @@ if [ "$OUTCOME" = STALLED ] || [ "$OUTCOME" = TIMEOUT ]; then
   else UNCONFIRMED_CANCEL=1; echo "$(elapsed)s $OUTCOME → cancel of process group $PGID NOT confirmed; a process may still be running" >> "$PREFIX.progress"
     echo "implement-run.sh: cancel of process group $PGID not confirmed; DO NOT retry — check with: ps -o pid,pgid,command -g $PGID" >&2; fi
 fi
+if [ "$UNCONFIRMED_CANCEL" = 1 ]; then
+  # The child may still edit the worktree. Do not wait indefinitely, parse a
+  # changing result, or stage/commit its files while cancellation is unresolved.
+  printf 'outcome=UNCONFIRMED-CANCEL\nbackend=ccr\nmode=implement\nalias=%s\npid=%s\npgid=%s\nbranch=%s\nworktree=%s\nchild_exit=unknown\nlauncher_commit=not_attempted\ncancel_confirmed=no\n' "$ALIAS" "$CHILD" "$PGID" "$BRANCH" "$WT" > "$PREFIX.meta"
+  : > "$PREFIX.stdout"
+  echo 5 > "$PREFIX.exit"
+  exit 5
+fi
 wait "$CHILD" 2>/dev/null; CHILD_RC=$?
 SESSION_ID=$(stream_field "$PREFIX.joblog" init-session); HAS_RESULT=$(stream_field "$PREFIX.joblog" has-result)
 stream_field "$PREFIX.joblog" result-text > "$PREFIX.stdout"

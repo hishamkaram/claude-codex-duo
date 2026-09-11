@@ -61,7 +61,7 @@ set -u
 umask 077
 # The job API arrived in 0.5.0; 0.5.1 fixes process-group cleanup observation.
 CCR_MIN_VERSION="0.5.1"
-CCR_HELPER="$(cd "$(dirname "$0")" && pwd)/ccr-job.py"
+CCR_HELPER="$(exec 9>&-; cd "$(exec 9>&-; dirname "$0")" && pwd)/ccr-job.py"
 # These are assigned inside ccr_preflight, past its early-return failures. The attach path is
 # allowed to run without a successful preflight (the child is already going), so under `set -u`
 # every reader below would abort the collector mid-publication. Declare them empty up front: an
@@ -105,11 +105,11 @@ else: print(cur)' "$2" 2>/dev/null
 # attempt in flight rather than closing it.
 ccr_job_state() {
   local answer
-  answer=$(printf '%s' "$1" | python3 "$CCR_HELPER" state 2>/dev/null) || answer=undetermined
+  answer=$(exec 9>&-; printf '%s' "$1" | python3 "$CCR_HELPER" state 2>/dev/null) || answer=undetermined
   printf '%s\n' "$answer"
 }
 codex_root() {
-  python3 -c 'import json,os,glob
+  python3 9>&- -c 'import json,os,glob
 p=os.path.expanduser("~/.claude/plugins/installed_plugins.json")
 try: print(json.load(open(p))["plugins"]["codex@openai-codex"][0]["installPath"]); raise SystemExit
 except Exception: pass
@@ -119,7 +119,7 @@ print(os.path.dirname(os.path.dirname(c[-1])) if c else "")'
 # --- ccr helpers (shared by the probe and the launch path) -----------------------------------
 ccr_version() { ccr version 2>/dev/null | head -1 | sed -nE 's/^ccr[[:space:]]+v?([0-9]+\.[0-9]+\.[0-9]+).*$/\1/p'; }
 version_ge() {  # X.Y.Z >= A.B.C
-  python3 -c 'import sys
+  python3 9>&- -c 'import sys
 a=[int(x) for x in sys.argv[1].split(".")]; b=[int(x) for x in sys.argv[2].split(".")]
 raise SystemExit(0 if a>=b else 1)' "$1" "$2"
 }
@@ -148,11 +148,11 @@ else:
 # (Not run in a command substitution: the variables must reach the caller.)
 ccr_preflight() {  # <alias>
   command -v ccr >/dev/null 2>&1 || { REASON="ccr not found on PATH (install claude-code-router >= $CCR_MIN_VERSION)"; return 1; }
-  CCR_VER=$(ccr_version); [ -n "$CCR_VER" ] || { REASON="cannot parse 'ccr version' output"; return 1; }
+  CCR_VER=$(exec 9>&-; ccr_version); [ -n "$CCR_VER" ] || { REASON="cannot parse 'ccr version' output"; return 1; }
   version_ge "$CCR_VER" "$CCR_MIN_VERSION" || { REASON="requires ccr >= $CCR_MIN_VERSION (found $CCR_VER)"; return 1; }
-  MODEL_JSON=$(ccr_model_json "$1") && [ -n "$MODEL_JSON" ] || { REASON="ccr model show $1 --json failed (unknown alias on this machine?)"; return 1; }
-  PROVIDER=$(ccr_model_field "$MODEL_JSON" provider); PROVIDER_MODEL=$(ccr_model_field "$MODEL_JSON" provider_model)
-  CLAUDE_MODEL=$(ccr_model_field "$MODEL_JSON" claude_model_id); COMPAT=$(ccr_model_field "$MODEL_JSON" compatibility); TOOLS=$(ccr_model_field "$MODEL_JSON" tools)
+  MODEL_JSON=$(exec 9>&-; ccr_model_json "$1") && [ -n "$MODEL_JSON" ] || { REASON="ccr model show $1 --json failed (unknown alias on this machine?)"; return 1; }
+  PROVIDER=$(exec 9>&-; ccr_model_field "$MODEL_JSON" provider); PROVIDER_MODEL=$(exec 9>&-; ccr_model_field "$MODEL_JSON" provider_model)
+  CLAUDE_MODEL=$(exec 9>&-; ccr_model_field "$MODEL_JSON" claude_model_id); COMPAT=$(exec 9>&-; ccr_model_field "$MODEL_JSON" compatibility); TOOLS=$(exec 9>&-; ccr_model_field "$MODEL_JSON" tools)
   [ -n "$PROVIDER" ] || { REASON="ccr model show $1 --json has no provider field"; return 1; }
   [ -n "$PROVIDER_MODEL" ] || { REASON="ccr model show $1 --json has no provider_model field"; return 1; }
   [ -n "$CLAUDE_MODEL" ] || { REASON="ccr model show $1 --json has no claude_model_id field"; return 1; }
@@ -169,7 +169,7 @@ ccr_smoke_check() {  # <dir> <alias>  (needs ccr_preflight first)
   grep -qxF "model=$PROVIDER_MODEL" "$f" || { REASON="ccr smoke for $2 was recorded for another provider model (now $PROVIDER_MODEL); re-run the probe"; return 1; }
   grep -qxF "claude_model_id=$CLAUDE_MODEL" "$f" || { REASON="ccr smoke for $2 was recorded for another generated child model (now $CLAUDE_MODEL); re-run the probe"; return 1; }
   grep -qxF "child_model=$CLAUDE_MODEL" "$f" || { REASON="ccr smoke for $2 lacks a verified generated child model ($f); re-run the probe"; return 1; }
-  grep -qxF "launch_sha256=$(ccr_launch_digest)" "$f" || { REASON="ccr smoke for $2 was recorded for another launch line; re-run the probe"; return 1; }
+  grep -qxF "launch_sha256=$(exec 9>&-; ccr_launch_digest)" "$f" || { REASON="ccr smoke for $2 was recorded for another launch line; re-run the probe"; return 1; }
   return 0
 }
 # Process identity. A pid or pgid recorded minutes ago may name an unrelated process by the time
@@ -192,14 +192,14 @@ proc_identity() {  # <pid> -> start-time string, empty when the pid is gone or c
 # terminates. What identity IS authoritative for is the opposite direction: nothing may be
 # signalled unless state 0 says the number still names our execution.
 identity_state() {  # <pid> <recorded identity>
-  local live; live=$(proc_identity "$1")
+  local live; live=$(exec 9>&-; proc_identity "$1")
   [ -n "$live" ] || return 1
   [ "$live" = "$2" ] || return 2
   return 0
 }
 # stream-json readers
 stream_field() {  # <joblog> init-session|init-model|result-text|has-result
-  python3 - "$1" "$2" <<'PY' 2>/dev/null
+  python3 9>&- - "$1" "$2" <<'PY' 2>/dev/null
 import sys,json
 path,what=sys.argv[1],sys.argv[2]; sid=model=""; res=None
 for line in open(path,encoding="utf-8",errors="replace"):
@@ -235,9 +235,9 @@ if [ "${1:-}" = "--probe" ]; then
   done
   case "$VIA" in
     codex)
-      CODEX_ROOT=$(codex_root)
+      CODEX_ROOT=$(exec 9>&-; codex_root)
       [ -n "$CODEX_ROOT" ] || { echo "PROBE UNAVAILABLE: codex plugin not found"; exit 1; }
-      OUT=$(node "$CODEX_ROOT/scripts/codex-companion.mjs" setup --json 2>&1) || { echo "PROBE FAILED: setup exited non-zero"; printf '%s\n' "$OUT" | tail -5; exit 1; }
+      OUT=$(exec 9>&-; node "$CODEX_ROOT/scripts/codex-companion.mjs" setup --json 2>&1) || { echo "PROBE FAILED: setup exited non-zero"; printf '%s\n' "$OUT" | tail -5; exit 1; }
       printf '%s' "$OUT" | python3 -c 'import sys, json
 # Availability has three states, not two. The old predicate was `ready and loggedIn`, read as
 # plain booleans, so a companion that could not REACH its runtime to answer the auth question
@@ -285,11 +285,11 @@ raise SystemExit(rc)'
       # asks for a write by the Write tool and by Bash, inside and outside the repository. Any file
       # created ⇒ readonly=violated. CCR owns cancellation; admission observation
       # and the subsequent watch both spend the smoke's wall-clock budget.
-      SMOKE=$(mktemp -d 2>/dev/null) && [ -d "$SMOKE" ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS mktemp failed"; exit 1; }
+      SMOKE=$(exec 9>&-; mktemp -d 2>/dev/null) && [ -d "$SMOKE" ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS mktemp failed"; exit 1; }
       trap 'echo "CCR smoke evidence: $SMOKE" >&2' EXIT
       CCR_ATTEMPT_PREFIX="$SMOKE/run"
       git init -q "$SMOKE/repo" 2>/dev/null || mkdir -p "$SMOKE/repo"
-      mkdir -p "$SMOKE/outside"
+      mkdir 9>&- -p "$SMOKE/outside"
       printf '%s\n' "Smoke test. Do exactly these three things, then reply with the single word DONE:" \
         "1. Use the Write tool to create a file named smoke-write.txt containing hello in the current directory." \
         "2. Use the Bash tool to run: echo hello > smoke-bash.txt" \
@@ -301,46 +301,46 @@ raise SystemExit(rc)'
       # The smoke is a detached job like any other, so the bound is enforced by asking its owner to
       # cancel rather than by this script signalling a process group it inferred (review round 1:
       # F-04 required the bound; the CCR job API is how it is now enforced).
-      SSTART=$(date +%s)
+      SSTART=$(exec 9>&-; date +%s)
       SADMISSION_WAIT="$SMOKE_MAX_SEC"; [ "$SADMISSION_WAIT" -le 30 ] || SADMISSION_WAIT=30
-      SRECEIPT=$(cd "$SMOKE/repo" && python3 "$CCR_HELPER" admit "$CCR_ATTEMPT_PREFIX" "$ALIAS" "$CLAUDE_MODEL" 6 "$0" "$MODEL_JSON" "$CCR_VER" "$SADMISSION_WAIT" "${ARGV[@]}"); SLRC=$?
-      SJOB=$(ccr_job_field "$SRECEIPT" job_id)
+      SRECEIPT=$(exec 9>&-; cd "$SMOKE/repo" && python3 "$CCR_HELPER" admit "$CCR_ATTEMPT_PREFIX" "$ALIAS" "$CLAUDE_MODEL" 6 "$0" "$MODEL_JSON" "$CCR_VER" "$SADMISSION_WAIT" "${ARGV[@]}"); SLRC=$?
+      SJOB=$(exec 9>&-; ccr_job_field "$SRECEIPT" job_id)
       if [ "$SLRC" != 0 ] || [ -z "$SJOB" ]; then
         echo "PROBE UNDETERMINED: admission unresolved; evidence=$SMOKE; do not retry"
         exit 1
       fi
       STIMED=0
       while :; do
-        SJSON=$(ccr_job_json "$SJOB")
-        [ "$(ccr_job_state "$SJSON")" = running ] || break
-        if [ $(( $(date +%s) - SSTART )) -ge "$SMOKE_MAX_SEC" ]; then STIMED=1; break; fi
-        sleep 1
+        SJSON=$(exec 9>&-; ccr_job_json "$SJOB")
+        [ "$(exec 9>&-; ccr_job_state "$SJSON")" = running ] || break
+        if [ $(( $(exec 9>&-; date +%s) - SSTART )) -ge "$SMOKE_MAX_SEC" ]; then STIMED=1; break; fi
+        sleep 1 9>&-
       done
       if [ "$STIMED" = 1 ]; then
         ccr_job_cancel "$SJOB" >/dev/null 2>&1 || true
-        SCW=0; while [ "$SCW" -lt 30 ]; do SJSON=$(ccr_job_json "$SJOB"); [ "$(ccr_job_state "$SJSON")" = running ] || break; sleep 1; SCW=$((SCW+1)); done
-        if [ "$(ccr_job_state "$SJSON")" = ended ]; then SKILL="job $SJOB cancelled by its owner (cleanup coverage=$(ccr_job_field "$SJSON" cleanup.coverage))"
+        SCW=0; while [ "$SCW" -lt 30 ]; do SJSON=$(exec 9>&-; ccr_job_json "$SJOB"); [ "$(exec 9>&-; ccr_job_state "$SJSON")" = running ] || break; sleep 1 9>&-; SCW=$((SCW+1)); done
+        if [ "$(exec 9>&-; ccr_job_state "$SJSON")" = ended ]; then SKILL="job $SJOB cancelled by its owner (cleanup coverage=$(exec 9>&-; ccr_job_field "$SJSON" cleanup.coverage))"
         else SKILL="cancellation of job $SJOB NOT confirmed (check: ccr status $SJOB --json)"; fi
         echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke timed out after ${SMOKE_MAX_SEC}s ($SKILL) ccr=$CCR_VER"; exit 1
       fi
-      SFROZEN=$(python3 "$CCR_HELPER" freeze "$CCR_ATTEMPT_PREFIX" "$SJOB") || { echo "PROBE UNDETERMINED: workload stop/result unproven; evidence=$SMOKE"; exit 1; }
-      [ "$(ccr_job_field "$SFROZEN" successful)" = True ] || { echo "PROBE UNAVAILABLE: unsuccessful workload result; evidence=$SMOKE"; exit 1; }
-      cp "$CCR_ATTEMPT_PREFIX.joblog" "$SMOKE/stream.jsonl"
-      SRC=$(ccr_job_field "$SJSON" exit_code); SRC=${SRC:-1}
-      CREATED=$( { cd "$SMOKE/repo" && find . -path ./.git -prune -o -type f -print | sed 's|^\./||'; cd "$SMOKE/outside" && find . -type f -print | sed 's|^\./|outside/|'; } 2>/dev/null)
+      SFROZEN=$(exec 9>&-; python3 "$CCR_HELPER" freeze "$CCR_ATTEMPT_PREFIX" "$SJOB") || { echo "PROBE UNDETERMINED: workload stop/result unproven; evidence=$SMOKE"; exit 1; }
+      [ "$(exec 9>&-; ccr_job_field "$SFROZEN" successful)" = True ] || { echo "PROBE UNAVAILABLE: unsuccessful workload result; evidence=$SMOKE"; exit 1; }
+      cp 9>&- "$CCR_ATTEMPT_PREFIX.joblog" "$SMOKE/stream.jsonl"
+      SRC=$(exec 9>&-; ccr_job_field "$SJSON" exit_code); SRC=${SRC:-1}
+      CREATED=$(exec 9>&-;  { cd "$SMOKE/repo" && find . -path ./.git -prune -o -type f -print | sed 's|^\./||'; cd "$SMOKE/outside" && find . -type f -print | sed 's|^\./|outside/|'; } 2>/dev/null)
       if [ -n "$CREATED" ]; then
-        echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS readonly=violated files_created=$(printf '%s' "$CREATED" | tr '\n' ',') ccr=$CCR_VER"; exit 1
+        echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS readonly=violated files_created=$(exec 9>&-; printf '%s' "$CREATED" | tr '\n' ',') ccr=$CCR_VER"; exit 1
       fi
       if [ "$SRC" != 0 ]; then
         echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke launch exited $SRC ccr=$CCR_VER"; tail -5 "$SMOKE/stderr"; exit 1
       fi
-      [ "$(stream_field "$SMOKE/stream.jsonl" has-result)" = yes ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke produced no result event ccr=$CCR_VER"; exit 1; }
-      [ "$(stream_field "$SMOKE/stream.jsonl" result-ok)" = yes ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke result is an error event ($(stream_field "$SMOKE/stream.jsonl" result-subtype)) ccr=$CCR_VER"; exit 1; }
-      SMOKE_MODEL=$(stream_field "$SMOKE/stream.jsonl" init-model)
+      [ "$(exec 9>&-; stream_field "$SMOKE/stream.jsonl" has-result)" = yes ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke produced no result event ccr=$CCR_VER"; exit 1; }
+      [ "$(exec 9>&-; stream_field "$SMOKE/stream.jsonl" result-ok)" = yes ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke result is an error event ($(exec 9>&-; stream_field "$SMOKE/stream.jsonl" result-subtype)) ccr=$CCR_VER"; exit 1; }
+      SMOKE_MODEL=$(exec 9>&-; stream_field "$SMOKE/stream.jsonl" init-model)
       [ "$SMOKE_MODEL" = "$CLAUDE_MODEL" ] || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS route=unverified expected_child_model=${CLAUDE_MODEL:-unknown} got_child_model=${SMOKE_MODEL:-unknown} ccr=$CCR_VER"; exit 1; }
       RECORDED="not recorded (pass --record-dir <run dir> so launches in it can verify the smoke)"
       if [ -n "$RECORD_DIR" ]; then
-        printf 'alias=%s\nccr=%s\nmodel=%s\nprovider=%s\nclaude_model_id=%s\nchild_model=%s\nreadonly=verified\nlaunch_sha256=%s\nrecorded=%s\n' "$ALIAS" "$CCR_VER" "$PROVIDER_MODEL" "$PROVIDER" "$CLAUDE_MODEL" "$SMOKE_MODEL" "$(ccr_launch_digest)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RECORD_DIR/.ccr-smoke.$ALIAS" \
+        printf 'alias=%s\nccr=%s\nmodel=%s\nprovider=%s\nclaude_model_id=%s\nchild_model=%s\nreadonly=verified\nlaunch_sha256=%s\nrecorded=%s\n' "$ALIAS" "$CCR_VER" "$PROVIDER_MODEL" "$PROVIDER" "$CLAUDE_MODEL" "$SMOKE_MODEL" "$(exec 9>&-; ccr_launch_digest)" "$(exec 9>&-; date -u +%Y-%m-%dT%H:%M:%SZ)" > "$RECORD_DIR/.ccr-smoke.$ALIAS" \
           || { echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS cannot write $RECORD_DIR/.ccr-smoke.$ALIAS"; exit 1; }
         RECORDED="recorded=$RECORD_DIR/.ccr-smoke.$ALIAS"
       fi
@@ -381,11 +381,12 @@ CLAIM_MODE=0; CLAIM_TOKEN=""; for _a in "$@"; do [ "$_a" = "--claim" ] && CLAIM_
 # invocation, so when any of them is present it is reported and nothing is published.
 die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || [ -e "${PREFIX:-/nonexistent}.exit" ] || [ -e "${PREFIX:-/nonexistent}.detached" ] || [ -e "${PREFIX:-/nonexistent}.progress" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
 need() { [ $# -ge 2 ] || die4 "$1 requires a value"; case "$2" in -*) die4 "$1 requires a value (got option $2)";; esac; }
-MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""; ATTACH=0; VIA_SET=0; CANCEL_ONLY=0
+MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""; ATTACH=0; VIA_SET=0; CANCEL_ONLY=0; EXPECTED_JOB=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --attach) ATTACH=1;;
     --cancel) CANCEL_ONLY=1;;
+    --expected-job) need "$@"; EXPECTED_JOB="$2"; shift;;
     --fresh|--resume-last) [ "$MODE_SET" != 1 ] || [ "$MODE" = "$1" ] || die4 "$MODE and $1 are exclusive"; MODE="$1"; MODE_SET=1;;
     --via) need "$@"; VIA="$2"; VIA_SET=1; shift;;
     --prompt-file) need "$@"; PROMPT_FILE="$2"; shift;;
@@ -401,6 +402,8 @@ while [ $# -gt 0 ]; do
 done
 # --attach is an operation, not a launch mode: it submits no prompt and chooses no backend. The
 # backend, the launch mode and every identifier come from the detached record the launch left.
+[ -z "$EXPECTED_JOB" ] || [ "$ATTACH" = 1 ] || die4 "--expected-job requires --attach"
+[ -z "$EXPECTED_JOB" ] || [ -f "$PREFIX.ccr-attempt.json" ] || die4 "--expected-job requires a durable CCR attempt"
 [ "$CANCEL_ONLY" != 1 ] || [ "$ATTACH" = 1 ] || die4 "--cancel is only valid with --attach"
 if [ "$ATTACH" = 1 ]; then
   [ "$MODE_SET" != 1 ] || die4 "--attach and $MODE are exclusive: an attach resumes the watch on the job the launch already started"
@@ -429,11 +432,11 @@ fi
 for v in STALL_MIN MAX_MIN POLL MAX_TURNS; do
   eval "val=\$$v"
   [ "$v" != MAX_TURNS ] || [ -n "$val" ] || continue
-  case "$val" in ''|*[!0-9]*) die4 "--$(echo "$v" | tr 'A-Z_' 'a-z-') requires a whole number (got '$val')";; esac
+  case "$val" in ''|*[!0-9]*) die4 "--$(exec 9>&-; echo "$v" | tr 'A-Z_' 'a-z-') requires a whole number (got '$val')";; esac
   # Strip to base 10: bash reads a leading-zero literal as octal, so "08" would
   # abort arithmetic later with "value too great for base". Also bound the range
   # so an oversized value cannot silently overflow.
-  val=$(printf '%s' "$val" | sed 's/^0*//'); [ -n "$val" ] && [ "${#val}" -le 6 ] || die4 "--$(echo "$v" | tr 'A-Z_' 'a-z-') must be between 1 and 999999"
+  val=$(exec 9>&-; printf '%s' "$val" | sed 's/^0*//'); [ -n "$val" ] && [ "${#val}" -le 6 ] || die4 "--$(exec 9>&-; echo "$v" | tr 'A-Z_' 'a-z-') must be between 1 and 999999"
   eval "$v=\$val"
 done
 if [ "$ATTACH" != 1 ]; then
@@ -446,13 +449,15 @@ fi
 # claim and authorize a second launch against the job that is still running.
 write_detached() {  # key=value lines on stdin
   local tmp="$PREFIX.detached.tmp"
-  cat > "$tmp"
-  mv "$tmp" "$PREFIX.detached"
+  cat 9>&- > "$tmp"
+  mv 9>&- "$tmp" "$PREFIX.detached"
 }
 detached_field() { awk -F= -v k="$1" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$PREFIX.detached" 2>/dev/null; }
 prompt_digest() { { shasum -a 256 "$1" 2>/dev/null || sha256sum "$1" 2>/dev/null; } | awk '{print $1; exit}'; }
 # Kernel file locks serialize collectors, admission and claim rotation. The
-# shell owns descriptor 9; the helper locks that inherited open-file description.
+# shell owns descriptor 9; the lock helper inherits it. Observation children
+# close it, including their command-substitution shells. Admission execs its
+# helper with the lease until the private attempt record is durable.
 # Keep the lock inode permanently: unlinking it would split future contenders.
 # Old directory locks must drain under the old runner before upgrading.
 publish_lock() {  # [--must], bounded acquisition for every caller
@@ -479,7 +484,7 @@ trap 'publish_unlock; exit 143' TERM
 # reads and refuses; it never rotates or writes.
 refuse_if_in_flight() {
   if [ -e "$PREFIX.ccr-attempt.json" ] && [ ! -e "$PREFIX.exit" ]; then
-    python3 "$CCR_HELPER" stopped "$PREFIX" >/dev/null 2>&1 || {
+    python3 9>&- "$CCR_HELPER" stopped "$PREFIX" >/dev/null 2>&1 || {
       echo "codex-run.sh: durable CCR attempt is still open; use --attach. An unresolved admission must never be resubmitted." >&2
       exit 4
     }
@@ -497,13 +502,13 @@ refuse_if_in_flight() {
   # record it leaves is the launch line in `.progress`, the same line `phase-gate.sh` reads.
   if [ ! -e "$PREFIX.exit" ] && [ ! -e "$PREFIX.detached" ] && [ -e "$PREFIX.progress" ]; then
     local lline lpgid ljob lstat lroot mlive=""
-    lline=$(grep -E '^[0-9]+s launched backend=ccr ' "$PREFIX.progress" 2>/dev/null | tail -1)
+    lline=$(exec 9>&-; grep -E '^[0-9]+s launched backend=ccr ' "$PREFIX.progress" 2>/dev/null | tail -1)
     if [ -n "$lline" ]; then
-      lccrjob=$(printf '%s' "$lline" | sed -n 's/.* job=\([^ ]*\).*/\1/p')
+      lccrjob=$(exec 9>&-; printf '%s' "$lline" | sed -n 's/.* job=\([^ ]*\).*/\1/p')
       # The job's owner is the authority, exactly as it is in the watch loop. An unanswerable
       # status is undetermined and refuses the launch; only a job CCR reports as over clears it.
       if [ -n "$lccrjob" ]; then
-        case "$(ccr_job_state "$(ccr_job_json "$lccrjob")")" in
+        case "$(exec 9>&-; ccr_job_state "$(exec 9>&-; ccr_job_json "$lccrjob")")" in
           ended) ;;                                                        # over: rotate
           running) mlive="ccr reports job $lccrjob as still running";;
           *) mlive="ccr could not be asked about job $lccrjob";;            # fail closed
@@ -512,11 +517,11 @@ refuse_if_in_flight() {
         mlive="legacy CCR attempt has no durable job receipt; drain it before upgrading"
       fi
     else
-      ljob=$(grep -oE 'launched job=task-[a-z0-9-]+' "$PREFIX.progress" 2>/dev/null | head -1 | cut -d= -f2)
+      ljob=$(exec 9>&-; grep -oE 'launched job=task-[a-z0-9-]+' "$PREFIX.progress" 2>/dev/null | head -1 | cut -d= -f2)
       if [ -n "$ljob" ]; then
-        lroot=$(codex_root)
+        lroot=$(exec 9>&-; codex_root)
         if [ -n "$lroot" ] && [ -f "$lroot/scripts/codex-companion.mjs" ]; then
-          lstat=$(node "$lroot/scripts/codex-companion.mjs" status "$ljob" --json 2>/dev/null \
+          lstat=$(exec 9>&-; node "$lroot/scripts/codex-companion.mjs" status "$ljob" --json 2>/dev/null \
                   | python3 -c "import sys,json;d=json.load(sys.stdin);print((d.get('job') or {}).get('status') or '')" 2>/dev/null)
           case "$lstat" in
             completed|failed|cancelled|canceled) ;;                      # over: rotate
@@ -540,7 +545,7 @@ refuse_if_in_flight() {
   # record can never deadlock the prefix.
   if [ -e "$PREFIX.detached" ] && [ ! -e "$PREFIX.exit" ]; then
     local dbackend dpid dident djob dstatus droot dlive=no
-    dbackend=$(detached_field backend)
+    dbackend=$(exec 9>&-; detached_field backend)
     case "$dbackend" in
       ccr)
         if python3 "$CCR_HELPER" stopped "$PREFIX" >/dev/null 2>&1; then dlive=no
@@ -552,9 +557,9 @@ refuse_if_in_flight() {
         # was dead code on the default backend (no pid= was ever recorded), so a relaunch rotated a
         # live job's record away and started a SECOND job beside it — and codex-debate and
         # codex-deep-plan, which pass no --claim, had no other protection (cycle 3: CL-03/CX-02).
-        djob=$(detached_field job); droot=$(codex_root)
+        djob=$(exec 9>&-; detached_field job); droot=$(exec 9>&-; codex_root)
         if [ -n "$djob" ] && [ -n "$droot" ] && [ -f "$droot/scripts/codex-companion.mjs" ]; then
-          dstatus=$(node "$droot/scripts/codex-companion.mjs" status "$djob" --json 2>/dev/null \
+          dstatus=$(exec 9>&-; node "$droot/scripts/codex-companion.mjs" status "$djob" --json 2>/dev/null \
                     | python3 -c "import sys,json;d=json.load(sys.stdin);print((d.get('job') or {}).get('status') or '')" 2>/dev/null)
           case "$dstatus" in
             completed|failed|cancelled|canceled) dlive=no;;                       # authoritatively over: rotate
@@ -565,14 +570,14 @@ refuse_if_in_flight() {
           dlive="undetermined (the codex companion could not be consulted for job $djob)"
         fi
         # A local worker pid, when the record has one, can only make the answer MORE certain.
-        dpid=$(detached_field worker_pid); dident=$(detached_field worker_identity)
+        dpid=$(exec 9>&-; detached_field worker_pid); dident=$(exec 9>&-; detached_field worker_identity)
         [ -z "$dpid" ] || ! identity_state "$dpid" "$dident" || dlive="yes (worker pid $dpid is still running)"
         ;;
     esac
     if [ "$dlive" != no ]; then
       echo "codex-run.sh: $PREFIX.detached names an attempt that has not ended — $dlive. Launching here would strand it and start a second job beside it. Attach to it or cancel it first:" >&2
-      echo "  $(detached_field attach_command)" >&2
-      echo "  $(detached_field cancel_command)" >&2
+      echo "  $(exec 9>&-; detached_field attach_command)" >&2
+      echo "  $(exec 9>&-; detached_field cancel_command)" >&2
       exit 4
     fi
   fi
@@ -590,7 +595,7 @@ rotate_previous_attempt() {
     # .detached and .childexit belong to the attempt too: a record left behind would make a bogus
     # --attach admissible against the NEXT, live attempt, and a stale receipt would let it publish
     # a terminal outcome from the previous run's exit status.
-    for ext in stdout stderr progress joblog meta exit detached childexit ccr-attempt.json ccr-receipt.json ccr-prompt ccr-result.json ccr-errorlog ccr-submit.stderr; do [ -e "$PREFIX.$ext" ] && mv "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
+    for ext in stdout stderr progress joblog meta exit detached childexit ccr-attempt.json ccr-receipt.json ccr-prompt ccr-result.json ccr-errorlog ccr-submit.stderr; do [ -e "$PREFIX.$ext" ] && mv 9>&- "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
     echo "codex-run.sh: previous attempt rotated to $PREFIX.attempt$N.*"
   fi
 }
@@ -643,13 +648,13 @@ stamp_claim() {
     echo "codex-run.sh: $PREFIX.claim does not carry token $CLAIM_TOKEN (the claim was rotated or replaced since the gate printed it); re-run the launch gate and use its new token (no sidecar was written)" >&2
     exit 4
   fi
-  if ! mkdir "$PREFIX.claim/runner" 2>/dev/null; then
+  if ! mkdir 9>&- "$PREFIX.claim/runner" 2>/dev/null; then
     publish_unlock
-    echo "codex-run.sh: $PREFIX.claim is already taken by runner $(cat "$PREFIX.claim/runner/pid" 2>/dev/null || echo unknown); re-run the launch gate before launching again (no sidecar was written)" >&2
+    echo "codex-run.sh: $PREFIX.claim is already taken by runner $(exec 9>&-; cat "$PREFIX.claim/runner/pid" 2>/dev/null || echo unknown); re-run the launch gate before launching again (no sidecar was written)" >&2
     exit 4
   fi
   printf '%s\n' "$$" > "$PREFIX.claim/runner/pid"
-  printf 'runner_pid=%s\nstarted=%s\n' "$$" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$PREFIX.claim/owner" 2>/dev/null
+  printf 'runner_pid=%s\nstarted=%s\n' "$$" "$(exec 9>&-; date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$PREFIX.claim/owner" 2>/dev/null
   HELD_LOCK="$lock"
   return 0
 }
@@ -661,7 +666,7 @@ launch_error() {  # <message> <command>
   echo "codex-run.sh: $1" >&2; printf 'LAUNCH-ERROR\n%s\n' "$1" > "$PREFIX.stderr"; printf '0s LAUNCH-ERROR: %s\n' "$1" > "$PREFIX.progress"
   printf 'outcome=LAUNCH-ERROR\nbackend=%s\nlast_error=%s\nmode=%s\nprompt_file=%s\ncommand=%s\n' "$BACKEND" "$1" "$MODE" "$PROMPT_FILE" "$2" > "$PREFIX.meta"; echo 4 > "$PREFIX.exit"; exit 4
 }
-START=$(date +%s); now() { date +%s; }; elapsed() { echo $(( $(now) - START )); }
+START=$(exec 9>&-; date +%s); now() { date +%s; }; elapsed() { echo $(( $(exec 9>&-; now) - START )); }
 
 
 # =============================================================================================
@@ -675,8 +680,8 @@ if [ "$ATTACH" = 1 ]; then
   # Cancellation addresses the admitted job and does not publish collector
   # artifacts. It must remain available while another collector holds its lease.
   if [ "$CANCEL_ONLY" = 1 ] && [ -e "$PREFIX.ccr-attempt.json" ]; then
-    CANCEL_RESULT=$(python3 "$CCR_HELPER" cancel-attempt "$PREFIX") || exit 6
-    echo "codex-run.sh: stopped job $(ccr_job_field "$CANCEL_RESULT" job_id) (cleanup coverage=$(ccr_job_field "$CANCEL_RESULT" cleanup.coverage))"
+    CANCEL_RESULT=$(exec 9>&-; python3 "$CCR_HELPER" cancel-attempt "$PREFIX" ${EXPECTED_JOB:+"$EXPECTED_JOB"}) || exit 6
+    echo "codex-run.sh: stopped job $(exec 9>&-; ccr_job_field "$CANCEL_RESULT" job_id) (cleanup coverage=$(exec 9>&-; ccr_job_field "$CANCEL_RESULT" cleanup.coverage))"
     exit 0
   fi
   # Admission is decided under the publication lock and HELD for the whole attach, so a second
@@ -685,17 +690,18 @@ if [ "$ATTACH" = 1 ]; then
   # this process published, another collector could already have finished.
   publish_lock
   if [ -e "$PREFIX.ccr-attempt.json" ] && [ ! -e "$PREFIX.exit" ]; then
-    python3 "$CCR_HELPER" recover "$PREFIX" >/dev/null || { echo "codex-run.sh: admission unresolved; retain the claim and investigate, never retry launch" >&2; exit 6; }
+    [ -z "$EXPECTED_JOB" ] || python3 9>&- "$CCR_HELPER" verify-attempt "$PREFIX" "$EXPECTED_JOB" >/dev/null || die4 "saved attach belongs to a different attempt"
+    python3 9>&- "$CCR_HELPER" recover "$PREFIX" >/dev/null || { echo "codex-run.sh: admission unresolved; retain the claim and investigate, never retry launch" >&2; exit 6; }
   fi
   [ -e "$PREFIX.detached" ] || die4 "--attach: no $PREFIX.detached — nothing detached from this prefix (a launch that finished wrote .exit; a launch that never ran wrote nothing)"
   [ ! -e "$PREFIX.exit" ] || die4 "--attach: $PREFIX.exit exists, so that attempt already finished; re-read its sidecars instead of attaching"
-  BACKEND=$(detached_field backend); JOB=$(detached_field job); MODE=$(detached_field mode)
-  ALIAS=$(detached_field alias); LOGFILE=$(detached_field joblog); RECEIPT=$(detached_field receipt)
-  DPID=$(detached_field pid); PGID=$(detached_field pgid); IDENT=$(detached_field identity)
-  ATTEMPTS=$(awk -F= '$1=="attached"{print $2; exit}' "$PREFIX.meta" 2>/dev/null); ATTEMPTS=$(( ${ATTEMPTS:-0} + 1 ))
+  BACKEND=$(exec 9>&-; detached_field backend); JOB=$(exec 9>&-; detached_field job); MODE=$(exec 9>&-; detached_field mode)
+  ALIAS=$(exec 9>&-; detached_field alias); LOGFILE=$(exec 9>&-; detached_field joblog); RECEIPT=$(exec 9>&-; detached_field receipt)
+  DPID=$(exec 9>&-; detached_field pid); PGID=$(exec 9>&-; detached_field pgid); IDENT=$(exec 9>&-; detached_field identity)
+  ATTEMPTS=$(exec 9>&-; awk -F= '$1=="attached"{print $2; exit}' "$PREFIX.meta" 2>/dev/null); ATTEMPTS=$(( ${ATTEMPTS:-0} + 1 ))
   case "$BACKEND" in codex|ccr) ;; *) die4 "--attach: $PREFIX.detached names no usable backend (backend='$BACKEND')";; esac
-  ATTACH_CMD=$(detached_field attach_command); CANCEL_CMD=$(detached_field cancel_command)
-  echo "$(elapsed)s ATTACH #$ATTEMPTS backend=$BACKEND ${JOB:+job=$JOB}${DPID:+pid=$DPID pgid=$PGID}" >> "$PREFIX.progress"
+  ATTACH_CMD=$(exec 9>&-; detached_field attach_command); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
+  echo "$(exec 9>&-; elapsed)s ATTACH #$ATTEMPTS backend=$BACKEND ${JOB:+job=$JOB}${DPID:+pid=$DPID pgid=$PGID}" >> "$PREFIX.progress"
 
   # ---- the job's state, asked of its owner ----------------------------------
   # There is no identity to resolve any more. Both backends address their job by an id issued by
@@ -704,28 +710,28 @@ if [ "$ATTACH" = 1 ]; then
   # proved and the other of which was signalled (cycles 2-5).
   ALIVE=1; IDENT_NOTE=""; IDENT_STATE=0
   if [ "$BACKEND" = ccr ]; then
-    JOB_ID="$JOB"; CCR_SESSION=$(detached_field session)
-    JOB_JSON=$(ccr_job_json "$JOB_ID")
-    case "$(ccr_job_state "$JOB_JSON")" in
+    JOB_ID="$JOB"; CCR_SESSION=$(exec 9>&-; detached_field session)
+    JOB_JSON=$(exec 9>&-; ccr_job_json "$JOB_ID")
+    case "$(exec 9>&-; ccr_job_state "$JOB_JSON")" in
       running) ALIVE=1;;
-      ended)   ALIVE=0; IDENT_NOTE="ccr reports job $JOB_ID as $(ccr_job_field "$JOB_JSON" status); there is nothing left to cancel";;
+      ended)   ALIVE=0; IDENT_NOTE="ccr reports job $JOB_ID as $(exec 9>&-; ccr_job_field "$JOB_JSON" status); there is nothing left to cancel";;
       *)       ALIVE=0; IDENT_NOTE="ccr could not be asked about job $JOB_ID; nothing will be requested and the attempt stays open";;
     esac
-    [ -z "$IDENT_NOTE" ] || echo "$(elapsed)s JOB-STATE: $IDENT_NOTE" >> "$PREFIX.progress"
+    [ -z "$IDENT_NOTE" ] || echo "$(exec 9>&-; elapsed)s JOB-STATE: $IDENT_NOTE" >> "$PREFIX.progress"
   fi
 
   if [ "$CANCEL_ONLY" = 1 ]; then
     if [ "$BACKEND" = codex ]; then
-      CODEX_ROOT=$(codex_root); [ -n "$CODEX_ROOT" ] || die4 "--attach --cancel: cannot locate the codex plugin"
-      node "$CODEX_ROOT/scripts/codex-companion.mjs" cancel "$JOB" >>"$PREFIX.stderr" 2>&1 || true
+      CODEX_ROOT=$(exec 9>&-; codex_root); [ -n "$CODEX_ROOT" ] || die4 "--attach --cancel: cannot locate the codex plugin"
+      node 9>&- "$CODEX_ROOT/scripts/codex-companion.mjs" cancel "$JOB" >>"$PREFIX.stderr" 2>&1 || true
       echo "codex-run.sh: cancel requested for job $JOB"
     elif [ "$ALIVE" = 1 ]; then
       # A request to the owner, by job id. Nothing is signalled, no pid is derived and no process
       # group is named, so there is no target this runner could get wrong.
       ccr_job_cancel "$JOB_ID" >>"$PREFIX.stderr" 2>&1 || true
-      CWAIT=0; while [ "$CWAIT" -lt 30 ]; do JOB_JSON=$(ccr_job_json "$JOB_ID"); [ "$(ccr_job_state "$JOB_JSON")" = running ] || break; sleep 1; CWAIT=$((CWAIT+1)); done
-      if [ "$(ccr_job_state "$JOB_JSON")" = ended ]; then
-        echo "codex-run.sh: cancelled job $JOB_ID (cleanup coverage=$(ccr_job_field "$JOB_JSON" cleanup.coverage) survivors=$(ccr_job_field "$JOB_JSON" cleanup.survivors))"
+      CWAIT=0; while [ "$CWAIT" -lt 30 ]; do JOB_JSON=$(exec 9>&-; ccr_job_json "$JOB_ID"); [ "$(exec 9>&-; ccr_job_state "$JOB_JSON")" = running ] || break; sleep 1 9>&-; CWAIT=$((CWAIT+1)); done
+      if [ "$(exec 9>&-; ccr_job_state "$JOB_JSON")" = ended ]; then
+        echo "codex-run.sh: cancelled job $JOB_ID (cleanup coverage=$(exec 9>&-; ccr_job_field "$JOB_JSON" cleanup.coverage) survivors=$(exec 9>&-; ccr_job_field "$JOB_JSON" cleanup.survivors))"
       else
         echo "codex-run.sh: cancellation of job $JOB_ID not confirmed; check: ccr status $JOB_ID --json" >&2
       fi
@@ -745,23 +751,23 @@ fi
 # ccr backend
 # =============================================================================================
 if [ "$BACKEND" = ccr ]; then
-  DIR=$(dirname "$PREFIX")
+  DIR=$(exec 9>&-; dirname "$PREFIX")
  if [ "$ATTACH" = 1 ]; then
   # Attaching: the launch already happened. Take the identifiers from the detached record, keep
   # the launch's own command line for .meta, and go straight to the watch loop.
-  CMD=$(awk -F= '$1=="command"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
-  [ -n "$CMD" ] || CMD=$(detached_field command)
-  SESSION=""; PROMPT_FILE=$(detached_field prompt_file)
-  CLAUDE_MODEL=$(detached_field claude_model_id)
-  PROVIDER=$(detached_field provider); PROVIDER_MODEL=$(detached_field provider_model)
-  COMPAT=$(detached_field compatibility); CCR_VER=$(detached_field ccr_version)
+  CMD=$(exec 9>&-; awk -F= '$1=="command"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
+  [ -n "$CMD" ] || CMD=$(exec 9>&-; detached_field command)
+  SESSION=""; PROMPT_FILE=$(exec 9>&-; detached_field prompt_file)
+  CLAUDE_MODEL=$(exec 9>&-; detached_field claude_model_id)
+  PROVIDER=$(exec 9>&-; detached_field provider); PROVIDER_MODEL=$(exec 9>&-; detached_field provider_model)
+  COMPAT=$(exec 9>&-; detached_field compatibility); CCR_VER=$(exec 9>&-; detached_field ccr_version)
   # The job id is the whole handle. An attach re-asks CCR about it; it inherits no pid, no pgid
   # and no start-time identity, because it needs none of them to observe or to cancel.
-  JOB_ID=$(detached_field job); CCR_SESSION=$(detached_field session)
+  JOB_ID=$(exec 9>&-; detached_field job); CCR_SESSION=$(exec 9>&-; detached_field session)
   [ -n "$JOB_ID" ] || die4 "--attach: $PREFIX.detached records no job= for the ccr backend; this record predates the CCR job API and cannot be attached to"
   # The launch's turn budget, not this collector's default: `error_max_turns` in a result event is
   # only interpretable against the budget the run actually used (cycle 3: CL-11).
-  MAX_TURNS=$(detached_field max_turns); MAX_TURNS=${MAX_TURNS:-$CCR_MAX_TURNS_DEFAULT}
+  MAX_TURNS=$(exec 9>&-; detached_field max_turns); MAX_TURNS=${MAX_TURNS:-$CCR_MAX_TURNS_DEFAULT}
   # Control and expected model come from the admitted attempt, not current configuration.
  else
   CMD="ccr launch --model $ALIAS --permission-mode plan -p ... --max-turns $MAX_TURNS $MODE${RESUME_SESSION:+ $RESUME_SESSION} --prompt-file $PROMPT_FILE"
@@ -769,61 +775,61 @@ if [ "$BACKEND" = ccr ]; then
   ccr_smoke_check "$DIR" "$ALIAS" || launch_error "$REASON" "$CMD"
   SESSION=""
   if [ "$MODE" = "--resume-last" ]; then
-    SESSION=$(cat "$DIR/.ccr-last-session" 2>/dev/null | head -1 | tr -d ' ')
+    SESSION=$(exec 9>&-; cat "$DIR/.ccr-last-session" 2>/dev/null | head -1 | tr -d ' ')
     [ -n "$SESSION" ] || launch_error "--resume-last: no previous ccr session recorded in $DIR/.ccr-last-session" "$CMD"
   elif [ "$MODE" = "--resume-session" ]; then SESSION="$RESUME_SESSION"; fi
   ccr_launch_argv "$ALIAS" "$MAX_TURNS" "$PROMPT_FILE"
   stamp_claim; rotate_previous_attempt
   : > "$PREFIX.progress"; : > "$PREFIX.stderr"; : > "$PREFIX.joblog"
-  ADMISSION_WAIT=$(( MAX_MIN*60 - $(elapsed) ))
+  ADMISSION_WAIT=$(( MAX_MIN*60 - $(exec 9>&-; elapsed) ))
   [ "$ADMISSION_WAIT" -gt 0 ] || ADMISSION_WAIT=1
   [ "$ADMISSION_WAIT" -le 30 ] || ADMISSION_WAIT=30
-  RECEIPT_JSON=$(python3 "$CCR_HELPER" admit "$PREFIX" "$ALIAS" "$CLAUDE_MODEL" "$MAX_TURNS" "$0" "$MODEL_JSON" "$CCR_VER" "$ADMISSION_WAIT" "${ARGV[@]}")
+  RECEIPT_JSON=$(exec python3 "$CCR_HELPER" admit "$PREFIX" "$ALIAS" "$CLAUDE_MODEL" "$MAX_TURNS" "$0" "$MODEL_JSON" "$CCR_VER" "$ADMISSION_WAIT" "${ARGV[@]}")
   LRC=$?
   if [ "$LRC" != 0 ]; then
-    echo "$(elapsed)s ADMISSION-UNKNOWN: retain claim; no terminal outcome; never automatically resubmit" >> "$PREFIX.progress"
+    echo "$(exec 9>&-; elapsed)s ADMISSION-UNKNOWN: retain claim; no terminal outcome; never automatically resubmit" >> "$PREFIX.progress"
     unlock_claim
     exit 6
   fi
-  JOB_ID=$(ccr_job_field "$RECEIPT_JSON" job_id)
-  CCR_SESSION=$(ccr_job_field "$RECEIPT_JSON" session_id)
+  JOB_ID=$(exec 9>&-; ccr_job_field "$RECEIPT_JSON" job_id)
+  CCR_SESSION=$(exec 9>&-; ccr_job_field "$RECEIPT_JSON" session_id)
   # Keep the collector lock through this watch. A dead collector can be reclaimed; a live one cannot.
-  echo "$(elapsed)s launched backend=ccr job=$JOB_ID session=$CCR_SESSION alias=$ALIAS" >> "$PREFIX.progress"
+  echo "$(exec 9>&-; elapsed)s launched backend=ccr job=$JOB_ID session=$CCR_SESSION alias=$ALIAS" >> "$PREFIX.progress"
  fi
  # CCR writes the job's stream-json to its own job directory. The runner mirrors it to
  # <prefix>.joblog on every poll so that every existing consumer — stream_field, the stall
  # detector, the phase gates — keeps reading the sidecar it always read.
- JOB_JSON=$(ccr_job_json "$JOB_ID"); JOB_LOG=$(ccr_job_field "$JOB_JSON" log)
+ JOB_JSON=$(exec 9>&-; ccr_job_json "$JOB_ID"); JOB_LOG=$(exec 9>&-; ccr_job_field "$JOB_JSON" log)
  mirror_joblog() { python3 "$CCR_HELPER" mirror "$PREFIX" "$JOB_ID" >/dev/null 2>&1 || true; }
  mirror_joblog
 
-  OUTCOME=""; LAST_ACTIVITY=$(now); PREV_SIG=""; IDLE=0
+  OUTCOME=""; LAST_ACTIVITY=$(exec 9>&-; now); PREV_SIG=""; IDLE=0
   while :; do
-    sleep "$POLL"
-    JOB_JSON=$(ccr_job_json "$JOB_ID")
-    [ -z "$(ccr_job_field "$JOB_JSON" log)" ] || JOB_LOG=$(ccr_job_field "$JOB_JSON" log)
+    sleep "$POLL" 9>&-
+    JOB_JSON=$(exec 9>&-; ccr_job_json "$JOB_ID")
+    [ -z "$(exec 9>&-; ccr_job_field "$JOB_JSON" log)" ] || JOB_LOG=$(exec 9>&-; ccr_job_field "$JOB_JSON" log)
     mirror_joblog
-    SIG=$(fsig "$JOB_LOG"); LASTLINE=$(tail -n 1 "$PREFIX.joblog" 2>/dev/null | cut -c1-140)
-    if [ "$SIG" != "$PREV_SIG" ]; then LAST_ACTIVITY=$(now); PREV_SIG="$SIG"; fi
-    IDLE=$(( $(now) - LAST_ACTIVITY ))
+    SIG=$(exec 9>&-; fsig "$JOB_LOG"); LASTLINE=$(exec 9>&-; tail -n 1 "$PREFIX.joblog" 2>/dev/null | cut -c1-140)
+    if [ "$SIG" != "$PREV_SIG" ]; then LAST_ACTIVITY=$(exec 9>&-; now); PREV_SIG="$SIG"; fi
+    IDLE=$(( $(exec 9>&-; now) - LAST_ACTIVITY ))
     # One question, one authority, and the same answer on both paths: a launcher and an attach are
     # equally not the job's parent now, so both simply ask CCR. The three cycles of defects this
     # replaces all came from inferring the answer — a pid that might be reused, a process group
     # that might be unreadable, a supervisor whose death said nothing about its child.
-    case "$(ccr_job_state "$JOB_JSON")" in
+    case "$(exec 9>&-; ccr_job_state "$JOB_JSON")" in
       running) STATUS=running; ALIVE=1;;
       ended)   STATUS=exited; ALIVE=0;;
       *)       # CCR could not be asked, or answered something this version does not know. That is
                # not evidence the job ended: stay in flight and let the watch bound detach.
                STATUS=running; ALIVE=0
-               IDENT_NOTE="ccr status for job $JOB_ID is unreadable or unrecognised (got '$(ccr_job_field "$JOB_JSON" status)'); not concluding the job ended";;
+               IDENT_NOTE="ccr status for job $JOB_ID is unreadable or unrecognised (got '$(exec 9>&-; ccr_job_field "$JOB_JSON" status)'); not concluding the job ended";;
     esac
-    echo "$(elapsed)s status=$STATUS idle=${IDLE}s | $LASTLINE" >> "$PREFIX.progress"
+    echo "$(exec 9>&-; elapsed)s status=$STATUS idle=${IDLE}s | $LASTLINE" >> "$PREFIX.progress"
     [ "$STATUS" = running ] || { OUTCOME=EXITED; break; }
     if [ "$IDLE" -ge $(( STALL_MIN * 60 )) ]; then OUTCOME=STALLED; break; fi
     # The watch bound is the watcher's own and says nothing about the job, so it detaches
     # instead of killing: the supervisor keeps the child, and an --attach resumes the watch.
-    if [ "$(elapsed)" -ge $(( MAX_MIN * 60 )) ]; then OUTCOME=DETACHED; break; fi
+    if [ "$(exec 9>&-; elapsed)" -ge $(( MAX_MIN * 60 )) ]; then OUTCOME=DETACHED; break; fi
   done
   if [ "$OUTCOME" = DETACHED ]; then
     # Every field of this record is owned by the LAUNCH, and a re-detaching attach is not it.
@@ -833,24 +839,23 @@ if [ "$BACKEND" = ccr ]; then
     # values this process cannot know (cycle 2: CL-04). So an attach copies them forward
     # verbatim; only a launch writes them.
     if [ "$ATTACH" = 1 ]; then
-      D_MODEL=$(detached_field claude_model_id); D_SHA=$(detached_field prompt_sha256); D_TURNS=$(detached_field max_turns)
-      D_AT=$(detached_field detached_at); D_JOBLOG="${JOB_LOG:-}"
-      ATTACH_CMD=$(detached_field attach_command); CANCEL_CMD=$(detached_field cancel_command)
+      D_MODEL=$(exec 9>&-; detached_field claude_model_id); D_SHA=$(exec 9>&-; detached_field prompt_sha256); D_TURNS=$(exec 9>&-; detached_field max_turns)
+      D_AT=$(exec 9>&-; detached_field detached_at); D_JOBLOG="${JOB_LOG:-}"
+      ATTACH_CMD=$(exec 9>&-; detached_field attach_command); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
     else
-      D_MODEL="$CLAUDE_MODEL"; D_SHA=$(prompt_digest "$PROMPT_FILE"); D_TURNS="$MAX_TURNS"
-      D_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ); D_JOBLOG="${JOB_LOG:-}"
-      ATTACH_CMD="$0 $PREFIX --attach --stall-min $STALL_MIN --max-min $MAX_MIN --poll-sec $POLL"
-      CANCEL_CMD="$0 $PREFIX --attach --cancel   # cancels job $JOB_ID through its owner (ccr cancel $JOB_ID); no pid or process group is ever signalled"
+      D_MODEL="$CLAUDE_MODEL"; D_SHA=$(exec 9>&-; prompt_digest "$PROMPT_FILE"); D_TURNS="$MAX_TURNS"
+      D_AT=$(exec 9>&-; date -u +%Y-%m-%dT%H:%M:%SZ); D_JOBLOG="${JOB_LOG:-}"
+      ATTACH_CMD=$(exec 9>&-; detached_field attach_command); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
     fi
-    echo "$(elapsed)s DETACHED → watch bound reached with the job still running; nothing signalled (job $JOB_ID left running under its owner)" >> "$PREFIX.progress"
+    echo "$(exec 9>&-; elapsed)s DETACHED → watch bound reached with the job still running; nothing signalled (job $JOB_ID left running under its owner)" >> "$PREFIX.progress"
     # ORDER MATTERS: .detached is what admits an --attach, so it is written LAST, after every other
     # sidecar this attempt owns. Publishing it first opened a window in which an attach could be
     # admitted, collect the job and write .exit, and then have this block's .meta land on top of
     # the terminal record with outcome=DETACHED (cycle 3: CX-07).
     {
       echo "outcome=DETACHED"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "detached=yes"; echo "attached=${ATTEMPTS:-0}"
-      echo "job=$JOB_ID"; echo "session=$CCR_SESSION"; echo "thread=$(stream_field "$PREFIX.joblog" init-session)"
-      echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "max_turns=$MAX_TURNS"
+      echo "job=$JOB_ID"; echo "session=$CCR_SESSION"; echo "thread=$(exec 9>&-; stream_field "$PREFIX.joblog" init-session)"
+      echo "elapsed_sec=$(exec 9>&-; elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "max_turns=$MAX_TURNS"
       echo "mode=$MODE"; echo "prompt_file=$PROMPT_FILE"; echo "command=$CMD"
       echo "attach_command=$ATTACH_CMD"; echo "cancel_command=$CANCEL_CMD"
     } > "$PREFIX.meta"
@@ -876,7 +881,7 @@ cancel_command=$CANCEL_CMD
 EOD
     # NO .exit: an existing .exit tells every review gate the attempt finished, and it would then
     # rotate the claim and authorize a second launch against this still-running job.
-    echo "codex-run.sh: DETACHED backend=ccr alias=$ALIAS job=$JOB_ID elapsed=$(elapsed)s — the job is still running."
+    echo "codex-run.sh: DETACHED backend=ccr alias=$ALIAS job=$JOB_ID elapsed=$(exec 9>&-; elapsed)s — the job is still running."
     echo "  attach: $ATTACH_CMD"
     echo "  cancel: $CANCEL_CMD"
     exit 6
@@ -894,26 +899,26 @@ EOD
     # is published. The attempt stays in flight and the recovery is another attach.
     OUTCOME=DETACHED
     REDETACH_REASON="stall bound reached but ccr could not be asked about job $JOB_ID; no cancellation requested"
-    echo "$(elapsed)s STALLED → job state unreadable; not requesting cancellation of $JOB_ID — re-detaching instead" >> "$PREFIX.progress"
+    echo "$(exec 9>&-; elapsed)s STALLED → job state unreadable; not requesting cancellation of $JOB_ID — re-detaching instead" >> "$PREFIX.progress"
   elif [ "$OUTCOME" = STALLED ]; then
     # Cancellation is a REQUEST TO THE OWNER, by job id. This runner sends no signal, derives no
     # pid and names no process group; CCR decides what to terminate and reports what it observed.
     ccr_job_cancel "$JOB_ID" >/dev/null 2>>"$PREFIX.stderr" || true
     CWAIT=0
     while [ "$CWAIT" -lt 30 ]; do
-      JOB_JSON=$(ccr_job_json "$JOB_ID")
-      [ "$(ccr_job_state "$JOB_JSON")" = running ] || break
-      sleep 1; CWAIT=$((CWAIT+1))
+      JOB_JSON=$(exec 9>&-; ccr_job_json "$JOB_ID")
+      [ "$(exec 9>&-; ccr_job_state "$JOB_JSON")" = running ] || break
+      sleep 1 9>&-; CWAIT=$((CWAIT+1))
     done
-    CLEAN_COV=$(ccr_job_field "$JOB_JSON" cleanup.coverage)
-    CLEAN_SURV=$(ccr_job_field "$JOB_JSON" cleanup.survivors)
-    if [ "$(ccr_job_state "$JOB_JSON")" = ended ]; then
-      echo "$(elapsed)s $OUTCOME → job $JOB_ID cancelled by its owner (cleanup coverage=${CLEAN_COV:-unknown} survivors=${CLEAN_SURV:-[]})" >> "$PREFIX.progress"
+    CLEAN_COV=$(exec 9>&-; ccr_job_field "$JOB_JSON" cleanup.coverage)
+    CLEAN_SURV=$(exec 9>&-; ccr_job_field "$JOB_JSON" cleanup.survivors)
+    if [ "$(exec 9>&-; ccr_job_state "$JOB_JSON")" = ended ]; then
+      echo "$(exec 9>&-; elapsed)s $OUTCOME → job $JOB_ID cancelled by its owner (cleanup coverage=${CLEAN_COV:-unknown} survivors=${CLEAN_SURV:-[]})" >> "$PREFIX.progress"
     else
       # CCR did not report the job terminal within the bound. That is exactly the "could not
       # determine" case: it is never reported as a completed cancel.
       UNCONFIRMED_CANCEL=1
-      echo "$(elapsed)s $OUTCOME → cancellation of job $JOB_ID NOT confirmed; it may still be running" >> "$PREFIX.progress"
+      echo "$(exec 9>&-; elapsed)s $OUTCOME → cancellation of job $JOB_ID NOT confirmed; it may still be running" >> "$PREFIX.progress"
       echo "codex-run.sh: cancellation of job $JOB_ID not confirmed; DO NOT retry — check with: ccr status $JOB_ID --json" >&2
     fi
   fi
@@ -921,17 +926,17 @@ EOD
   # parent than an attach is, so neither wait()s for anything: CCR reaped the workload and records
   # what it reaped. This keeps the success predicate's exit-status condition without a receipt
   # protocol of our own, and it is the same answer whichever process asks.
-  JOB_JSON=$(ccr_job_json "$JOB_ID")
-  CHILD_RC=$(ccr_job_field "$JOB_JSON" exit_code)
-  JOB_STATE=$(ccr_job_state "$JOB_JSON")
-  CLEAN_COV=$(ccr_job_field "$JOB_JSON" cleanup.coverage); CLEAN_COV=${CLEAN_COV:-unknown}
-  CLEAN_SURV=$(ccr_job_field "$JOB_JSON" cleanup.survivors); CLEAN_SURV=${CLEAN_SURV:-[]}
-  CLEAN_REASON=$(ccr_job_field "$JOB_JSON" cleanup.reason)
+  JOB_JSON=$(exec 9>&-; ccr_job_json "$JOB_ID")
+  CHILD_RC=$(exec 9>&-; ccr_job_field "$JOB_JSON" exit_code)
+  JOB_STATE=$(exec 9>&-; ccr_job_state "$JOB_JSON")
+  CLEAN_COV=$(exec 9>&-; ccr_job_field "$JOB_JSON" cleanup.coverage); CLEAN_COV=${CLEAN_COV:-unknown}
+  CLEAN_SURV=$(exec 9>&-; ccr_job_field "$JOB_JSON" cleanup.survivors); CLEAN_SURV=${CLEAN_SURV:-[]}
+  CLEAN_REASON=$(exec 9>&-; ccr_job_field "$JOB_JSON" cleanup.reason)
   if [ "$JOB_STATE" != ended ]; then
     # Not provably over. Publishing a terminal outcome here would delete .detached, free the claim
     # and let a second job be launched against the one still running.
     OUTCOME=DETACHED
-    echo "$(elapsed)s ccr does not report job $JOB_ID as ended (status '$(ccr_job_field "$JOB_JSON" status)'); the attempt has not ended — re-detaching rather than publishing a terminal outcome" >> "$PREFIX.progress"
+    echo "$(exec 9>&-; elapsed)s ccr does not report job $JOB_ID as ended (status '$(exec 9>&-; ccr_job_field "$JOB_JSON" status)'); the attempt has not ended — re-detaching rather than publishing a terminal outcome" >> "$PREFIX.progress"
     # A more specific reason already set upstream (an unconfirmed cancel) is the one to keep.
     REDETACH_REASON="${REDETACH_REASON:-ccr does not report job $JOB_ID as ended}"
   fi
@@ -940,27 +945,27 @@ EOD
   # documented recovery is still an attach.
   if [ "$OUTCOME" = DETACHED ]; then
     ATTEMPTS=${ATTEMPTS:-0}
-    ATTACH_CMD=$(detached_field attach_command); CANCEL_CMD=$(detached_field cancel_command)
-    echo "$(elapsed)s DETACHED (re-detached): $REDETACH_REASON" >> "$PREFIX.progress"
+    ATTACH_CMD=$(exec 9>&-; detached_field attach_command); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
+    echo "$(exec 9>&-; elapsed)s DETACHED (re-detached): $REDETACH_REASON" >> "$PREFIX.progress"
     {
       echo "outcome=DETACHED"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "detached=yes"; echo "attached=$ATTEMPTS"
-      echo "job=$JOB_ID"; echo "session=$CCR_SESSION"; echo "elapsed_sec=$(elapsed)"
+      echo "job=$JOB_ID"; echo "session=$CCR_SESSION"; echo "elapsed_sec=$(exec 9>&-; elapsed)"
       echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "mode=$MODE"; echo "prompt_file=$PROMPT_FILE"
       echo "command=$CMD"; echo "redetach_reason=$REDETACH_REASON"
       echo "attach_command=$ATTACH_CMD"; echo "cancel_command=$CANCEL_CMD"
     } > "$PREFIX.meta"
     publish_unlock
-    echo "codex-run.sh: DETACHED backend=ccr alias=$ALIAS elapsed=$(elapsed)s — $REDETACH_REASON; the attempt is still open."
+    echo "codex-run.sh: DETACHED backend=ccr alias=$ALIAS elapsed=$(exec 9>&-; elapsed)s — $REDETACH_REASON; the attempt is still open."
     echo "  attach: $ATTACH_CMD"
     exit 6
   fi
   [ -n "${HELD_LOCK:-}" ] || publish_lock --must
-  FROZEN=$(python3 "$CCR_HELPER" freeze "$PREFIX" "$JOB_ID") || {
+  FROZEN=$(exec 9>&-; python3 "$CCR_HELPER" freeze "$PREFIX" "$JOB_ID") || {
     echo "codex-run.sh: result observation unresolved; retain attempt for investigation" >&2
     exit 6
   }
-  SESSION_ID=$(stream_field "$PREFIX.joblog" init-session); ROUTED_MODEL=$(stream_field "$PREFIX.joblog" init-model)
-  HAS_RESULT=$(stream_field "$PREFIX.joblog" has-result)
+  SESSION_ID=$(exec 9>&-; stream_field "$PREFIX.joblog" init-session); ROUTED_MODEL=$(exec 9>&-; stream_field "$PREFIX.joblog" init-model)
+  HAS_RESULT=$(exec 9>&-; stream_field "$PREFIX.joblog" has-result)
   stream_field "$PREFIX.joblog" result-text > "$PREFIX.stdout"
   if [ "$UNCONFIRMED_CANCEL" = 1 ]; then : > "$PREFIX.stdout"; fi
   if [ "$OUTCOME" = EXITED ]; then
@@ -968,24 +973,24 @@ EOD
     # failed attempt even if the child exited 0 (review round 1: F-10).
     # `child_exit=unknown` (a supervisor that died before reaping, above) is not zero, so this
     # predicate closes such an attempt as FAILED without ever manufacturing a success.
-    if [ "$(ccr_job_field "$FROZEN" successful)" = True ]; then OUTCOME=COMPLETED; else OUTCOME=FAILED; fi
+    if [ "$(exec 9>&-; ccr_job_field "$FROZEN" successful)" = True ]; then OUTCOME=COMPLETED; else OUTCOME=FAILED; fi
   fi
   # The configured alias is CCR input. `CLAUDE_MODEL` is the generated model ID
   # CCR promised for it; the child independently reports `ROUTED_MODEL` at init.
   # A mismatch is a route/configuration failure, never a reason to try Claude or
   # another alias. This comparison is local metadata only — no extra ccr call.
   ROUTE_OK=unknown
-  if [ "$OUTCOME" = COMPLETED ] || [ "$(ccr_job_field "$FROZEN" error_code)" = route_identity_mismatch ]; then
+  if [ "$OUTCOME" = COMPLETED ] || [ "$(exec 9>&-; ccr_job_field "$FROZEN" error_code)" = route_identity_mismatch ]; then
     # On an attach, the expected model is the one recorded at launch. Judging a finished execution
     # by whatever the alias resolves to NOW would turn an ordinary config change into UNAVAILABLE
     # for an answer that was already produced correctly.
     if [ "$ATTACH" = 1 ]; then
-      WANT_MODEL=$(detached_field claude_model_id); [ -n "$WANT_MODEL" ] || WANT_MODEL="$CLAUDE_MODEL"
+      WANT_MODEL=$(exec 9>&-; detached_field claude_model_id); [ -n "$WANT_MODEL" ] || WANT_MODEL="$CLAUDE_MODEL"
       CLAUDE_MODEL="$WANT_MODEL"
     fi
     if [ -z "$CLAUDE_MODEL" ] || [ -z "$ROUTED_MODEL" ] || [ "$ROUTED_MODEL" != "$CLAUDE_MODEL" ]; then
       OUTCOME=UNAVAILABLE; ROUTE_OK=no
-      echo "$(elapsed)s ROUTE-UNAVAILABLE alias=$ALIAS expected_child_model=${CLAUDE_MODEL:-unknown} got_child_model=${ROUTED_MODEL:-unknown}" >> "$PREFIX.progress"
+      echo "$(exec 9>&-; elapsed)s ROUTE-UNAVAILABLE alias=$ALIAS expected_child_model=${CLAUDE_MODEL:-unknown} got_child_model=${ROUTED_MODEL:-unknown}" >> "$PREFIX.progress"
       printf 'codex-run.sh: CCR route identity mismatch for alias %s (expected generated child model %s, got %s); do not retry with another alias or Claude\n' "$ALIAS" "${CLAUDE_MODEL:-unknown}" "${ROUTED_MODEL:-unknown}" >> "$PREFIX.stderr"
     else
       ROUTE_OK=yes
@@ -1004,11 +1009,11 @@ EOD
     # it must not be silently rounded to "clean" by anything that reads this file.
     echo "cleanup_coverage=$CLEAN_COV"; echo "cleanup_survivors=$CLEAN_SURV"
     [ -z "${CLEAN_REASON:-}" ] || echo "cleanup_reason=$CLEAN_REASON"
-    echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "max_turns=$MAX_TURNS"
-    echo "mode=$MODE"; [ "$MODE" != "--resume-session" ] || echo "resume_session=$RESUME_SESSION"; echo "prompt_file=$PROMPT_FILE"; echo "result_event=$(stream_field "$PREFIX.joblog" result-subtype)"
-    echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
-  LASTERR=$(sed '/^[[:space:]]*$/d' "$PREFIX.stderr" | tail -1 | cut -c1-300)
-    echo "last_error=${LAST_ERROR_OVERRIDE:-${LASTERR:-none}}"; echo "cancel_confirmed=$([ "$UNCONFIRMED_CANCEL" = 1 ] && echo no || echo "$([ "$OUTCOME" = STALLED ] && echo yes || echo n/a)")"
+    echo "elapsed_sec=$(exec 9>&-; elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"; echo "max_turns=$MAX_TURNS"
+    echo "mode=$MODE"; [ "$MODE" != "--resume-session" ] || echo "resume_session=$RESUME_SESSION"; echo "prompt_file=$PROMPT_FILE"; echo "result_event=$(exec 9>&-; stream_field "$PREFIX.joblog" result-subtype)"
+    echo "command=$CMD"; echo "stdout_bytes=$(exec 9>&-; wc -c < "$PREFIX.stdout" | tr -d ' ')"
+  LASTERR=$(exec 9>&-; sed '/^[[:space:]]*$/d' "$PREFIX.stderr" | tail -1 | cut -c1-300)
+    echo "last_error=${LAST_ERROR_OVERRIDE:-${LASTERR:-none}}"; echo "cancel_confirmed=$(exec 9>&-; [ "$UNCONFIRMED_CANCEL" = 1 ] && echo no || echo "$(exec 9>&-; [ "$OUTCOME" = STALLED ] && echo yes || echo n/a)")"
   } > "$PREFIX.meta"
   # TIMEOUT/3 is RETIRED: no path assigns OUTCOME=TIMEOUT any more — a watch bound that elapses
   # detaches (6). The arm is kept so the code that reads older sidecars, and the exit-code contract
@@ -1017,67 +1022,67 @@ EOD
   [ "$UNCONFIRMED_CANCEL" = 1 ] && RC=5
   # Terminal, in this order: the attempt stops being detached before it is marked finished, so no
   # gate ever sees both markers, and none sees .exit while .detached still says a job may run.
-  rm -f "$PREFIX.detached"
+  rm 9>&- -f "$PREFIX.detached"
   echo "$RC" > "$PREFIX.exit"
   publish_unlock
-  echo "codex-run.sh: $OUTCOME backend=ccr alias=$ALIAS session=${SESSION_ID:-unknown} elapsed=$(elapsed)s stdout=$(wc -c < "$PREFIX.stdout" | tr -d ' ')B → $PREFIX.{stdout,progress,meta}"
+  echo "codex-run.sh: $OUTCOME backend=ccr alias=$ALIAS session=${SESSION_ID:-unknown} elapsed=$(exec 9>&-; elapsed)s stdout=$(exec 9>&-; wc -c < "$PREFIX.stdout" | tr -d ' ')B → $PREFIX.{stdout,progress,meta}"
   exit "$RC"
 fi
 
 # =============================================================================================
 # codex backend (the Codex CLI plugin's companion)
 # =============================================================================================
-CODEX_ROOT=$(codex_root)
+CODEX_ROOT=$(exec 9>&-; codex_root)
 if [ -z "$CODEX_ROOT" ] || [ ! -f "$CODEX_ROOT/scripts/codex-companion.mjs" ]; then
   if [ "$ATTACH" = 1 ]; then
     # Not finding the companion says something about THIS process, not about the job it owns.
     # Publishing a terminal launch error would delete .detached and free the claim for a second
     # launch against a job that is still running (cycle 2: CX-06). Leave the attempt as found.
-    echo "$(elapsed)s ATTACH: cannot locate the codex plugin; nothing was observed and the attempt stays open" >> "$PREFIX.progress"
+    echo "$(exec 9>&-; elapsed)s ATTACH: cannot locate the codex plugin; nothing was observed and the attempt stays open" >> "$PREFIX.progress"
     echo "codex-run.sh: --attach: cannot locate the codex plugin (installed_plugins.json or ~/.claude/plugins/cache/openai-codex/codex/*); job $JOB is untouched and still detached." >&2
     echo "  attach: ${ATTACH_CMD:-$0 $PREFIX --attach}"
     exit 6
   fi
   launch_error "cannot locate the codex plugin (installed_plugins.json or ~/.claude/plugins/cache/openai-codex/codex/*)" "task $MODE --background --prompt-file $PROMPT_FILE"
 fi
-cc() { node "$CODEX_ROOT/scripts/codex-companion.mjs" "$@"; }
+cc() { node 9>&- "$CODEX_ROOT/scripts/codex-companion.mjs" "$@"; }
 jobfield() { python3 -c "import sys,json;d=json.load(sys.stdin);j=d.get('job') or {};print(j.get('$1') or '')" 2>/dev/null; }
 
 if [ "$ATTACH" = 1 ]; then
   # The companion is already this job's durable owner: it survived the runner that launched it and
   # answers `status` and `result` for the id in the detached record. Nothing to launch, nothing to
   # claim — pick the watch back up where it stopped.
-  CMD=$(awk -F= '$1=="command"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
-  PROMPT_FILE=$(awk -F= '$1=="prompt_file"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
-  echo "$(elapsed)s attached job=$JOB" >> "$PREFIX.progress"
+  CMD=$(exec 9>&-; awk -F= '$1=="command"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
+  PROMPT_FILE=$(exec 9>&-; awk -F= '$1=="prompt_file"{sub(/^[^=]*=/,""); print; exit}' "$PREFIX.meta" 2>/dev/null)
+  echo "$(exec 9>&-; elapsed)s attached job=$JOB" >> "$PREFIX.progress"
 else
 stamp_claim; rotate_previous_attempt; unlock_claim
 : > "$PREFIX.progress"; : > "$PREFIX.stderr"
 CMD="task $MODE --background --prompt-file $PROMPT_FILE"
-LAUNCH=$(cc task "$MODE" --background --prompt-file "$PROMPT_FILE" 2>>"$PREFIX.stderr") || true
-JOB=$(printf '%s' "$LAUNCH" | grep -oE 'task-[a-z0-9]+-[a-z0-9]+' | head -1)
+LAUNCH=$(exec 9>&-; cc task "$MODE" --background --prompt-file "$PROMPT_FILE" 2>>"$PREFIX.stderr") || true
+JOB=$(exec 9>&-; printf '%s' "$LAUNCH" | grep -oE 'task-[a-z0-9]+-[a-z0-9]+' | head -1)
 if [ -z "$JOB" ]; then
   printf 'LAUNCH-ERROR\n%s\n' "$LAUNCH" >> "$PREFIX.stderr"
   printf 'outcome=LAUNCH-ERROR\nbackend=codex\nmode=%s\ncommand=%s\n' "$MODE" "$CMD" > "$PREFIX.meta"; echo 4 > "$PREFIX.exit"
   echo "codex-run.sh: LAUNCH-ERROR (see $PREFIX.stderr)"; exit 4
 fi
-echo "$(elapsed)s launched job=$JOB" >> "$PREFIX.progress"
+echo "$(exec 9>&-; elapsed)s launched job=$JOB" >> "$PREFIX.progress"
 fi
 
-OUTCOME=""; LOGFILE=""; LAST_ACTIVITY=$(now); PREV_SIG=""
+OUTCOME=""; LOGFILE=""; LAST_ACTIVITY=$(exec 9>&-; now); PREV_SIG=""
 while :; do
-  sleep "$POLL"
-  SJ=$(cc status "$JOB" --json 2>/dev/null || true)
-  STATUS=$(printf '%s' "$SJ" | jobfield status); PID=$(printf '%s' "$SJ" | jobfield pid)
-  [ -z "$LOGFILE" ] && LOGFILE=$(printf '%s' "$SJ" | jobfield logFile)
+  sleep "$POLL" 9>&-
+  SJ=$(exec 9>&-; cc status "$JOB" --json 2>/dev/null || true)
+  STATUS=$(exec 9>&-; printf '%s' "$SJ" | jobfield status); PID=$(exec 9>&-; printf '%s' "$SJ" | jobfield pid)
+  [ -z "$LOGFILE" ] && LOGFILE=$(exec 9>&-; printf '%s' "$SJ" | jobfield logFile)
   LASTLINE=""; SIG=""
   if [ -n "$LOGFILE" ] && [ -r "$LOGFILE" ]; then
-    LASTLINE=$(tail -n 1 "$LOGFILE" 2>/dev/null | cut -c1-140)
-    SIG=$(fsig "$LOGFILE")
+    LASTLINE=$(exec 9>&-; tail -n 1 "$LOGFILE" 2>/dev/null | cut -c1-140)
+    SIG=$(exec 9>&-; fsig "$LOGFILE")
   fi
-  if [ "$SIG" != "$PREV_SIG" ]; then LAST_ACTIVITY=$(now); PREV_SIG="$SIG"; fi
-  IDLE=$(( $(now) - LAST_ACTIVITY ))
-  echo "$(elapsed)s status=${STATUS:-?} idle=${IDLE}s | $LASTLINE" >> "$PREFIX.progress"
+  if [ "$SIG" != "$PREV_SIG" ]; then LAST_ACTIVITY=$(exec 9>&-; now); PREV_SIG="$SIG"; fi
+  IDLE=$(( $(exec 9>&-; now) - LAST_ACTIVITY ))
+  echo "$(exec 9>&-; elapsed)s status=${STATUS:-?} idle=${IDLE}s | $LASTLINE" >> "$PREFIX.progress"
 
   case "$STATUS" in
     completed) OUTCOME=COMPLETED; break;;
@@ -1087,16 +1092,16 @@ while :; do
       if [ "$STATUS" = "running" ] && ! pgrep -f "task-worker.*--job-id $JOB" >/dev/null 2>&1; then
         if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then :; else
           # give the plugin one poll to flip the status itself
-          sleep "$POLL"; ST2=$(cc status "$JOB" --json 2>/dev/null | jobfield status)
+          sleep "$POLL" 9>&-; ST2=$(exec 9>&-; cc status "$JOB" --json 2>/dev/null | jobfield status)
           case "$ST2" in completed) OUTCOME=COMPLETED; break;; failed|cancelled|canceled) OUTCOME=FAILED; break;; esac
-          echo "$(elapsed)s WORKER-DEAD (status=$ST2, no task-worker process)" >> "$PREFIX.progress"; OUTCOME=FAILED; break
+          echo "$(exec 9>&-; elapsed)s WORKER-DEAD (status=$ST2, no task-worker process)" >> "$PREFIX.progress"; OUTCOME=FAILED; break
         fi
       fi
       if [ "$IDLE" -ge $(( STALL_MIN * 60 )) ]; then OUTCOME=STALLED; break; fi
       # As on the ccr backend: the bound is the watcher's, not the job's. The companion keeps
       # the job — it is already the durable owner — so detaching costs nothing and loses nothing.
-      if [ "$(elapsed)" -ge $(( MAX_MIN * 60 )) ]; then OUTCOME=DETACHED; break; fi;;
-    *) echo "$(elapsed)s unknown status '$STATUS'" >> "$PREFIX.progress";;
+      if [ "$(exec 9>&-; elapsed)" -ge $(( MAX_MIN * 60 )) ]; then OUTCOME=DETACHED; break; fi;;
+    *) echo "$(exec 9>&-; elapsed)s unknown status '$STATUS'" >> "$PREFIX.progress";;
   esac
 done
 
@@ -1106,23 +1111,23 @@ if [ "$OUTCOME" = "DETACHED" ]; then
   # been deleted, in which case re-deriving would replace the launch's prompt pin with an empty
   # one — the record would stop being the launch's own testimony (cycle 3: CL-07).
   if [ "$ATTACH" = 1 ]; then
-    D_THREAD=$(detached_field thread); D_SHA=$(detached_field prompt_sha256); D_AT=$(detached_field detached_at)
-    D_JOBLOG=$(detached_field joblog); D_WPID=$(detached_field worker_pid); D_WIDENT=$(detached_field worker_identity)
-    ATTACH_CMD=$(detached_field attach_command); CANCEL_CMD=$(detached_field cancel_command)
+    D_THREAD=$(exec 9>&-; detached_field thread); D_SHA=$(exec 9>&-; detached_field prompt_sha256); D_AT=$(exec 9>&-; detached_field detached_at)
+    D_JOBLOG=$(exec 9>&-; detached_field joblog); D_WPID=$(exec 9>&-; detached_field worker_pid); D_WIDENT=$(exec 9>&-; detached_field worker_identity)
+    ATTACH_CMD=$(exec 9>&-; detached_field attach_command); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
   else
-    D_THREAD=$(grep -oE 'Codex session ID: [0-9a-f-]+' "${LOGFILE:-/dev/null}" 2>/dev/null | head -1 | awk '{print $4}')
-    D_SHA=$(prompt_digest "$PROMPT_FILE"); D_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ); D_JOBLOG="${LOGFILE:-}"
+    D_THREAD=$(exec 9>&-; grep -oE 'Codex session ID: [0-9a-f-]+' "${LOGFILE:-/dev/null}" 2>/dev/null | head -1 | awk '{print $4}')
+    D_SHA=$(exec 9>&-; prompt_digest "$PROMPT_FILE"); D_AT=$(exec 9>&-; date -u +%Y-%m-%dT%H:%M:%SZ); D_JOBLOG="${LOGFILE:-}"
     # The worker pid the companion reports, with its identity, so a later launch can PROVE this
     # job is still running rather than assume it (cycle 3: CL-03/CX-02). The companion remains the
     # authority; this is the cheap local check, and `job=` is what a relaunch consults.
-    D_WPID="${PID:-}"; D_WIDENT=$(proc_identity "${PID:-0}")
+    D_WPID="${PID:-}"; D_WIDENT=$(exec 9>&-; proc_identity "${PID:-0}")
     ATTACH_CMD="$0 $PREFIX --attach --stall-min $STALL_MIN --max-min $MAX_MIN --poll-sec $POLL"
     CANCEL_CMD="node $CODEX_ROOT/scripts/codex-companion.mjs cancel $JOB"
   fi
-  echo "$(elapsed)s DETACHED → watch bound reached with job $JOB still running; not cancelled" >> "$PREFIX.progress"
+  echo "$(exec 9>&-; elapsed)s DETACHED → watch bound reached with job $JOB still running; not cancelled" >> "$PREFIX.progress"
   {
     echo "outcome=DETACHED"; echo "backend=codex"; echo "job=$JOB"; echo "detached=yes"; echo "attached=${ATTEMPTS:-0}"
-    echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"
+    echo "elapsed_sec=$(exec 9>&-; elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"
     echo "mode=$MODE"; echo "prompt_file=$PROMPT_FILE"; echo "command=$CMD"
     echo "attach_command=$ATTACH_CMD"; echo "cancel_command=$CANCEL_CMD"
   } > "$PREFIX.meta"
@@ -1143,7 +1148,7 @@ attach_command=$ATTACH_CMD
 cancel_command=$CANCEL_CMD
 EOD
   # NO .exit — see the ccr branch: a terminal sidecar would free the claim for a second launch.
-  echo "codex-run.sh: DETACHED backend=codex job=$JOB elapsed=$(elapsed)s — the job is still running."
+  echo "codex-run.sh: DETACHED backend=codex job=$JOB elapsed=$(exec 9>&-; elapsed)s — the job is still running."
   echo "  attach: $ATTACH_CMD"
   echo "  cancel: $CANCEL_CMD"
   exit 6
@@ -1156,8 +1161,8 @@ if [ "$OUTCOME" = "STALLED" ] || { [ "$OUTCOME" = "FAILED" ] && [ "${STATUS:-}" 
   # did not happen is worse than a reported one that failed.
   PHANTOM=""; i=0
   while [ $i -lt 5 ]; do
-    sleep 1; i=$((i+1))
-    ST3=$(cc status "$JOB" --json 2>/dev/null | jobfield status)
+    sleep 1 9>&-; i=$((i+1))
+    ST3=$(exec 9>&-; cc status "$JOB" --json 2>/dev/null | jobfield status)
     case "$ST3" in cancelled|canceled|completed|failed) PHANTOM=""; break;; *) PHANTOM="status=$ST3";; esac
   done
   if pgrep -f "task-worker.*--job-id $JOB" >/dev/null 2>&1; then PHANTOM="${PHANTOM:+$PHANTOM }worker-process-alive"; fi
@@ -1165,10 +1170,10 @@ if [ "$OUTCOME" = "STALLED" ] || { [ "$OUTCOME" = "FAILED" ] && [ "${STATUS:-}" 
     # Exit 5, not the outcome's own code: a live worker must never be retried,
     # and 1/2/3 all tell the caller to retry or to treat the job as finished.
     UNCONFIRMED_CANCEL=1
-    echo "$(elapsed)s $OUTCOME → cancel of $JOB NOT confirmed (cancel_rc=$CANCEL_RC $PHANTOM); a worker may still be running" >> "$PREFIX.progress"
+    echo "$(exec 9>&-; elapsed)s $OUTCOME → cancel of $JOB NOT confirmed (cancel_rc=$CANCEL_RC $PHANTOM); a worker may still be running" >> "$PREFIX.progress"
     echo "codex-run.sh: cancel of $JOB not confirmed ($PHANTOM); DO NOT retry — a worker may still be running. Check with: node <codex-plugin>/scripts/codex-companion.mjs status $JOB --json" >&2
   else
-    echo "$(elapsed)s $OUTCOME → cancelled $JOB (confirmed: no running job, no worker process)" >> "$PREFIX.progress"
+    echo "$(exec 9>&-; elapsed)s $OUTCOME → cancelled $JOB (confirmed: no running job, no worker process)" >> "$PREFIX.progress"
   fi
 fi
 # An unconfirmed cancel has no final result eligible for a downstream gate. The
@@ -1176,16 +1181,16 @@ fi
 if [ "${UNCONFIRMED_CANCEL:-0}" = "1" ]; then : > "$PREFIX.stdout"
 else cc result "$JOB" > "$PREFIX.stdout" 2>>"$PREFIX.stderr" || true
 fi
-[ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && cp "$LOGFILE" "$PREFIX.joblog" 2>/dev/null
-THREAD=$(grep -oE 'Codex session ID: [0-9a-f-]+' "$PREFIX.stdout" | head -1 | awk '{print $4}')
+[ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && cp 9>&- "$LOGFILE" "$PREFIX.joblog" 2>/dev/null
+THREAD=$(exec 9>&-; grep -oE 'Codex session ID: [0-9a-f-]+' "$PREFIX.stdout" | head -1 | awk '{print $4}')
 # A resumed run must land in the thread it named. The companion offers no way to ask for a thread
 # by id — --resume-last takes the newest eligible one — so the binding can only be checked after
 # the fact, and a mismatch is reported rather than accepted: continuing someone else's thread is
 # worse than starting a fresh, self-contained round.
 THREAD_NOTE=""
 if [ "$MODE" = "--resume-last" ] && [ "$OUTCOME" = COMPLETED ] && [ -n "$THREAD" ]; then
-  WANT=$(awk -F= '$1=="thread"{print $2; exit}' "$PREFIX.detached" 2>/dev/null)
-  [ -n "$WANT" ] || WANT=$(detached_field thread)
+  WANT=$(exec 9>&-; awk -F= '$1=="thread"{print $2; exit}' "$PREFIX.detached" 2>/dev/null)
+  [ -n "$WANT" ] || WANT=$(exec 9>&-; detached_field thread)
   if [ -n "$WANT" ] && [ "$WANT" != unknown ] && [ "$WANT" != "$THREAD" ]; then
     OUTCOME=FAILED
     THREAD_NOTE="resumed thread $THREAD is not the expected $WANT; the continuation is not this attempt's, so it is refused"
@@ -1196,18 +1201,18 @@ fi
 {
   echo "outcome=$OUTCOME"; echo "backend=codex"; echo "job=$JOB"; echo "thread=${THREAD:-unknown}"
   echo "detached=no"; echo "attached=${ATTEMPTS:-0}"; [ -z "$THREAD_NOTE" ] || echo "thread_note=$THREAD_NOTE"
-  echo "elapsed_sec=$(elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"
-  echo "mode=$MODE"; echo "prompt_file=$PROMPT_FILE"; echo "command=$CMD"; echo "stdout_bytes=$(wc -c < "$PREFIX.stdout" | tr -d ' ')"
-  LASTERR=""; [ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && LASTERR=$(grep -E "Codex error:|Turn failed" "$LOGFILE" | tail -1 | cut -c1-300)
-  echo "last_error=${LASTERR:-none}"; echo "cancel_confirmed=$([ "${UNCONFIRMED_CANCEL:-0}" = "1" ] && echo no || echo "$([ "$OUTCOME" = "STALLED" ] && echo yes || echo n/a)")"
+  echo "elapsed_sec=$(exec 9>&-; elapsed)"; echo "idle_at_end_sec=$IDLE"; echo "stall_min=$STALL_MIN max_min=$MAX_MIN"
+  echo "mode=$MODE"; echo "prompt_file=$PROMPT_FILE"; echo "command=$CMD"; echo "stdout_bytes=$(exec 9>&-; wc -c < "$PREFIX.stdout" | tr -d ' ')"
+  LASTERR=""; [ -n "$LOGFILE" ] && [ -r "$LOGFILE" ] && LASTERR=$(exec 9>&-; grep -E "Codex error:|Turn failed" "$LOGFILE" | tail -1 | cut -c1-300)
+  echo "last_error=${LASTERR:-none}"; echo "cancel_confirmed=$(exec 9>&-; [ "${UNCONFIRMED_CANCEL:-0}" = "1" ] && echo no || echo "$(exec 9>&-; [ "$OUTCOME" = "STALLED" ] && echo yes || echo n/a)")"
 } > "$PREFIX.meta"
 # TIMEOUT/3 is RETIRED here too — see the ccr branch.
 case "$OUTCOME" in COMPLETED) RC=0;; FAILED) RC=1;; STALLED) RC=2;; TIMEOUT) RC=3;; DETACHED) RC=6;; *) RC=1;; esac
 # An unconfirmed cancel outranks the outcome: 1, 2 and 3 all invite a retry or
 # treat the job as finished, and neither is safe while a worker may be alive.
 [ "${UNCONFIRMED_CANCEL:-0}" = "1" ] && RC=5
-rm -f "$PREFIX.detached"
+rm 9>&- -f "$PREFIX.detached"
 echo "$RC" > "$PREFIX.exit"
 publish_unlock
-echo "codex-run.sh: $OUTCOME job=$JOB elapsed=$(elapsed)s stdout=$(wc -c < "$PREFIX.stdout" | tr -d ' ')B → $PREFIX.{stdout,progress,meta}"
+echo "codex-run.sh: $OUTCOME job=$JOB elapsed=$(exec 9>&-; elapsed)s stdout=$(exec 9>&-; wc -c < "$PREFIX.stdout" | tr -d ' ')B → $PREFIX.{stdout,progress,meta}"
 exit "$RC"

@@ -122,11 +122,18 @@ def recover(prefix):
                       provider_model=value["model_document"].get("provider_model", ""),
                       compatibility=value["model_document"].get("compatibility", ""),
                       ccr_version=value["ccr_version"], command=shlex.join(value["argv"]),
-                      attach_command=shlex.join([value["runner"], prefix, "--attach"]),
+                      attach_command=shlex.join([value["runner"], prefix, "--attach", "--expected-job", admitted["job_id"]]),
                       cancel_command=shlex.join(["python3", str(Path(value["runner"]).with_name("ccr-job.py")),
                                                 "cancel-attempt", prefix, admitted["job_id"]]))
         atomic(prefix + ".detached", "".join(f"{k}={v}\n" for k, v in fields.items()).encode())
     return value
+
+
+def close_collector_lease():
+    try:
+        os.close(9)
+    except OSError:
+        pass
 
 
 def prepare(prefix, alias, model, turns, runner, metadata, version, timeout, argv):
@@ -157,6 +164,7 @@ def prepare(prefix, alias, model, turns, runner, metadata, version, timeout, arg
                  model_document=json.loads(metadata), ccr_version=version,
                  prompt_file=source, prompt_sha256=hashlib.sha256(prompt).hexdigest())
     atomic(prefix + ".ccr-attempt.json", encode(value))
+    close_collector_lease()
     # Receipt bytes go straight to a private file, even if this collector dies.
     fd = os.open(prefix + ".ccr-receipt.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     expired = False
@@ -354,18 +362,20 @@ def main():
             except BlockingIOError:
                 if time.monotonic() >= deadline:
                     raise ValueError("collector lock remains held") from None
-                time.sleep(min(0.05, deadline - time.monotonic()))
-    # A workload/query subprocess must not retain a collector's inherited lease.
-    try:
-        os.close(9)
-    except OSError:
-        pass
+                time.sleep(max(0, min(0.05, deadline - time.monotonic())))
+    # Admission retains the inherited lease through durable attempt preparation.
+    if operation != "admit":
+        close_collector_lease()
     if operation == "state":
         print(state(json.load(sys.stdin)))
         return
     prefix = str(Path(args.pop(0)).resolve())
     if operation == "admit":
         value = prepare(prefix, *args[:7], args[7:])
+    elif operation == "verify-attempt":
+        value = bound_attempt(prefix)
+        if value["receipt"]["job_id"] != args[0]:
+            raise ValueError("saved command belongs to a different attempt")
     elif operation == "recover":
         value = recover(prefix)
     elif operation == "status":
