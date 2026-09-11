@@ -1717,7 +1717,10 @@ pgw pre-codex "$PR" "$G2" >/dev/null 2>&1 || { printf '  FAIL  T-19: preflight\n
 chk "T-19: unknown prefix refused" 1 "unknown phase prefix" bash "$PG" release "$PR" 02-p3
 mkdir -p "$PR/02-p2.claim/runner"; printf '2147483646\n' > "$PR/02-p2.claim/runner/pid"
 CCRH="plugins/codex-pr-review/scripts/ccr-job.py"
-PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=sleep python3 "$CCRH" admit "$PR/02-p2" x anthropic.ccr.x 1 "$R" '{}' 0.5.1 30 ccr launch --model x --detach --prompt-file "$PROMPT" >/dev/null
+if ! PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=sleep python3 "$CCRH" admit "$PR/02-p2" x anthropic.ccr.x 1 "$R" '{}' 0.5.1 30 6 25 1 ccr launch --model x --detach --prompt-file "$PROMPT" >/dev/null; then
+  printf '  FAIL  CCR gate fixture admission failed before receipt creation\n'
+  exit 1
+fi
 chk "T-19b: live CCR job refuses release" 1 "stop evidence" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
 RJ=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["job_id"])' "$PR/02-p2.ccr-receipt.json")
 python3 "$CCRH" cancel "$PR/02-p2" "$RJ" >/dev/null
@@ -1779,7 +1782,10 @@ printf 'p1\tccr\tx\n' > "$CT/00-participants.tsv"
 printf '5\n' > "$CT/02-p1.exit"
 printf 'backend=ccr\npid=2147483646\npgid=2147483646\ncancel_confirmed=no\n' > "$CT/02-p1.meta"
 chk "T-19c: exit-5 blocks before terminal proof" 1 "unconfirmed cancellation" pgw pre-codex "$CT" "$G2"
-PATH="$CCRBIN:$PATH" python3 "$CCRH" admit "$CT/02-p1" x anthropic.ccr.x 1 "$R" '{}' 0.5.1 30 ccr launch --model x --detach --prompt-file "$PROMPT" >/dev/null
+if ! PATH="$CCRBIN:$PATH" python3 "$CCRH" admit "$CT/02-p1" x anthropic.ccr.x 1 "$R" '{}' 0.5.1 30 6 25 1 ccr launch --model x --detach --prompt-file "$PROMPT" >/dev/null; then
+  printf '  FAIL  CCR gate fixture admission failed before receipt creation\n'
+  exit 1
+fi
 chk "T-19c: terminal proof writes immutable receipt" 0 "TERMINATION-CONFIRMED 02-p1 backend=ccr" bash "$PG" confirm-terminated "$CT" 02-p1
 [ "$(fmode "$CT/02-p1.cancel-resolved")" = 400 ] && grep -q '^exit_sha256=' "$CT/02-p1.cancel-resolved" && grep -q '^meta_sha256=' "$CT/02-p1.cancel-resolved" && grep -q ' 02-p1.cancel-resolved  confirm-terminated  final$' "$CT/00-accepted.sha256" && printf '  ok    %-42s\n' "T-19c: cancellation receipt binds raw sidecars" || { printf '  FAIL  T-19c: cancellation receipt missing, unledgered or writable\n'; FAIL=1; }
 chk "T-19c: resolved exit-5 permits fresh claim" 0 "PREFLIGHT-OK" pgw pre-codex "$CT" "$G2"
