@@ -405,8 +405,11 @@ A proven aborted `not_started` admission may close as failure without inventing 
 Successful output is restricted to CCR's committed byte boundary and verified digest.
 
 Fresh retry is a separate, explicitly recorded caller decision. For CCR, permit at most one
-fresh retry after a positively stopped `startup_failed` attempt; use a new prefix, submission,
-and session and preserve both observations. Missing/unknown failure codes, owner loss,
+fresh retry after a positively stopped `startup_failed` attempt. Obtain a new gate claim for
+the same canonical phase prefix (`04-consultation` or `06-resolution`), then launch with
+`--fresh` and that claim. The runner rotates the previous attempt, preserving both
+observations, and uses the new claim as a new submission with a new session. Never
+launch an alternate prefix outside the gate budget. Missing/unknown failure codes, owner loss,
 identity mismatch, or uncertain admission do not authorize this retry. Fresh success does
 not establish why the earlier attempt failed. Never infer missing history from stderr.
 

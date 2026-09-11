@@ -51,7 +51,7 @@
 #                           commands. Removed when an attach publishes the terminal outcome.
 #   Exit 4 with NO sidecar written: another runner already took <out-prefix>.claim/, or (--claim)
 #   no claim exists / the arguments are invalid.
-#   ccr backend also writes <dir>/.ccr-last-session (the session id --resume-last resumes).
+#   CCR continuation requires an explicit session and authoritative parent job.
 #
 # CCR owns workload lifecycle. A stall requests cancellation by job ID; a watch
 # deadline only detaches the collector. Unknown admission or cleanup retains the
@@ -426,6 +426,7 @@ if [ "$BACKEND" = codex ]; then
   [ -z "$RESUME_SESSION" ] || die4 "--resume-session is ccr-only (pass --via ccr:<alias>)"
   [ -z "$EXPECTED_PARENT" ] || die4 "--expected-parent-job is ccr-only"
 else
+  [ "$MODE" != --resume-last ] || die4 "CCR --resume-last is ambiguous; resolve the session before preparing the prompt and use --resume-session with --expected-parent-job"
   [ -n "$MAX_TURNS" ] || MAX_TURNS=$CCR_MAX_TURNS_DEFAULT
   case "$RESUME_SESSION" in *[!A-Za-z0-9-]*) die4 "--resume-session: a session id has only letters, digits and '-' (got '$RESUME_SESSION')";; esac
 fi
@@ -732,6 +733,9 @@ if [ "$ATTACH" = 1 ]; then
   ALIVE=1; IDENT_NOTE=""; IDENT_STATE=0
   if [ "$BACKEND" = ccr ]; then
     JOB_ID="$JOB"; CCR_SESSION=$(exec 9>&-; detached_field session)
+    ATTEMPT_JSON=$(exec 9>&-; python3 "$CCR_HELPER" verify-attempt "$PREFIX" "$JOB_ID") || exit 6
+    RESUME_SESSION=$(exec 9>&-; ccr_job_field "$ATTEMPT_JSON" requested_resume_session)
+    if [ -n "$RESUME_SESSION" ]; then MODE=--resume-session; else MODE=--fresh; fi
     JOB_JSON=$(exec 9>&-; ccr_job_json "$JOB_ID")
     case "$(exec 9>&-; ccr_job_state "$JOB_JSON")" in
       running) ALIVE=1;;
@@ -795,15 +799,7 @@ if [ "$BACKEND" = ccr ]; then
   ccr_preflight "$ALIAS" || launch_error "$REASON" "$CMD"
   ccr_smoke_check "$DIR" "$ALIAS" || launch_error "$REASON" "$CMD"
   SESSION=""
-  if [ "$MODE" = "--resume-last" ]; then
-    SESSION=$(exec 9>&-; cat "$DIR/.ccr-last-session" 2>/dev/null | head -1 | tr -d ' ')
-    [ -n "$SESSION" ] || launch_error "--resume-last: no previous ccr session recorded in $DIR/.ccr-last-session" "$CMD"
-    SAVED_PARENT=$(exec 9>&-; cat "$DIR/.ccr-last-job" 2>/dev/null | head -1)
-    [ -n "$SAVED_PARENT" ] || launch_error "--resume-last: no previous CCR job anchor" "$CMD"
-    [ -z "$EXPECTED_PARENT" ] || [ "$EXPECTED_PARENT" = "$SAVED_PARENT" ] || launch_error "saved parent differs from requested parent" "$CMD"
-    EXPECTED_PARENT="$SAVED_PARENT"
-    valid_resume_identity "$SESSION" "$EXPECTED_PARENT" || launch_error "saved session or parent identity is malformed" "$CMD"
-  elif [ "$MODE" = "--resume-session" ]; then SESSION="$RESUME_SESSION"; fi
+  if [ "$MODE" = "--resume-session" ]; then SESSION="$RESUME_SESSION"; fi
   ccr_launch_argv "$ALIAS" "$MAX_TURNS" "$PROMPT_FILE"
   if [ -n "$SESSION" ]; then ARGV+=("--resume=$SESSION" "--expected-parent-job=$EXPECTED_PARENT"); fi
   stamp_claim; rotate_previous_attempt

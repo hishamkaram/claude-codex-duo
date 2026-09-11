@@ -59,6 +59,37 @@ esac
         self.assertEqual(value["submission_id"], value["receipt"]["submission_id"])
         self.assertEqual(len(list((self.root / "store/fake-ccr-jobs").glob("*.json"))), before + 1)
 
+    def test_resume_last_rejected_before_claim_or_admission(self):
+        claim = Path(str(self.prefix) + ".claim")
+        claim.mkdir()
+        (claim / "owner").write_text("token=original\n")
+        before = list((self.root / "store/fake-ccr-jobs").glob("*.json"))
+        result = self.run_runner(str(self.prefix), "--via", "ccr:x", "--resume-last",
+                                 "--claim", "original", "--prompt-file", str(self.prompt))
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertEqual((claim / "owner").read_text(), "token=original\n")
+        self.assertFalse((claim / "runner").exists())
+        self.assertFalse(Path(str(self.prefix) + ".ccr-attempt.json").exists())
+        self.assertFalse(Path(str(self.prefix) + ".exit").exists())
+        self.assertEqual(list((self.root / "store/fake-ccr-jobs").glob("*.json")), before)
+
+    def test_attach_continuation_preserves_requested_session_metadata(self):
+        self.assertEqual(self.launch().returncode, 0)
+        previous = job.load(str(self.prefix) + ".ccr-attempt.json")["receipt"]
+        prefix = str(self.root / "unwatched-continuation")
+        args = ["python3", str(RUNNER.with_name("ccr-job.py")), "admit", prefix,
+                "x", "anthropic.ccr.x", "100", str(RUNNER), "{}", "0.6.0", "5", "10", "25", "1",
+                "ccr", "launch", "--model", "x", "--detach", "--prompt-file", str(self.prompt),
+                "--resume=" + previous["session_id"], "--expected-parent-job=" + previous["job_id"]]
+        admitted = subprocess.run(args, env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(admitted.returncode, 0, admitted.stderr)
+        attached = self.run_runner(prefix, "--attach", "--poll-sec", "1")
+        self.assertEqual(attached.returncode, 0, attached.stdout + attached.stderr)
+        meta = Path(prefix + ".meta").read_text()
+        self.assertIn("mode=--resume-session\n", meta)
+        self.assertIn("resume_session=" + previous["session_id"] + "\n", meta)
+        self.assertIn("requested_resume_session=" + previous["session_id"] + "\n", meta)
+
     def test_guarded_resume_has_new_job_and_same_session(self):
         first = self.launch()
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
