@@ -99,9 +99,38 @@ else:
     v=d.get(f); print("" if v is None else v)' "$2" 2>/dev/null; }
 start_in_own_group() { exec python3 -c 'import os,sys; os.setpgrp(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"; }
 pgid_of() { ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
-group_alive() { kill -0 -- "-$1" 2>/dev/null; }
-kill_group() { local i; kill -TERM -- "-$1" 2>/dev/null || true
+proc_identity() { LC_ALL=C ps -o pid=,pgid=,lstart= -p "$1" 2>/dev/null; }
+# THE ONLY GATE THROUGH WHICH THIS SCRIPT MAY SIGNAL A PROCESS GROUP. `kill -- "-N"` gives two
+# values of N a session-wide meaning: 1 is EVERY process the user may signal (on macOS the whole
+# login session, loginwindow included), and 0 is the SENDER's own process group (the invoking
+# shell and its sibling jobs). A group number is therefore a legal target only when it is a
+# plausible group id AND still the process group of the pid this script recorded. Anything else
+# refuses and signals nothing. Escalation also checks the launch-time owner identity.
+pgid_is_signalable() {  # <pgid> [owner-pid]
+  local pg="$1" owner="${2:-}" self
+  case "$pg" in ''|*[!0-9]*) return 1;; esac
+  [ "$pg" -ge 2 ] 2>/dev/null || return 1
+  [ "$pg" != "$$" ] || return 1
+  self=$(pgid_of "$$"); [ -z "$self" ] || [ "$pg" != "$self" ] || return 1
+  if [ -n "$owner" ]; then
+    case "$owner" in ''|*[!0-9]*) return 1;; esac
+    [ "$(pgid_of "$owner")" = "$pg" ] || return 1
+  fi
+  return 0
+}
+group_alive() {  # <pgid> [owner-pid]
+  pgid_is_signalable "$1" "${2:-}" || return 1
+  kill -0 -- "-$1" 2>/dev/null
+}
+# Fails closed: an unverified target returns 1 (cancel not confirmed) having signalled nothing.
+kill_group() { local i owner="${2:-}" identity="${3:-}"
+  [ -n "$identity" ] && [ "$(proc_identity "$owner")" = "$identity" ] || return 1
+  pgid_is_signalable "$1" "$owner" || { echo "implement-run.sh: REFUSING to signal process group '${1:-<empty>}' — it is not a verified job group. Nothing was signalled." >&2; return 1; }
+  kill -TERM -- "-$1" 2>/dev/null || true
   for i in 1 2 3 4 5; do group_alive "$1" || return 0; sleep 1; done
+  # TERM and each destructive escalation require current ownership evidence.
+  # A vanished or replaced leader is unresolved, never authority for KILL.
+  [ "$(proc_identity "$owner")" = "$identity" ] && pgid_is_signalable "$1" "$owner" || return 1
   kill -KILL -- "-$1" 2>/dev/null || true
   for i in 1 2 3 4 5; do group_alive "$1" || return 0; sleep 1; done; return 1; }
 stream_field() { python3 - "$1" "$2" <<'PY' 2>/dev/null
@@ -181,9 +210,11 @@ CMD="ccr launch --model $ALIAS --permission-mode acceptEdits -p ... --max-turns 
 CHILD=$!
 sleep 1
 PGID=$(pgid_of "$CHILD")
+CHILD_IDENTITY=$(proc_identity "$CHILD")
 if [ "$PGID" != "$CHILD" ]; then
   if kill -0 "$CHILD" 2>/dev/null; then
-    kill -KILL -- "-$CHILD" 2>/dev/null; kill -KILL "$CHILD" 2>/dev/null; wait "$CHILD" 2>/dev/null   # pgid == pid by construction
+    pgid_is_signalable "$CHILD" "$CHILD" && kill -KILL -- "-$CHILD" 2>/dev/null   # pgid == pid by construction, verified
+    kill -KILL "$CHILD" 2>/dev/null; wait "$CHILD" 2>/dev/null
     echo "$(elapsed)s LAUNCH: process group of pid $CHILD could not be read (got '$PGID'); child killed" >> "$PREFIX.progress"
     printf 'outcome=UNCONFIRMED-CANCEL\nbackend=ccr\nmode=implement\nalias=%s\npid=%s\npgid=unknown\nbranch=%s\nworktree=%s\nlast_error=process group unreadable\ncancel_confirmed=no\n' "$ALIAS" "$CHILD" "$BRANCH" "$WT" > "$PREFIX.meta"
     : > "$PREFIX.stdout"; echo 5 > "$PREFIX.exit"; echo "implement-run.sh: process group unreadable; child killed (exit 5)" >&2; exit 5
@@ -206,9 +237,17 @@ while :; do
 done
 UNCONFIRMED_CANCEL=0
 if [ "$OUTCOME" = STALLED ] || [ "$OUTCOME" = TIMEOUT ]; then
-  if kill_group "$PGID"; then echo "$(elapsed)s $OUTCOME → process group $PGID terminated (confirmed: no member left)" >> "$PREFIX.progress"
+  if kill_group "$PGID" "$CHILD" "$CHILD_IDENTITY"; then echo "$(elapsed)s $OUTCOME → process group $PGID terminated (confirmed: no member left)" >> "$PREFIX.progress"
   else UNCONFIRMED_CANCEL=1; echo "$(elapsed)s $OUTCOME → cancel of process group $PGID NOT confirmed; a process may still be running" >> "$PREFIX.progress"
     echo "implement-run.sh: cancel of process group $PGID not confirmed; DO NOT retry — check with: ps -o pid,pgid,command -g $PGID" >&2; fi
+fi
+if [ "$UNCONFIRMED_CANCEL" = 1 ]; then
+  # The child may still edit the worktree. Do not wait indefinitely, parse a
+  # changing result, or stage/commit its files while cancellation is unresolved.
+  printf 'outcome=UNCONFIRMED-CANCEL\nbackend=ccr\nmode=implement\nalias=%s\npid=%s\npgid=%s\nbranch=%s\nworktree=%s\nchild_exit=unknown\nlauncher_commit=not_attempted\ncancel_confirmed=no\n' "$ALIAS" "$CHILD" "$PGID" "$BRANCH" "$WT" > "$PREFIX.meta"
+  : > "$PREFIX.stdout"
+  echo 5 > "$PREFIX.exit"
+  exit 5
 fi
 wait "$CHILD" 2>/dev/null; CHILD_RC=$?
 SESSION_ID=$(stream_field "$PREFIX.joblog" init-session); HAS_RESULT=$(stream_field "$PREFIX.joblog" has-result)

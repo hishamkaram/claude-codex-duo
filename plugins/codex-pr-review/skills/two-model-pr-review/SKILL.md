@@ -71,6 +71,10 @@ must resolve; both must restate the brief's own Target section, which is the
 frozen record of what Codex reviewed), and whether the index differs from the
 working tree.
 
+CCR currently supports fresh detached jobs in this runner. Its resume options fail before
+admission. Record `continuity=unavailable` and explicitly choose a self-contained `--fresh`
+exchange when using CCR in Phases 4 and 6; see codex-protocol.md. Codex resume is unchanged.
+
 ## Participants
 
 `--via` names the blind second-model reviewers: `codex` (default) or a comma list of
@@ -172,11 +176,11 @@ whose owner file carries that token (`<prefix>.claim/runner`, an atomic mkdir)
 before it writes anything at all, and a missing, replaced or already-taken
 claim, or an invalid argument, exits 4 with a stderr message and no sidecar.
 Creating or rotating a claim and taking one are serialized by
-`<prefix>.claim.lock` (an atomic mkdir held for milliseconds by the gate, and by
-the runner until it has rotated the previous attempt's sidecars away; one older
-than a minute is reclaimed), so a runner can never take a claim the gate is
-rotating out from under it, and a stale `.exit` can never make a gate treat a
-just-started runner's claim as finished.
+`<prefix>.claim.lock`, a persistent kernel-lock file held during admission and
+collection. The operating system releases ownership when the owning descriptors
+close; no PID or age inference authorizes reclamation. Never delete the file,
+which would split contenders across different lock inodes. Legacy directory locks
+must be drained with the previous runner before upgrade.
 While a runner holds a claim and has not written `<prefix>.exit`, every later
 gate refuses to advance, whatever the phase's `.md` says. **The claim a runner took is the one record of
 a launch.** The four-launch budget counts runner-taken claims (the live one
@@ -188,17 +192,23 @@ deleted claim). A claim is in flight while its runner has started
 younger than the ten-minute handoff grace window
 (`PHASE_GATE_CLAIM_GRACE_SEC`; a directory with no owner file yet counts).
 There are no process-liveness heuristics in the launch gates. Past the grace
-window an unstarted claim is reclaimed; a started claim whose runner died
-without writing `.exit` is recovered only by
-`phase-gate.sh release "$ART" <prefix>` (prefix `02-p<k>`, `04-consultation` or
-`06-resolution`), which refuses while the runner pid or any descendant is alive; for a
-finished exit-5 attempt, `phase-gate.sh confirm-terminated "$ART" <prefix>` is the separate
-operator action: it appends a read-only resolution receipt only after the same liveness proof
-succeeds, never removes the exit-5 sidecars, and refuses an unreadable process group. For a
-codex attempt, while `.progress` names a job the codex plugin reports running
-(failing closed if the plugin cannot be found); for a ccr attempt, while the
-recorded process group (`pgid=` on the launch line) has any member — a launch
-line without `pgid=` is refused, and the companion is never consulted — then
+window an unstarted claim is reclaimed. A claim whose attempt is DETACHED —
+`<prefix>.detached` present and no `.exit`, the runner's exit 6 — is in flight
+whatever its age: the job may still be running and still spending tokens, so the
+gate refuses to advance and the normal recovery is the `attach_command` the
+record carries (never a relaunch, which would start a second job against the
+live one). `release` refuses until its backend positively establishes the workload stopped.
+For CCR, terminal status alone is insufficient: exit evidence, known cleanup coverage and
+no observed survivors are required. Partial coverage remains visible. The saved private
+admission context selects the CCR job store; neither PIDs nor a process search grants control.
+An unknown admission retains its claim. Attach can recover a collector that died immediately
+after receiving its receipt. A missing receipt requires investigation, never automatic retry.
+For a Codex attempt, the companion must report a terminal job.
+
+`phase-gate.sh release "$ART" <prefix>` also refuses a live runner. For a finished historical
+exit-5 attempt, `confirm-terminated` appends a read-only resolution receipt only after positive
+backend proof, preserving the raw sidecars. Legacy CCR PID-only records cannot supply that
+proof; drain them with their original runner before upgrading. Successful release
 rotates the claim to spent, where it still counts as a launch. Never remove a claim
 directory by hand. The next launch rotates any orphaned `.progress`/`.stderr`
 aside as `attemptN.*`. The gate refuses an eleventh launch of one phase. Launch

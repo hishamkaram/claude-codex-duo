@@ -71,6 +71,11 @@ for r in plugins/*/scripts/codex-run.sh; do
   cmp -s "$REF" "$r" && note ok "$r identical to $REF" || note FAIL "$r differs from $REF (the runner is shared by copy; keep the copies byte-identical)"
 done
 
+REF=plugins/codex-pr-review/scripts/ccr-job.py
+for r in plugins/*/scripts/ccr-job.py; do
+  cmp -s "$REF" "$r" && note ok "$r shared CCR protocol" || note FAIL "$r differs from $REF"
+done
+
 echo "4b2. review-workflow.js constants are generated from review_common.py (gen-workflow-constants.py --check)"
 python3 plugins/codex-pr-review/skills/two-model-pr-review/scripts/gen-workflow-constants.py --check >/dev/null 2>&1 && note ok "workflow constants match review_common.py" || note FAIL "review-workflow.js constants differ from review_common.py: run scripts/gen-workflow-constants.py --write"
 

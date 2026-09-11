@@ -13,6 +13,10 @@ D=plugins/codex-debate/scripts/codex-run.sh
 P=plugins/codex-deep-plan/scripts/codex-run.sh
 DS=plugins/codex-deep-plan/skills/deep-plan-duo/scripts
 FAIL=0
+lock_free() {
+  python3 -c 'import fcntl,sys; f=open(sys.argv[1],"a"); fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)' "$1" 2>/dev/null
+}
+PG=plugins/codex-pr-review/skills/two-model-pr-review/scripts/phase-gate.sh
 # The gate counts launches by runner-taken claims and refuses sidecars without
 # one (round-32 debate). Fixtures below write attempt sidecars directly, so a
 # gate call through pgw first tops up runner-taken spent claims to the number of
@@ -55,6 +59,32 @@ fixture_prov() {  # what Phase 3 writes beside the matrix: one raiser row per or
   [ -e "$1/03-matrix.tsv" ] && [ ! -e "$1/03-provenance.tsv" ] || return 0
   awk -F'\t' '$2=="BOTH"||$2=="CONFLICT"{printf "%s\tlead\tCL-%02d\n%s\tp1\tCX-%02d\n",$1,NR,$1,NR; next} $2=="CLAUDE-ONLY"{printf "%s\tlead\tCL-%02d\n",$1,NR; next} $2=="CODEX-ONLY"{printf "%s\tp1\tCX-%02d\n",$1,NR}' "$1/03-matrix.tsv" > "$1/03-provenance.tsv"
 }
+# No group signal fallback is allowed from saved fixture metadata. An uncertain
+# owner remains uncertain in test teardown; finite fixtures expire on their own.
+# The PER-PID form of the same trap, and the one this suite actually fell into. POSIX kill(2) gives
+# pid 0 the meaning "every process in the SENDER's process group" — the invoking shell, validate.sh
+# and every sibling job in that terminal — and pid -1 "every process this user may signal". So
+# `kill -KILL "${VAR:-0}"` is a session-wide kill wearing a per-pid disguise, and the value it
+# defaults from is read out of a sidecar that need not contain it: a LAUNCH-ERROR `.meta` carries
+# no `pid=` at all, so one failed fixture launch turns a teardown into `kill -KILL 0`
+# (cycle 5: CL-01/CX-01, reproduced). The remaining read-only probe rejects invalid PID values. Fixture teardown
+# uses private cooperative stop files and never signals a saved PID.
+pid_alive() {  # <pid> -> 0 only when a plausible, non-sentinel pid is running
+  case "${1:-}" in ''|*[!0-9]*) return 1;; esac
+  [ "$1" -ge 2 ] 2>/dev/null || return 1
+  kill -0 "$1" 2>/dev/null
+}
+# Group liveness, asked by READING the process table. `kill -0 -- "-N"` sends nothing, but it is
+# still a group-negative kill with a group-negative kill's blind spots: for N=1 it is a permission
+# probe against every process this user owns, and it answers "alive" for a group that never
+# existed — so an assertion written on it can pass on a machine-wide answer instead of the job's.
+# Returns 1 (no members) for empty, non-numeric, 0 and 1, which is the safe direction for a suite
+# whose assertions read "the group was killed" (cycle 4: the S-08 sweep).
+group_has_members() {  # <pgid>
+  case "${1:-}" in ''|*[!0-9]*) return 1;; esac
+  [ "$1" -ge 2 ] 2>/dev/null || return 1
+  [ -n "$(ps -o pid= -g "$1" 2>/dev/null | tr -d ' \n')" ]
+}
 pgw() { [ -d "${2:-}" ] && { top_up_claims "$2"; fixture_revs "$2"; fixture_prov "$2"; }; bash "$PG" "$@"; }
 pgwg() { local g="$1"; shift; [ -d "${2:-}" ] && { top_up_claims "$2"; fixture_revs "$2"; fixture_prov "$2"; }; PHASE_GATE_CLAIM_GRACE_SEC="$g" bash "$PG" "$@"; }
 chk() {
@@ -92,12 +122,14 @@ mkdir -p "$TMP/nohome"; PFX4="$TMP/cx04r15"
 HOME="$TMP/nohome" bash "$R" "$PFX4" --prompt-file "$PROMPT" >/dev/null 2>&1; rc=$?
 [ "$rc" = 4 ] && grep -q '^outcome=LAUNCH-ERROR' "$PFX4.meta" 2>/dev/null && [ "$(cat "$PFX4.exit")" = 4 ] && printf '  ok    %-42s\n' "CX-04r15: missing plugin writes .meta + .exit=4" || { printf '  FAIL  CX-04r15: rc=%s meta=%s\n' "$rc" "$(cat "$PFX4.meta" 2>/dev/null)"; FAIL=1; }
 HOME="$TMP/nohome" bash "$R" "$PFX4" --prompt-file "$PROMPT" >/dev/null 2>&1
-# CX-01r26: a runner killed after launching leaves only .progress/.stderr; the next
-# launch rotates that orphan as a unit instead of truncating it, and the runner
-# records its own pid in the gate's claim so the gate can tell it is alive.
+# Unknown legacy progress cannot establish termination or authorize a new launch.
 PFX5="$TMP/runner-orphan"; printf '10s launched job=orphan\n' > "$PFX5.progress"; mkdir -p "$PFX5.claim"; printf 'pid=1\nat=now\ngate=pre-codex\n' > "$PFX5.claim/owner"
+cp "$PFX5.progress" "$TMP/orphan-progress.before"; cp "$PFX5.claim/owner" "$TMP/orphan-owner.before"
+HOME="$TMP/nohome" bash "$R" "$PFX5" --prompt-file "$PROMPT" >/dev/null 2>&1; rc=$?
+[ "$rc" = 4 ] && cmp -s "$PFX5.progress" "$TMP/orphan-progress.before" && cmp -s "$PFX5.claim/owner" "$TMP/orphan-owner.before" && [ ! -e "$PFX5.exit" ] && [ ! -e "$PFX5.attempt1.progress" ] && [ ! -e "$PFX5.claim/runner" ] && printf '  ok    %-42s\n' "unknown legacy attempt retained without admission" || { printf '  FAIL  unknown legacy attempt changed\n'; FAIL=1; }
+# Claim stamping is tested on a separate fresh attempt, with no uncertain work.
+PFX5="$TMP/runner-fresh-claim"; mkdir -p "$PFX5.claim"; printf 'pid=1\nat=now\ngate=pre-codex\n' > "$PFX5.claim/owner"
 HOME="$TMP/nohome" bash "$R" "$PFX5" --prompt-file "$PROMPT" >/dev/null 2>&1
-grep -q 'job=orphan' "$PFX5.attempt1.progress" 2>/dev/null && [ -s "$PFX5.exit" ] && printf '  ok    %-42s\n' "CX-01r26: orphaned .progress rotated, not truncated" || { printf '  FAIL  CX-01r26: orphaned .progress was not rotated\n'; FAIL=1; }
 grep -q '^runner_pid=[0-9]' "$PFX5.claim/owner" && grep -q '^started=' "$PFX5.claim/owner" && printf '  ok    %-42s\n' "CX-01r26: runner stamps its pid into the claim" || { printf '  FAIL  CX-01r26: claim not stamped by runner\n'; FAIL=1; }
 # CX-02r28: one claim authorizes one runner; a second runner on a stamped claim refuses (exit 4).
 cp "$PFX5.exit" "$TMP/pfx5-exit.bak"
@@ -128,23 +160,34 @@ printf 'pid=1\ntoken=t1\n' > "$PFX7.claim/owner"
 PFX7L="$TMP/claimlegacy/02-p1"; mkdir -p "$PFX7L.claim"; printf 'pid=1\ntoken=t9\n' > "$PFX7L.claim/owner"
 HOME="$TMP/nohome" bash "$R" "$PFX7L" --prompt-file "$PROMPT" >/dev/null 2>&1
 [ -d "$PFX7L.claim/runner" ] && grep -q '^runner_pid=' "$PFX7L.claim/owner" && printf '  ok    %-42s\n' "L-02r37: legacy runner takes a token-bearing claim" || { printf '  FAIL  L-02r37: legacy runner did not take the claim\n'; FAIL=1; }
-# CX-03r38: the runner takes the claim under <prefix>.claim.lock; a stale lock is reclaimed, a held one refused.
-mkdir "$PFX7.claim.lock"; touch -t 202001010000 "$PFX7.claim.lock"
-chk "CX-03r38: runner reclaims a stale claim lock" 4 "does not carry token t2" bash "$R" "$PFX7" --claim t2 --prompt-file "$PROMPT"
-[ ! -e "$PFX7.claim.lock" ] && printf '  ok    %-42s\n' "CX-03r38: runner releases the claim lock" || { printf '  FAIL  CX-03r38: runner left the claim lock\n'; FAIL=1; }
-mkdir "$PFX7.claim.lock"
-chk "CX-03r38: runner refuses a held claim lock" 4 "claim.lock is held" bash "$R" "$PFX7" --claim t1 --prompt-file "$PROMPT"
+# Legacy directory locks fail closed; kernel lock files persist after unlock.
+rm -f "$PFX7.claim.lock"; mkdir "$PFX7.claim.lock"; touch -t 202001010000 "$PFX7.claim.lock"
+chk "collector: legacy directory lock refused" 4 "legacy collector lock" bash "$R" "$PFX7" --claim t2 --prompt-file "$PROMPT"
 rmdir "$PFX7.claim.lock"
-# CL-01r42: a stale lock that cannot be removed (non-empty) is bounded like a held one, never a busy loop.
-mkdir -p "$PFX7.claim.lock/stray"; touch -t 202001010000 "$PFX7.claim.lock"
-chk "CL-01r42: unremovable stale lock exits 4, no hang" 4 "cannot be removed" bash "$R" "$PFX7" --claim t1 --prompt-file "$PROMPT"
+chk "collector: unlocked file permits token validation" 4 "does not carry token t2" bash "$R" "$PFX7" --claim t2 --prompt-file "$PROMPT"
+lock_free "$PFX7.claim.lock" && printf '  ok    collector lock released after argument refusal\n' || { printf '  FAIL  collector lease left held\n'; FAIL=1; }
+rm -f "$PFX7.claim.lock"; mkdir -p "$PFX7.claim.lock/stray"
+chk "collector: unknown legacy lock contents refused" 4 "legacy collector lock" bash "$R" "$PFX7" --claim t1 --prompt-file "$PROMPT"
 rm -rf "$PFX7.claim.lock"
 # CX-01r39: the runner keeps the claim lock until the previous attempt's sidecars are rotated,
 # so a stale <prefix>.exit cannot let a concurrent gate rotate the live claim.
 PFX8="$TMP/claimrot/02-p1"; mkdir -p "$TMP/claimrot/bin" "$PFX8.claim"; printf 'pid=1\ntoken=t8\n' > "$PFX8.claim/owner"; printf '1\n' > "$PFX8.exit"; printf 'old\n' > "$PFX8.stdout"
-printf '#!/bin/sh\ncase "$1" in *.exit) [ -d "%s.claim.lock" ] && : > "%s/lock-held";; esac\nexec /bin/mv "$@"\n' "$PFX8" "$TMP/claimrot" > "$TMP/claimrot/bin/mv"; chmod +x "$TMP/claimrot/bin/mv"
+cat > "$TMP/claimrot/bin/mv" <<'SH'
+#!/bin/sh
+case "$1" in *.exit)
+python3 - "$1" <<'PYLOCK'
+import fcntl,pathlib,sys
+prefix=sys.argv[1][:-5]
+with open(prefix+'.claim.lock','a') as f:
+    try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError: pathlib.Path(prefix).parent.joinpath('lock-held').touch()
+PYLOCK
+;; esac
+exec /bin/mv "$@"
+SH
+chmod +x "$TMP/claimrot/bin/mv"
 PATH="$TMP/claimrot/bin:$PATH" HOME="$TMP/nohome" bash "$R" "$PFX8" --claim t8 --prompt-file "$PROMPT" >/dev/null 2>&1
-[ -e "$TMP/claimrot/lock-held" ] && [ -e "$PFX8.attempt1.exit" ] && [ ! -e "$PFX8.claim.lock" ] && printf '  ok    %-42s\n' "CX-01r39: lock held through sidecar rotation, then released" || { printf '  FAIL  CX-01r39: lock-held=%s rotated=%s lock-left=%s\n' "$([ -e "$TMP/claimrot/lock-held" ] && echo y || echo n)" "$([ -e "$PFX8.attempt1.exit" ] && echo y || echo n)" "$([ -e "$PFX8.claim.lock" ] && echo y || echo n)"; FAIL=1; }
+[ -e "$TMP/claimrot/lock-held" ] && [ -e "$PFX8.attempt1.exit" ] && lock_free "$PFX8.claim.lock" && printf '  ok    collector lock held through rotation and then released\n' || { printf '  FAIL  collector rotation lease\n'; FAIL=1; }
 [ ! -e "$PFX7.exit" ] && [ ! -d "$PFX7.claim/runner" ] && printf '  ok    %-42s\n' "claim mode: argument errors leave no .exit and do not take the claim" || { printf '  FAIL  claim mode: side effect on argument error\n'; FAIL=1; }
 chk "no claim mode: argument error still records .exit" 4 "unknown arg" bash "$R" "$TMP/claimmode/legacy" --bogus --prompt-file "$PROMPT"
 # CX-03r33: "--claim" inside a value is not the flag.
@@ -187,13 +230,18 @@ chk "oversized --max-min rejected" 4 "between 1 and"  bash "$R" "$PFX" --max-min
 
 echo "runner: ccr backend (hermetic fake ccr on PATH)"
 # The fake gateway: `version`, `model show <alias> --json`, `launch …`. Behaviour is chosen by
-# FAKE_CCR_MODE (ok|write|fail|noresult|sleep|grandchild); argv and stdin are recorded so a test
+# FAKE_CCR_MODE (ok|write|fail|noresult|sleep|slowok|grandchild); argv and stdin are recorded so a test
 # can assert the exact read-only launch line the runner is required to use.
+export FAKE_CCR_JOBS_SCRIPT="$PWD/scripts/fake-ccr-jobs.py"
+export FAKE_CCR_STORE="$TMP/ccr-store"
 CCRBIN="$TMP/ccrbin"; mkdir -p "$CCRBIN"
 cat > "$CCRBIN/ccr" <<'FAKE'
 #!/bin/bash
+if [ "${1:-}" = status ] || [ "${1:-}" = cancel ] || { [ "${1:-}" = launch ] && printf '%s\n' "$@" | grep -qx -- --detach; }; then
+  exec python3 "$FAKE_CCR_JOBS_SCRIPT" "$@"
+fi
 case "${1:-}" in
-  version) echo "ccr ${FAKE_CCR_VERSION:-0.4.11} (fake, test-args.sh)"; exit 0;;
+  version) echo "ccr ${FAKE_CCR_VERSION:-0.5.1} (fake, test-args.sh)"; exit 0;;
   model)
     [ "${2:-}" = show ] || { echo "fake ccr: unsupported model subcommand" >&2; exit 2; }
     [ -z "${FAKE_CCR_SHOW_FAIL:-}" ] || { echo "model alias not found: $3" >&2; exit 1; }
@@ -213,7 +261,10 @@ case "${1:-}" in
       write) echo hello > smoke-write.txt;;
       fail) printf '{"type":"assistant","message":{"content":[{"type":"text","text":"boom"}]}}\n'; echo "waiting for Claude Code: exit status 1" >&2; exit 1;;
       noresult) printf '{"type":"assistant","message":{"content":[{"type":"text","text":"partial"}]}}\n'; exit 0;;
-      sleep) sleep 600; exit 0;;
+      sleep) sleep 120; exit 0;;
+      # Outlives a short watch bound and then finishes on its own, so a detached job can be
+      # attached to and collected — the whole point of exit 6.
+      slowok) sleep "${FAKE_CCR_SLEEP:-75}";;
       grandchild) sleep 600 & sleep 600; exit 0;;
     esac
     printf '{"type":"assistant","message":{"content":[{"type":"text","text":"working"}]}}\n'
@@ -224,7 +275,11 @@ esac
 FAKE
 chmod +x "$CCRBIN/ccr"
 CCRD="$TMP/ccrrun"; mkdir -p "$CCRD"; CP="$CCRD/02-p2"
-mkdir -p "$TMP/ccrerr"; sed 's/"subtype":"success","is_error":false/"subtype":"error_max_turns","is_error":true/' "$CCRBIN/ccr" > "$TMP/ccrerr/ccr"; chmod +x "$TMP/ccrerr/ccr"   # a fake whose result event is an error (review round 1: F-10)
+mkdir -p "$TMP/ccrerr"; sed 's/"subtype":"success","is_error":false/"subtype":"error_max_turns","is_error":true/' "$CCRBIN/ccr" > "$TMP/ccrerr/ccr"; python3 - "$TMP/ccrerr/ccr" <<'PYFIX'
+import pathlib,sys
+p=pathlib.Path(sys.argv[1]); p.write_text(p.read_text().replace('exec python3 "$FAKE_CCR_JOBS_SCRIPT"', 'FAKE_CCR_MODE=error_result exec python3 "$FAKE_CCR_JOBS_SCRIPT"'))
+PYFIX
+chmod +x "$TMP/ccrerr/ccr"   # a fake whose result event is an error (review round 1: F-10)
 ccr_run() { PATH="$CCRBIN:$PATH" bash "$R" "$@"; }
 # T-1 / T-2: argument errors, exit 4 and .exit=4 on a claim-less prefix
 chk "T-1: --via without a value"          4 "requires a value"      bash "$R" "$CP" --via
@@ -244,7 +299,7 @@ out=$(PATH="$NOCCR" bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT" 2>&1); r
 [ "$rc" = 4 ] && grep -q 'ccr not found' "$CP.stderr" && grep -q '^outcome=LAUNCH-ERROR' "$CP.meta" && grep -q '^backend=ccr' "$CP.meta" && [ "$(cat "$CP.exit")" = 4 ] && printf '  ok    %-42s\n' "T-3: ccr missing → LAUNCH-ERROR sidecars" || { printf '  FAIL  T-3: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
 rm -f "$CP".*
 # T-4 / T-5 / T-6: the probe — version gate, model show, happy path with JSON and the smoke record
-chk "T-4: ccr below minimum refused"      4 "requires ccr >= 0.4.11" env PATH="$CCRBIN:$PATH" FAKE_CCR_VERSION=0.4.10 bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT"
+chk "T-4: ccr below minimum refused"      4 "requires ccr >= 0.5.1" env PATH="$CCRBIN:$PATH" FAKE_CCR_VERSION=0.4.10 bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT"
 chk "T-4: probe below minimum"            1 "PROBE UNAVAILABLE"     env PATH="$CCRBIN:$PATH" FAKE_CCR_VERSION=0.4.10 bash "$R" --probe --via ccr:x
 chk "T-5: model show failing"             1 "PROBE UNAVAILABLE"     env PATH="$CCRBIN:$PATH" FAKE_CCR_SHOW_FAIL=1 bash "$R" --probe --via ccr:x
 chk "T-5: supports_tools false"           1 "supports_tools=false"  env PATH="$CCRBIN:$PATH" FAKE_CCR_TOOLS=false bash "$R" --probe --via ccr:x
@@ -258,16 +313,16 @@ rm -f "$CP".*
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=write bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
 [ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'readonly=violated' && printf '%s' "$out" | grep -q 'smoke-write.txt' && [ ! -e "$CCRD/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "T-5b: writing smoke → readonly=violated, no record" || { printf '  FAIL  T-5b: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=fail bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
-[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'smoke launch exited 1' && [ ! -e "$CCRD/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "T-5b: failing smoke launch → UNAVAILABLE" || { printf '  FAIL  T-5b(fail): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'unsuccessful workload result' && [ ! -e "$CCRD/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "T-5b: failing smoke launch → UNAVAILABLE" || { printf '  FAIL  T-5b(fail): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
 # T-5c: launch gate — no record ⇒ exit 4 and nothing launched
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv-none" bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT" 2>&1); rc=$?
 [ "$rc" = 4 ] && grep -q 'ccr smoke missing for x' "$CP.stderr" && [ ! -e "$TMP/argv-none" ] && printf '  ok    %-42s\n' "T-5c: launch without a smoke record refused" || { printf '  FAIL  T-5c: rc=%s stderr=%s\n' "$rc" "$(head -2 "$CP.stderr" 2>/dev/null | tr '\n' ' ')"; FAIL=1; }
 rm -f "$CP".*
 # T-6: probe happy path records the smoke and prints the JSON
 out=$(PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
-[ "$rc" = 0 ] && printf '%s' "$out" | grep -q '^PROBE SUCCEEDED backend=ccr alias=x provider=litellm model=claude-haiku-4-5 compatibility=degraded tools=true readonly=verified ccr=0.4.11' && printf '%s' "$out" | grep -q '"schema_version"' && grep -qx 'alias=x' "$CCRD/.ccr-smoke.x" && grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" && grep -qx 'ccr=0.4.11' "$CCRD/.ccr-smoke.x" && grep -qx 'claude_model_id=anthropic.ccr.x' "$CCRD/.ccr-smoke.x" && grep -qx 'child_model=anthropic.ccr.x' "$CCRD/.ccr-smoke.x" && grep -q '^launch_sha256=' "$CCRD/.ccr-smoke.x" && printf '  ok    %-42s\n' "T-6: probe SUCCEEDED + JSON + smoke record" || { printf '  FAIL  T-6: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q '^PROBE SUCCEEDED backend=ccr alias=x provider=litellm model=claude-haiku-4-5 compatibility=degraded tools=true readonly=verified ccr=0.5.1' && printf '%s' "$out" | grep -q '"schema_version"' && grep -qx 'alias=x' "$CCRD/.ccr-smoke.x" && grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" && grep -qx 'ccr=0.5.1' "$CCRD/.ccr-smoke.x" && grep -qx 'claude_model_id=anthropic.ccr.x' "$CCRD/.ccr-smoke.x" && grep -qx 'child_model=anthropic.ccr.x' "$CCRD/.ccr-smoke.x" && grep -q '^launch_sha256=' "$CCRD/.ccr-smoke.x" && printf '  ok    %-42s\n' "T-6: probe SUCCEEDED + JSON + smoke record" || { printf '  FAIL  T-6: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
 # T-5c (continued): a record for another version or a violated record refuses the launch
-sed 's/^ccr=0.4.11$/ccr=0.4.10/; s/^alias=x$/alias=y/; s/^claude_model_id=anthropic.ccr.x$/claude_model_id=anthropic.ccr.y/; s/^child_model=anthropic.ccr.x$/child_model=anthropic.ccr.y/' "$CCRD/.ccr-smoke.x" > "$CCRD/.ccr-smoke.y"
+sed 's/^ccr=0.5.1$/ccr=0.4.10/; s/^alias=x$/alias=y/; s/^claude_model_id=anthropic.ccr.x$/claude_model_id=anthropic.ccr.y/; s/^child_model=anthropic.ccr.x$/child_model=anthropic.ccr.y/' "$CCRD/.ccr-smoke.x" > "$CCRD/.ccr-smoke.y"
 chk "T-5c: record from another ccr version" 4 "another ccr version" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-py" --via ccr:y --prompt-file "$PROMPT"
 sed 's/^readonly=verified/readonly=violated/; s/^alias=x$/alias=z/; s/^claude_model_id=anthropic.ccr.x$/claude_model_id=anthropic.ccr.z/; s/^child_model=anthropic.ccr.x$/child_model=anthropic.ccr.z/' "$CCRD/.ccr-smoke.x" > "$CCRD/.ccr-smoke.z"
 chk "T-5c: violated record"               4 "not 'readonly=verified'" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-pz" --via ccr:z --prompt-file "$PROMPT"
@@ -287,8 +342,9 @@ chmod 700 "$CCRD/ro"
 chk "F-05: --record-dir that is not a directory" 1 "is not a directory" env PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/nonexistent"
 # review round 1 F-04: a smoke that never returns is killed as a group and reported UNAVAILABLE within the bound
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=grandchild CODEX_RUN_SMOKE_MAX_SEC=3 bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
-SPG=$(printf '%s' "$out" | sed -n 's/.*smoke timed out after 3s (process group \([0-9][0-9]*\) terminated).*/\1/p' | head -1)
-[ "$rc" = 1 ] && [ -n "$SPG" ] && ! kill -0 -- "-$SPG" 2>/dev/null && [ -z "$(pgrep -g "$SPG" 2>/dev/null)" ] && printf '  ok    %-42s\n' "F-04: hung smoke → UNAVAILABLE, group killed" || { printf '  FAIL  F-04: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; [ -n "$SPG" ] && pkill -g "$SPG" 2>/dev/null; FAIL=1; }
+SJOB=$(printf '%s' "$out" | sed -n 's/.*(job \(ccr-[a-z0-9-]*\) cancelled by its owner.*/\1/p' | head -1)
+[ "$rc" = 1 ] && [ -n "$SJOB" ] && PATH="$CCRBIN:$PATH" ccr status "$SJOB" --json | python3 -c 'import json,sys; r=json.load(sys.stdin); assert r["status"]=="cancelled" and r["cleanup"]["survivors"]==[]' \
+  && printf '  ok    %-42s\n' "F-04: hung smoke cancelled by owner" || { printf '  FAIL  F-04: rc=%s out=%s\n' "$rc" "$out"; FAIL=1; }
 grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" && printf '  ok    %-42s\n' "F-04: the earlier record survives a failed re-probe" || { printf '  FAIL  F-04: record clobbered\n'; FAIL=1; }
 # review round 2 F-03: the smoke bound must be a positive whole number, or the probe refuses before launching anything
 chk "F-03: CODEX_RUN_SMOKE_MAX_SEC=abc → UNAVAILABLE" 1 "positive whole number" env PATH="$CCRBIN:$PATH" CODEX_RUN_SMOKE_MAX_SEC=abc bash "$R" --probe --via ccr:x --record-dir "$CCRD"
@@ -301,55 +357,72 @@ out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=outside bash "$R" --probe --via ccr:x -
 [ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'readonly=violated' && printf '%s' "$out" | grep -q 'smoke-outside.txt' && [ ! -e "$CCRD/outside/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "F-06: write outside the smoke repo → violated" || { printf '  FAIL  F-06: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | tail -1)"; FAIL=1; }
 # F-10 (probe): a smoke whose result event is an error is not readonly=verified
 out=$(PATH="$TMP/ccrerr:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD/dp" 2>&1); rc=$?
-[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'smoke result is an error event (error_max_turns' && [ ! -e "$CCRD/dp/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "F-10: error result in the smoke → UNAVAILABLE" || { printf '  FAIL  F-10(probe): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'unsuccessful workload result' && [ ! -e "$CCRD/dp/.ccr-smoke.x" ] && printf '  ok    %-42s\n' "F-10: error result in the smoke → UNAVAILABLE" || { printf '  FAIL  F-10(probe): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
 rm -f "$CCRD/02-py".* "$CCRD/02-pz".* "$CCRD/.ccr-smoke.y" "$CCRD/.ccr-smoke.z"
-# T-7: happy path — exact argv, stdin = prompt, sidecars, thread = session id, last-session file
-printf 'review this\n' > "$CCRD/prompt.md"
-out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv7" FAKE_CCR_STDIN_OUT="$TMP/stdin7" FAKE_CCR_SESSION=sess-7 bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
-WANT_ARGV="$(printf '%s\n' --model x --permission-mode plan -p --no-lifecycle --no-statusline -- --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' --disallowedTools Write,Edit,MultiEdit,NotebookEdit,Agent --max-turns 100)"
-[ "$rc" = 0 ] && [ "$(cat "$TMP/argv7")" = "$WANT_ARGV" ] && cmp -s "$TMP/stdin7" "$CCRD/prompt.md" && [ "$(cat "$CP.exit")" = 0 ] && grep -q '^outcome=COMPLETED' "$CP.meta" && grep -q '^backend=ccr' "$CP.meta" && grep -q '^thread=sess-7' "$CP.meta" && grep -q '^alias=x' "$CP.meta" && grep -q '^provider=litellm' "$CP.meta" && grep -q '^claude_model_id=anthropic.ccr.x' "$CP.meta" && grep -q '^routed_model=anthropic.ccr.x' "$CP.meta" && grep -q '^route_identity=yes' "$CP.meta" && grep -q '^pgid=[0-9]' "$CP.meta" && grep -q '"type":"result"' "$CP.joblog" && grep -q '^DONE ' "$CP.stdout" && [ "$(cat "$CCRD/.ccr-last-session")" = sess-7 ] && grep -q 'launched backend=ccr pid=[0-9]* pgid=[0-9]* alias=x' "$CP.progress" && printf '  ok    %-42s\n' "T-7: ccr happy path, exact argv, sidecars" || { printf '  FAIL  T-7: rc=%s out=%s argv=%s\n' "$rc" "$(printf '%s' "$out" | head -1)" "$(tr '\n' ' ' < "$TMP/argv7" 2>/dev/null)"; FAIL=1; }
-# A generated child ID belongs to CCR's route contract. A mismatch is unavailable,
-# never an excuse to select the provider model or a different alias.
-out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_CHILD_MODEL=anthropic.ccr.wrong FAKE_CCR_ARGV_OUT="$TMP/argv-route-bad" bash "$R" "$CCRD/02-route-bad" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
-[ "$rc" = 4 ] && grep -q '^outcome=UNAVAILABLE' "$CCRD/02-route-bad.meta" && grep -q '^route_identity=no' "$CCRD/02-route-bad.meta" && grep -q 'CCR route identity mismatch' "$CCRD/02-route-bad.stderr" && [ "$(grep -c '^--model$' "$TMP/argv-route-bad")" = 1 ] && grep -qx 'x' "$TMP/argv-route-bad" && printf '  ok    %-42s\n' "T-7: child route mismatch → UNAVAILABLE, no fallback" || { printf '  FAIL  T-7(route mismatch): rc=%s meta=%s\n' "$rc" "$(grep -E '^(outcome|route_identity)=' "$CCRD/02-route-bad.meta" 2>/dev/null | tr '\n' ' ')"; FAIL=1; }
-# T-8: resume semantics
-out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8" bash "$R" "$CP" --via ccr:x --resume-last --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
-[ "$rc" = 0 ] && grep -qx -- '--resume' "$TMP/argv8" && grep -qx 'sess-7' "$TMP/argv8" && grep -q 'resume:sess-7' "$CP.stdout" && [ -e "$CP.attempt1.meta" ] && printf '  ok    %-42s\n' "T-8: --resume-last passes --resume <last session>" || { printf '  FAIL  T-8(resume-last): rc=%s\n' "$rc"; FAIL=1; }
-out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8b" bash "$R" "$CP" --via ccr:x --resume-session s2 --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
-[ "$rc" = 0 ] && grep -qx 's2' "$TMP/argv8b" && grep -q 'resume:s2' "$CP.stdout" && printf '  ok    %-42s\n' "T-8: --resume-session passes --resume <id>" || { printf '  FAIL  T-8(resume-session): rc=%s\n' "$rc"; FAIL=1; }
-# review round 1 F-01: an explicit resume is its own mode, recorded for the gates
-grep -qx 'mode=--resume-session' "$CP.meta" && grep -qx 'resume_session=s2' "$CP.meta" && grep -qx 'thread=s2' "$CP.meta" && printf '  ok    %-42s\n' "F-01: --resume-session recorded as mode" || { printf '  FAIL  F-01: mode line %s\n' "$(grep '^mode=' "$CP.meta")"; FAIL=1; }
-chk "F-01: --resume-session with --resume-last refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-session s2 --resume-last --prompt-file "$CCRD/prompt.md"
-chk "F-01: --resume-last then --resume-session refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-last --resume-session s2 --prompt-file "$CCRD/prompt.md"
-# review round 2 F-09: --fresh is exclusive with either resume mode, whichever comes first
-chk "F-09: --fresh then --resume-session refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --fresh --resume-session s2 --prompt-file "$CCRD/prompt.md"
-chk "F-09: --resume-session then --fresh refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-session s2 --fresh --prompt-file "$CCRD/prompt.md"
-chk "F-09: --fresh then --resume-last refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --fresh --resume-last --prompt-file "$CCRD/prompt.md"
-chk "F-09: --resume-last then --fresh refused" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-px" --via ccr:x --resume-last --fresh --prompt-file "$CCRD/prompt.md"
-[ ! -e "$CCRD/02-px.meta" ] && printf '  ok    %-42s\n' "F-09: refused launches write no sidecar" || { printf '  FAIL  F-09: sidecar written\n'; FAIL=1; }
-out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv8c" bash "$R" "$CP" --via ccr:x --fresh --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
-[ "$rc" = 0 ] && ! grep -qx -- '--resume' "$TMP/argv8c" && printf '  ok    %-42s\n' "T-8: --fresh passes no --resume" || { printf '  FAIL  T-8(fresh): rc=%s\n' "$rc"; FAIL=1; }
-mkdir -p "$CCRD/nolast"; cp "$CCRD/.ccr-smoke.x" "$CCRD/nolast/"
-chk "T-8: --resume-last without a session" 4 "no previous ccr session" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/nolast/02-p1" --via ccr:x --resume-last --prompt-file "$CCRD/prompt.md"
-# review round 1 F-10: a result event that is an error (is_error / non-success subtype) with child exit 0 is FAILED
-out=$(PATH="$TMP/ccrerr:$PATH" bash "$R" "$CCRD/02-perr" --via ccr:x --fresh --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
-[ "$rc" = 1 ] && grep -qx 'outcome=FAILED' "$CCRD/02-perr.meta" && grep -q '^result_event=error_max_turns is_error=True' "$CCRD/02-perr.meta" && printf '  ok    %-42s\n' "F-10: error result event with exit 0 → FAILED" || { printf '  FAIL  F-10: rc=%s meta=%s\n' "$rc" "$(grep -E '^(outcome|result_event)=' "$CCRD/02-perr.meta" | tr '\n' ' ')"; FAIL=1; }
-# T-9: child failure and missing result event
-out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=fail bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
-[ "$rc" = 1 ] && [ "$(cat "$CP.exit")" = 1 ] && grep -q '^outcome=FAILED' "$CP.meta" && grep -q '^child_exit=1' "$CP.meta" && printf '  ok    %-42s\n' "T-9: child exit 1 → FAILED" || { printf '  FAIL  T-9(fail): rc=%s\n' "$rc"; FAIL=1; }
-out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=noresult bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
-[ "$rc" = 1 ] && grep -q '^outcome=FAILED' "$CP.meta" && grep -q '^child_exit=0' "$CP.meta" && printf '  ok    %-42s\n' "T-9: exit 0 without a result event → FAILED" || { printf '  FAIL  T-9(noresult): rc=%s\n' "$rc"; FAIL=1; }
-# T-10 / T-10b: stall kills the group (a grandchild too) and exits 2 only after the group is gone; timeout exits 3
-out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=grandchild bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 1 --poll-sec 5 --max-min 5 2>&1); rc=$?
-PG=$(awk -F= '$1=="pgid"{print $2}' "$CP.meta")
-[ "$rc" = 2 ] && [ "$(cat "$CP.exit")" = 2 ] && grep -q '^outcome=STALLED' "$CP.meta" && grep -q 'terminated (confirmed: no member left)' "$CP.progress" && [ -n "$PG" ] && ! kill -0 -- "-$PG" 2>/dev/null && printf '  ok    %-42s\n' "T-10b: stall → group (with grandchild) killed, exit 2" || { printf '  FAIL  T-10b: rc=%s pgid=%s\n' "$rc" "$PG"; pkill -g "$PG" 2>/dev/null; FAIL=1; }
-out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=sleep bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --stall-min 5 --poll-sec 5 --max-min 1 2>&1); rc=$?
-PG=$(awk -F= '$1=="pgid"{print $2}' "$CP.meta")
-[ "$rc" = 3 ] && grep -q '^outcome=TIMEOUT' "$CP.meta" && grep -q '^cancel_confirmed=yes' "$CP.meta" && printf '  ok    %-42s\n' "T-10: timeout → exit 3, cancel confirmed" || { printf '  FAIL  T-10(timeout): rc=%s\n' "$rc"; pkill -g "$PG" 2>/dev/null; FAIL=1; }
-# T-10: exit 5 — the process group cannot be read (stub ps), so the child is killed and nothing is retried
-PSBIN="$TMP/psbin"; mkdir -p "$PSBIN"; printf '#!/bin/sh\necho ""\n' > "$PSBIN/ps"; chmod +x "$PSBIN/ps"
-out=$(PATH="$PSBIN:$CCRBIN:$PATH" FAKE_CCR_MODE=sleep bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
-[ "$rc" = 5 ] && [ "$(cat "$CP.exit")" = 5 ] && grep -q '^pgid=unknown' "$CP.meta" && grep -q '^cancel_confirmed=no' "$CP.meta" && printf '  ok    %-42s\n' "T-10: unreadable pgid → child killed, exit 5" || { printf '  FAIL  T-10(exit5): rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+# Durable job protocol coverage replaces the retired supervisor/PID fixtures.
+# Covers loss of receipt, collector death, owner cancellation, watch detachment,
+# strict stop evidence, route/session binding, and committed result bytes.
+python3 scripts/test-ccr-jobs.py || FAIL=1
+printf 'review this code\n' > "$CCRD/prompt.md"
+chk "CCR completion uses durable job receipt" 0 "COMPLETED" env PATH="$CCRBIN:$PATH" bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1
+chk "CCR resume-last unavailable before admission" 4 "detached resume is unavailable" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/noresume" --via ccr:x --resume-last --prompt-file "$CCRD/prompt.md"
+chk "CCR explicit resume unavailable before admission" 4 "detached resume is unavailable" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/noresume" --via ccr:x --resume-session example --prompt-file "$CCRD/prompt.md"
+for mode in --fresh --resume-last; do
+  chk "explicit resume conflicts with $mode" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/noresume" --via ccr:x --resume-session example "$mode" --prompt-file "$CCRD/prompt.md"
+done
+# T-30 (CX-05): a holder file that exists but cannot be read is not evidence of a dead holder, and
+# `rmdir` cannot remove a directory that still contains it. That pair wedged the lock forever
+# (reproduced: exit 4 on every attempt, the lock still present).
+CP12="$CCRD/p-emptyholder"
+mkdir -p "$CP12.claim.lock"; : > "$CP12.claim.lock/holder"; touch -t 200001010000 "$CP12.claim.lock"
+chk "T-30: empty legacy holder fails closed" 4 "legacy collector lock" env PATH="$CCRBIN:$PATH" bash "$R" "$CP12" --attach
+
+# T-31 (CL-03/CX-02): the relaunch guard was dead code on the codex backend — its detach record
+# carried no identity at all, so a relaunch rotated a LIVE job's record away and started a second
+# job beside it. codex-debate and codex-deep-plan pass no --claim, so this guard is their only
+# protection. A record whose worker is provably alive must refuse the launch.
+CP13="$CCRD/p-codexlive"
+python3 scripts/fixture-process.py "$CP13.stop" & CJOB=$!
+{ printf 'backend=codex\njob=task-fake-live\nthread=t\njoblog=\n'
+  printf 'worker_pid=%s\nworker_identity=%s\n' "$CJOB" "$(TZ=UTC ps -o lstart= -p "$CJOB" | tr -s ' ' | sed 's/^ *//;s/ *$//')"
+  printf 'mode=--fresh\nattach_command=ATTACH-CODEX\ncancel_command=CANCEL-CODEX\n'; } > "$CP13.detached"
+printf '0s launched job=task-fake-live\n' > "$CP13.progress"
+out=$(bash "$R" "$CP13" --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'has not ended' && printf '%s' "$out" | grep -q 'ATTACH-CODEX' \
+  && [ -e "$CP13.detached" ] && [ ! -e "$CP13.attempt1.detached" ] \
+  && printf '  ok    %-42s\n' "T-31: a codex relaunch is refused while alive" \
+  || { printf '  FAIL  T-31: rc=%s rotated=%s out=%s\n' "$rc" "$([ -e "$CP13.attempt1.detached" ] && echo yes || echo no)" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+: > "$CP13.stop"; wait "$CJOB" 2>/dev/null
+
+# T-16: a refused attach must never rewrite a terminal .exit — the result it would destroy is the
+# whole point of the change.
+out=$(bash "$R" "$CP" --attach 2>&1); rc=$?
+[ "$rc" = 4 ] && [ "$(cat "$CP.exit")" = 0 ] && printf '  ok    %-42s\n' "T-16: refused attach preserves terminal .exit" \
+  || { printf '  FAIL  T-16: rc=%s exit=%s\n' "$rc" "$(cat "$CP.exit" 2>/dev/null)"; FAIL=1; }
+
+# T-17: --attach argument surface — it is an operation, not a launch mode.
+chk "T-17: --attach with --fresh"        4 "exclusive"        bash "$R" "$CP" --attach --fresh
+chk "T-17: --attach with --prompt-file"  4 "takes no --prompt-file" bash "$R" "$CP" --attach --prompt-file "$CCRD/prompt.md"
+chk "T-17: --attach with --via"          4 "takes no --via"   bash "$R" "$CP" --attach --via ccr:x
+chk "T-17: --cancel without --attach"    4 "only valid with --attach" bash "$R" "$CCRD/nope" --cancel --prompt-file "$CCRD/prompt.md"
+
+# T-18: the probe's three states. UNAVAILABLE is reserved for an authoritative negative; a
+# companion that could not reach its runtime to answer is UNDETERMINED and never refuses a run.
+probe_case() {  # <name> <expect-label> <expect-rc> <json>
+  local out rc
+  out=$(printf '%s' "$4" | python3 -c "$PROBE_PY" 2>&1); rc=$?
+  printf '%s' "$out" | grep -q "$2" && [ "$rc" = "$3" ] && printf '  ok    %-42s\n' "$1" || { printf '  FAIL  %s: rc=%s out=%s\n' "$1" "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+}
+PROBE_PY=$(sed -n "/^      printf '%s' \"\$OUT\" | python3 -c '/,/^raise SystemExit(rc)'/p" "$R" | sed "1s/.*python3 -c '//" | sed "\$s/'$//")
+probe_case "T-18: runtime unreachable → UNDETERMINED" "PROBE UNDETERMINED" 0 \
+  '{"ready":false,"codex":{"available":true,"detail":"cli"},"auth":{"available":true,"loggedIn":false,"detail":"connect ENOENT /tmp/x/broker.sock","authMethod":null,"verified":null}}'
+probe_case "T-18: genuinely logged out → UNAVAILABLE" "PROBE UNAVAILABLE" 1 \
+  '{"ready":false,"codex":{"available":true,"detail":"cli"},"auth":{"available":true,"loggedIn":false,"authMethod":"chatgpt","verified":false}}'
+probe_case "T-18: cli absent → UNAVAILABLE" "PROBE UNAVAILABLE" 1 \
+  '{"ready":false,"codex":{"available":false,"detail":"not found"},"auth":{"available":false,"loggedIn":false,"authMethod":null,"verified":null}}'
+probe_case "T-18: healthy → SUCCEEDED" "PROBE SUCCEEDED" 0 \
+  '{"ready":true,"codex":{"available":true,"detail":"cli"},"auth":{"available":true,"loggedIn":true,"authMethod":"chatgpt","verified":true}}'
+
 # T-11: claim mode with the ccr backend — the existing claim rules apply unchanged
 CPC="$CCRD/claim/02-p1"; mkdir -p "$CCRD/claim"; cp "$CCRD/.ccr-smoke.x" "$CCRD/claim/"
 chk "T-11: claim mode, missing claim"     4 "does not exist"        env PATH="$CCRBIN:$PATH" bash "$R" "$CPC" --via ccr:x --claim t1 --prompt-file "$CCRD/prompt.md"
@@ -908,7 +981,7 @@ out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=fail bash "$IM" "$IP3" --via ccr:x --re
 IP4="$IMD/fourth/implement"
 out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=sleep bash "$IM" "$IP4" --via ccr:x --repo "$G2" --base "$SHA2" --branch impl/stall --plan "$IMD/PLAN.md" --stall-min 1 --poll-sec 5 --max-min 5 2>&1); rc=$?
 PG=$(awk -F= '$1=="pgid"{print $2}' "$IP4.meta")
-[ "$rc" = 2 ] && grep -q '^outcome=STALLED' "$IP4.meta" && [ -n "$PG" ] && ! kill -0 -- "-$PG" 2>/dev/null && [ -d "$(cat "$IP4.worktree")" ] && printf '  ok    %-42s\n' "T-15: stall → exit 2, group killed, worktree kept" || { printf '  FAIL  T-15(stall): rc=%s\n' "$rc"; pkill -g "$PG" 2>/dev/null; FAIL=1; }
+[ "$rc" = 2 ] && grep -q '^outcome=STALLED' "$IP4.meta" && [ -n "$PG" ] && ! group_has_members "$PG" && [ -d "$(cat "$IP4.worktree")" ] && printf '  ok    %-42s\n' "T-15: stall → exit 2, group killed, worktree kept" || { printf '  FAIL  T-15(stall): rc=%s\n' "$rc"; FAIL=1; }
 for b in impl/hello impl/fail impl/stall; do w=$(git -C "$G2" worktree list | awk -v b="[$b]" '$3==b{print $1}'); [ -n "$w" ] && git -C "$G2" worktree remove --force "$w" >/dev/null 2>&1; git -C "$G2" branch -D "$b" >/dev/null 2>&1; done
 
 
@@ -1346,12 +1419,14 @@ cp "$TMP/ga-repo.bak" "$GA/00-brief.md.repo"
 printf '%s\n' "$(git -C "$G2" rev-parse HEAD)" > "$GA/00-brief.md.head"
 chk "CX-02r38: recorded head differs from the brief's Target" 1 "differs from the frozen brief's Target head" pgw pre-codex "$GA" "$G2"
 cp "$TMP/ga-head.bak" "$GA/00-brief.md.head"
-# CX-03r38: claim creation/rotation and a runner taking the claim share <prefix>.claim.lock.
-mkdir "$GA/02-p1.claim.lock"
-chk "CX-03r38: held claim lock blocks the launch gate" 1 "claim.lock is held" pgw pre-codex "$GA" "$G2"
+# Gates share the kernel lease and refuse old directory locks even when aged.
+rm -f "$GA/02-p1.claim.lock"; mkdir "$GA/02-p1.claim.lock"
+chk "collector gate: legacy lock refused" 1 "legacy collector lock" pgw pre-codex "$GA" "$G2"
 touch -t 202001010000 "$GA/02-p1.claim.lock"
-chk "CX-03r38: stale claim lock reclaimed" 0 "PREFLIGHT-OK" pgw pre-codex "$GA" "$G2"
-[ ! -e "$GA/02-p1.claim.lock" ] && printf '  ok    %-42s\n' "CX-03r38: gate releases the claim lock" || { printf '  FAIL  CX-03r38: claim lock left behind\n'; FAIL=1; }
+chk "collector gate: aged legacy lock remains refused" 1 "legacy collector lock" pgw pre-codex "$GA" "$G2"
+rmdir "$GA/02-p1.claim.lock"
+chk "collector gate: unlocked lease admitted" 0 "PREFLIGHT-OK" pgw pre-codex "$GA" "$G2"
+lock_free "$GA/02-p1.claim.lock" || { printf '  FAIL  gate retained collector lease\n'; FAIL=1; }
 out=$(pgw pre-codex "$GA" "$G2" 2>&1); tok=$(printf '%s' "$out" | grep -oE 'claim\.p1=[0-9a-f]{16}' | cut -d= -f2)
 [ -n "$tok" ] && grep -qx "token=$tok" "$GA/02-p1.claim/owner" && printf '  ok    %-42s\n' "CX-03r36: gate prints the claim token it wrote" || { printf '  FAIL  CX-03r36: token missing (%s)\n' "$out"; FAIL=1; }
 ( cd "$GA" && chk "gate: pre-codex with a relative ART" 0 "PREFLIGHT-OK" bash "$OLDPWD/$PG" pre-codex . "$G2" )
@@ -1487,9 +1562,9 @@ chk "release: job without a reachable codex plugin refused" 1 "cannot locate the
 FAKE="$TMP/fakehome/.claude/plugins/cache/openai-codex/codex/9.9.9/scripts"; mkdir -p "$FAKE"
 printf 'if (process.argv.includes("--all")) { console.log(JSON.stringify({running: process.env.FAKE_RUNNING ? [{id:"task-live-1", workspaceRoot: process.env.FAKE_RUNNING}] : []})); } else { console.log(JSON.stringify({job:{status:process.env.FAKE_STATUS||"running"}})); }\n' > "$FAKE/codex-companion.mjs"
 chk "release: running job refused" 1 "not provably finished" env HOME="$TMP/fakehome" FAKE_STATUS=running bash "$PG" release "$PC5" 02-p1
-( exec -a "task-worker --job-id task-fake-job1" sleep 30 ) & WPID=$!; sleep 1
+python3 scripts/fixture-process.py "$PC5/worker.stop" task-worker --job-id task-fake-job1 & WPID=$!; sleep 1
 chk "release: live worker process refused" 1 "worker process for job task-fake-job1 is still alive" env HOME="$TMP/fakehome" FAKE_STATUS=completed bash "$PG" release "$PC5" 02-p1
-kill "$WPID" 2>/dev/null; wait "$WPID" 2>/dev/null
+: > "$PC5/worker.stop"; wait "$WPID" 2>/dev/null
 chk "release: finished job rotates the claim" 0 "RELEASED 02-p1 -> 02-p1.claim.spent" env HOME="$TMP/fakehome" FAKE_STATUS=completed bash "$PG" release "$PC5" 02-p1
 [ ! -d "$PC5/02-p1.claim" ] && ls -d "$PC5"/02-p1.claim.spent*/runner >/dev/null 2>&1 && grep -q '^released_by=phase-gate.sh release' "$PC5"/02-p1.claim.spent*/owner && printf '  ok    %-42s\n' "release: rotated claim keeps runner/ (still a counted launch)" || { printf '  FAIL  release: claim not rotated with runner\n'; FAIL=1; }
 chk "release: nothing live to release" 1 "no live claim" bash "$PG" release "$PC5" 02-p1
@@ -1641,17 +1716,65 @@ PR="$TMP/parts-release"; mkdir -p "$PR"; printf 'scope\n' > "$PR/00-scope.md"; m
 pgw pre-codex "$PR" "$G2" >/dev/null 2>&1 || { printf '  FAIL  T-19: preflight\n'; FAIL=1; }
 chk "T-19: unknown prefix refused" 1 "unknown phase prefix" bash "$PG" release "$PR" 02-p3
 mkdir -p "$PR/02-p2.claim/runner"; printf '2147483646\n' > "$PR/02-p2.claim/runner/pid"
-python3 -c 'import os,sys; os.setpgrp(); os.execvp("sleep",["sleep","60"])' & GRP=$!; sleep 1
-printf '0s launched backend=ccr pid=2147483646 pgid=%s alias=some-alias\n' "$GRP" > "$PR/02-p2.progress"
-chk "T-19b: live process group refused" 1 "process group $GRP of 02-p2 is still alive" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
-kill -TERM -- "-$GRP" 2>/dev/null; wait "$GRP" 2>/dev/null; sleep 1
-chk "T-19b: group gone → released without the companion" 0 "RELEASED 02-p2" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
-rm -rf "$PR"/02-p2.claim.spent*; rm -f "$PR/02-p2.progress"
+CCRH="plugins/codex-pr-review/scripts/ccr-job.py"
+if ! PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=sleep python3 "$CCRH" admit "$PR/02-p2" x anthropic.ccr.x 1 "$R" '{}' 0.5.1 30 6 25 1 ccr launch --model x --detach --prompt-file "$PROMPT" >/dev/null; then
+  printf '  FAIL  CCR gate fixture admission failed before receipt creation\n'
+  exit 1
+fi
+chk "T-19b: live CCR job refuses release" 1 "stop evidence" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+RJ=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["job_id"])' "$PR/02-p2.ccr-receipt.json")
+python3 "$CCRH" cancel "$PR/02-p2" "$RJ" >/dev/null
+chk "T-19b: cancelled CCR job releases without companion" 0 "RELEASED 02-p2" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+# ---- review cycle 3, CL-06: the gate half of the detach change had NO test at all. These three
+# fail if phase-gate.sh is reverted to its pre-change form.
+# T-23g: a detached attempt (.detached, no .exit) is IN FLIGHT — the gate must refuse to advance
+# rather than read a missing .exit as "the runner died" and authorize a second launch.
+PD="$TMP/parts-detached"; mkdir -p "$PD"; printf 'scope\n' > "$PD/00-scope.md"; mkbrief "$PD"; printf 'p1\tcodex\t-\n' > "$PD/00-participants.tsv"
+pgw pre-codex "$PD" "$G2" >/dev/null 2>&1 || { printf '  FAIL  T-23g: preflight\n'; FAIL=1; }
+mkdir -p "$PD/02-p1.claim/runner"; printf '%s\n' "$$" > "$PD/02-p1.claim/runner/pid"
+printf '0s launched job=task-fake\n' > "$PD/02-p1.progress"
+printf 'backend=codex\njob=task-fake\nattach_command=ATTACH-ME\ncancel_command=CANCEL-ME\n' > "$PD/02-p1.detached"
+# The join gate checks the lead and the participant artifacts BEFORE it looks at claims, so both
+# must be present or the run fails for an unrelated reason and the detached check is never reached
+# (which is exactly what the first draft of this test did).
+printf 'lead\nSTATUS: PHASE 1 COMPLETE\n' > "$PD/01-lead.md"; chmod 000 "$PD/01-lead.md"
+printf 'p1\nSTATUS: PHASE 2 COMPLETE\n' > "$PD/02-p1.md"
+chk "T-23g: a detached attempt blocks the gate"   1 "detached" pgw pre-phase3 "$PD"
+chmod 600 "$PD/01-lead.md"
+# T-24g: release must refuse it — the job may still be running and still spending tokens. What
+# changed in cycle 4 (CL-05) is the REASON: detachment alone is no longer the refusal. Refusing on
+# it left the three recoveries pointing at each other — the attach could not publish, release said
+# "attach first", the relaunch said "attach or cancel first" — so a detached codex prefix now falls
+# through to the companion proof the gate already had. With the runner alive it is that check that
+# refuses; the twin below removes the runner so the companion decides.
+chk "T-24g: release refuses a live runner"        1 "still alive" bash "$PG" release "$PD" 02-p1
+printf '2147483646\n' > "$PD/02-p1.claim/runner/pid"   # a pid that cannot exist: the runner is gone
+# T-24g2: with the runner gone, a detached codex prefix is decided by the job's status and nothing
+# else. HOME has no codex plugin, so the companion cannot be consulted — which must still refuse,
+# and must name an exit the operator can actually take rather than the attach that just failed.
+out=$(env HOME="$TMP/nohome" bash "$PG" release "$PD" 02-p1 2>&1); rc=$?
+[ "$rc" = 1 ] && printf '%s' "$out" | grep -q 'cannot locate the codex plugin' \
+  && printf '%s' "$out" | grep -q 'start a fresh run directory' \
+  && ! printf '%s' "$out" | grep -q 'run its attach command to publish' \
+  && printf '  ok    %-42s\n' "T-24g2: detached is decided by the job, not by .detached" \
+  || { printf '  FAIL  T-24g2: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -2 | tr '\n' ' ')"; FAIL=1; }
+printf '%s\n' "$$" > "$PD/02-p1.claim/runner/pid"
+# A real kernel lease blocks the gate until its holder dies. No PID identity record.
+python3 scripts/fixture-process.py "$PD/lease.stop" --lease "$PD/02-p1.claim.lock" --ready "$PD/lease-ready" &
+GH=$!
+for _ in $(seq 1 50); do [ ! -e "$PD/lease-ready" ] || break; sleep 0.1; done
+[ -e "$PD/lease-ready" ] || { printf '  FAIL  kernel lease fixture never ready\n'; FAIL=1; }
+chk "T-25g: live kernel lease blocks gate" 1 "claim.lock is held by a live" bash "$PG" release "$PD" 02-p1
+: > "$PD/lease.stop"; wait "$GH" 2>/dev/null
+out=$(bash "$PG" release "$PD" 02-p1 2>&1)
+printf '%s' "$out" | grep -q 'claim.lock is held' && { printf '  FAIL  T-25g: dead holder retained lease\n'; FAIL=1; }
+lock_free "$PD/02-p1.claim.lock" || { printf '  FAIL  T-25g: kernel lease not released\n'; FAIL=1; }
+rm -rf "$PR"/02-p2.claim.spent*; rm -f "$PR/02-p2.progress" "$PR/02-p2.detached" "$PR"/02-p2.ccr-*
 mkdir -p "$PR/02-p2.claim/runner"; printf '2147483646\n' > "$PR/02-p2.claim/runner/pid"; printf '0s launched backend=ccr pid=2147483646 alias=some-alias\n' > "$PR/02-p2.progress"
-chk "T-19b: launch line without pgid refused" 1 "has no pgid=" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+chk "T-19b: legacy process record refused" 1 "stop evidence" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
 : > "$PR/02-p2.progress"
-chk "T-19b: ccr attempt with no launch line, nothing running → released" 0 "RELEASED 02-p2" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
-rm -rf "$PR"/02-p2.claim.spent* "$PR/02-p2.progress"
+chk "T-19b: missing durable admission refuses release" 1 "stop evidence" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+rm -rf "$PR"/02-p2.claim.spent* "$PR/02-p2.claim" "$PR/02-p2.progress"
 # A finished exit-5 remains fail-closed until the operator asks the separate recovery command
 # to prove the recorded CCR process group has gone. The original sidecars are never rewritten.
 CT="$TMP/cancel-resolved"; mkdir -p "$CT"; printf 'scope\n' > "$CT/00-scope.md"; mkbrief "$CT"
@@ -1659,12 +1782,17 @@ printf 'p1\tccr\tx\n' > "$CT/00-participants.tsv"
 printf '5\n' > "$CT/02-p1.exit"
 printf 'backend=ccr\npid=2147483646\npgid=2147483646\ncancel_confirmed=no\n' > "$CT/02-p1.meta"
 chk "T-19c: exit-5 blocks before terminal proof" 1 "unconfirmed cancellation" pgw pre-codex "$CT" "$G2"
+if ! PATH="$CCRBIN:$PATH" python3 "$CCRH" admit "$CT/02-p1" x anthropic.ccr.x 1 "$R" '{}' 0.5.1 30 6 25 1 ccr launch --model x --detach --prompt-file "$PROMPT" >/dev/null; then
+  printf '  FAIL  CCR gate fixture admission failed before receipt creation\n'
+  exit 1
+fi
 chk "T-19c: terminal proof writes immutable receipt" 0 "TERMINATION-CONFIRMED 02-p1 backend=ccr" bash "$PG" confirm-terminated "$CT" 02-p1
 [ "$(fmode "$CT/02-p1.cancel-resolved")" = 400 ] && grep -q '^exit_sha256=' "$CT/02-p1.cancel-resolved" && grep -q '^meta_sha256=' "$CT/02-p1.cancel-resolved" && grep -q ' 02-p1.cancel-resolved  confirm-terminated  final$' "$CT/00-accepted.sha256" && printf '  ok    %-42s\n' "T-19c: cancellation receipt binds raw sidecars" || { printf '  FAIL  T-19c: cancellation receipt missing, unledgered or writable\n'; FAIL=1; }
 chk "T-19c: resolved exit-5 permits fresh claim" 0 "PREFLIGHT-OK" pgw pre-codex "$CT" "$G2"
 rm -f "$CT/02-p1.cancel-resolved"
 printf 'backend=ccr\npid=2147483646\npgid=unknown\ncancel_confirmed=no\n' > "$CT/02-p1.meta"
-chk "T-19c: unreadable process group remains blocked" 1 "has no numeric pgid" bash "$PG" confirm-terminated "$CT" 02-p1
+rm -f "$CT/02-p1.ccr-receipt.json"
+chk "T-19c: missing admission receipt remains blocked" 1 "stop evidence" bash "$PG" confirm-terminated "$CT" 02-p1
 # T-16 (re-entry): a SKIPPED participant may be relaunched alone while a COMPLETE one is kept
 printf 'lead\n' > "$PR/01-lead.md"; chmod 000 "$PR/01-lead.md"
 printf 'x\nSTATUS: PHASE 2 COMPLETE\n' > "$PR/02-p1.md"; echo 0 > "$PR/02-p1.exit"; printf 'body\n' > "$PR/02-p1.stdout"; mkdir -p "$PR/02-p1.claim/runner"
@@ -3268,7 +3396,7 @@ rm -f "$WD/paired.md"
 bash "$AW" "$WD/adv" --expect "$WD/paired.md" --after-sec 2  --poll-sec 1 >/dev/null 2>&1 & ADV=$!
 bash "$AW" "$WD/dln" --expect "$WD/paired.md" --after-sec 12 --poll-sec 1 >/dev/null 2>&1 & DLN=$!
 wait "$ADV"; ADVRC=$?
-if kill -0 "$DLN" 2>/dev/null; then ALIVE=yes; else ALIVE=no; fi
+if pid_alive "$DLN"; then ALIVE=yes; else ALIVE=no; fi
 [ "$ADVRC" = 3 ] && [ "$ALIVE" = yes ] && printf '  ok    %-42s\n' "watch: advisory fired, deadline still alive" || { printf '  FAIL  watch: paired lifecycle advisory=%s deadline_alive=%s\n' "$ADVRC" "$ALIVE"; FAIL=1; }
 # the artifact appears between the two thresholds → the deadline watcher exits 0, never 3
 printf 'lead\n' > "$WD/paired.md"

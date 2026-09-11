@@ -12,6 +12,10 @@ shell limit killed one mid-round on 2026-09-02 and left a phantom job.
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/debate/r<n>-codex" [--via codex|ccr:<alias>] --fresh|--resume-last \
     --prompt-file "$ART/debate/r<n>-prompt.md" [--stall-min 8] [--max-min 30] [--poll-sec 15]
+
+# exit 6: the watch bound elapsed while the round was still running. Resume the watch — do not
+# relaunch, which would start a second round against the same prompt.
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/debate/r<n>-codex" --attach [--max-min 30]
 ```
 
 `--via` comes from `meta.json` (`via`, recorded by `init-plan.sh`); pass the same value on every
@@ -32,7 +36,8 @@ Exit codes and what to do:
 | 0 | COMPLETED | run `validate-verdict.py` on `.stdout` |
 | 1 | FAILED (plugin failure or worker died) | retry the same call once; then T5 |
 | 2 | STALLED (cancel confirmed) | retry once with `--budget` lowered; then T5 |
-| 3 | TIMEOUT | do not retry; T5, keep any partial `.stdout` |
+| 3 | TIMEOUT — **retired.** No path produces it any more: a watch bound that elapses detaches (6). The code is kept so older sidecars stay readable | if you see it, the sidecar was written by an older runner; treat it as T5 |
+| 6 | DETACHED — the watch bound elapsed while the job was still running. The runner did NOT cancel it: the job is alive and `.exit` is deliberately absent | **attach again, never relaunch.** Run the `attach_command` the runner printed (also in `.meta` and `<prefix>.detached`) to resume the watch; it publishes the real outcome and exit code when the job lands. Relaunching would run a second job against the same round. To abandon the round instead, run the `cancel_command` first |
 | 4 | LAUNCH-ERROR, or any invalid invocation (missing option value, unknown argument, unreadable prompt file, `--write`) | record UNAVAILABLE with `.stderr`; a usage message means fix the call, not retry |
 | 5 | STALLED or TIMEOUT **and the cancel could not be confirmed** — a Codex worker may still be running | DO NOT retry: a second job would run alongside the first. Report the job id, quote `.progress`, treat the round as failed (T5). |
 
@@ -71,7 +76,10 @@ ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe                              
 ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh --probe --via ccr:<alias> --record-dir "$ART/debate"   # ccr backend
 ```
 
-`PROBE SUCCEEDED …` (exit 0) or `PROBE UNAVAILABLE/FAILED …` (exit 1); record the line verbatim in
+`PROBE SUCCEEDED …` (exit 0), `PROBE UNAVAILABLE/FAILED …` (exit 1), or `PROBE UNDETERMINED …`
+(exit 0 — the companion could not determine authentication, which is not an authoritative
+negative: record the line and proceed to the launch, which settles it; never treat it as
+unavailable and never stamp the run SOLO on it); record the line verbatim in
 `00-scope.md` — for the ccr backend also the `ccr model show` JSON the probe prints after it, in a
 fenced block. On failure tell the user `/codex:setup` exists (codex) or `ccr model list` /
 `ccr model show <alias>` (ccr); do not improvise auth. Confirm with the user that sending
@@ -81,14 +89,15 @@ if not. `--solo` skips the probe and records SOLO.
 
 ## ccr backend (`--via ccr:<alias>`)
 
-The gateway is the user's `ccr` (claude-code-router, >= 0.4.11). Aliases are machine-local
+The gateway is the user's `ccr` (claude-code-router, >= 0.5.1). Aliases are machine-local
 (`ccr model list`); never write one into a shipped file, and never default to one. The runner's
 launch line is fixed and is the only one the plugin ever uses:
 
 ```
-ccr launch --model <alias> --permission-mode plan -p --no-lifecycle --no-statusline -- \
-  --output-format stream-json --verbose --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
-  --disallowedTools Write,Edit,MultiEdit,NotebookEdit,Agent --max-turns <N> [--resume <session>]
+ccr launch --model <alias> --permission-mode plan -p --no-lifecycle --no-statusline \
+  --detach --prompt-file <file> --output-format=stream-json --verbose \
+  --strict-mcp-config --mcp-config='{"mcpServers":{}}' \
+  --disallowedTools=Write,Edit,MultiEdit,NotebookEdit,Agent --max-turns=<N>
 ```
 
 Read-only rests on three controls, in order of importance: `--permission-mode plan` (Claude
@@ -101,21 +110,18 @@ prompt that asks for a write by the Write tool and by Bash) and records `readonl
 `<dir>/.ccr-smoke.<alias>`; every ccr launch in that directory refuses to start (exit 4) unless a
 matching record exists (same alias, provider model, CCR-generated child model ID, observed child init model, ccr version and launch-line digest). One smoke per alias per run. The configured alias is the only value passed to `ccr launch --model` before `--`; `provider_model` is descriptive, never a child CLI argument. The runner accepts a completed launch only when the child init model equals `claude_model_id`; a mismatch is `UNAVAILABLE` without an alias or Claude fallback.
 
-Thread semantics: `thread=` in `.meta` is the child's `session_id` from the stream's `init`
-event. `--resume-last` resumes the session recorded in `<dir>/.ccr-last-session` (written by
-every completed ccr launch in the directory); `--resume-session <id>` names one explicitly
-(needed when several ccr participants share a directory); `--fresh` starts a new session.
-`--max-turns <N>` (default 100) bounds the child's agentic turns; both options are ccr-only.
+CCR currently supports fresh detached jobs in this runner. Resume requests fail with
+exit 4 before admission or claim mutation. Record `continuity=unavailable` and explicitly
+choose `--fresh` for later CCR rounds, carrying the previous response and ledger in the
+self-contained prompt. Codex resume behavior is unchanged.
 
-Sidecars keep their names and meaning: `.joblog` is the raw stream-json, `.stdout` the `result`
-event's text verbatim, `.progress` lines `elapsed status=running|exited idle=Ns | last event`, the
-first line `launched backend=ccr pid=<pid> pgid=<pgid> alias=<alias>` (the child runs in its own
-process group; stall or timeout signals the whole group and exit 5 means a member survived).
-`.meta` adds `backend=ccr`, `alias=`, `provider=`, `provider_model=`, `claude_model_id=`,
-`routed_model=`, `route_identity=`, `compatibility=`, `ccr_version=`, `pid=`, `pgid=`,
-`child_exit=`. The exit table is identical.
-The `--model`/`--effort` prohibition below applies to the codex backend; for ccr the alias IS the
-model choice and is the user's.
+The receipt binds job and session IDs. Initialization, result, and model identities must
+agree before success is accepted. CCR alone owns workload cancellation. Watch expiry
+detaches; a stall requests cancellation by job ID. Unknown admission or cleanup, observed
+survivors, and missing exit evidence leave the attempt open without `.exit`. Partial
+coverage remains visible. The private attempt, receipt, and committed result sidecars
+support attach after collector death and prevent later log bytes replacing the result.
+Drain legacy process-based attempts using their original runner before upgrading.
 
 Plan mode's own plan file under `~/.claude/plans/` is the one write a ccr child may make outside
 the artifact directory (Claude Code writes it when a plan-mode session ends); it holds nothing
@@ -148,3 +154,15 @@ argument and parses any `--resume`, `--write`, or `--background` inside it as op
 
 - zsh treats `$VAR:x` as a modifier; always brace: `${SHA}:path`.
 - Shell state does not persist between tool calls; re-derive `ART` and `REPO` from `meta.json` each call.
+
+CCR admission observation is bounded to 30 seconds and the remaining watch or
+smoke budget. Expiry ends only the submitting CLI, retains admission evidence,
+and reports unresolved admission; it never cancels the detached job or permits
+resubmission. Attach observes the original receipt when one was saved.
+Workload stderr is frozen separately in `.ccr-errorlog`, with submission diagnostics
+in `.ccr-submit.stderr`; `.stderr` exposes their combined diagnostics without
+repeating them on attach. The committed evidence checks both stream digests.
+Collectors use a kernel lease on the persistent `.claim.lock` file. Do not delete
+that file. Drain legacy directory locks and unfinished legacy attempts before
+upgrading. Partial cleanup coverage cannot exclude escaped descendants; an empty
+observed survivor list does not establish that escaped tool processes are absent.

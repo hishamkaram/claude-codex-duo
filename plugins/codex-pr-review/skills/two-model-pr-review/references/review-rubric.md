@@ -52,6 +52,21 @@ prose around it differs.
   leaving inconsistent state, missing timeouts, unbounded retries.
 - **Concurrency & state:** races, non-atomic read-modify-write, lock ordering,
   transaction boundaries, handler/job idempotency, cache invalidation.
+- **Process & signal safety — treat any hit here as P0 until disproved:** does
+  anything send a signal (`kill`, `pkill`, `killall`, `os.kill`, a child-process
+  `.kill()`), create or record a process group or session, or run in a trap,
+  cancellation, stall, timeout, detach/attach or cleanup path? If so: is every
+  signal target VALIDATED before use, or does it come from a file, a variable
+  default, or a field that a different check proved? `kill -- "-N"` gives `-1`
+  the meaning *every process the user may signal* (on macOS the whole GUI login
+  session) and `-0` the meaning *the sender's own process group* (the invoking
+  shell and its sibling jobs) — so an unvalidated `0`, `1`, empty or non-numeric
+  target is a session-wide kill, not a job cancel. Reject any path that can
+  signal a parent, a shared group, or an arbitrary pid; require it to FAIL
+  CLOSED when ownership is uncertain. This includes test fixtures and teardown:
+  a fixture that records `pgid=0`/`pgid=1`, or a teardown that writes
+  `"-${VAR:-0}"`, is the same defect. See the ground rule in `CONTRIBUTING.md`;
+  this category exists because exactly this reached `kill -TERM -- -1` here.
 - **Data & migrations:** reversibility, lock/downtime risk on large tables,
   index strategy, backfill correctness and restartability, expand-then-contract
   ordering, and whether OLD and NEW code can both run against the migrated
