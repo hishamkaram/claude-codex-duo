@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Durable runner receipts and validation. CCR alone owns the workload."""
+from contextlib import contextmanager
 import hashlib
 import fcntl
 import json
@@ -136,6 +137,41 @@ def close_collector_lease():
         pass
 
 
+def acquire_lock(fd, seconds):
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise ValueError("collector lock remains held") from None
+            time.sleep(max(0, min(0.05, deadline - time.monotonic())))
+
+
+@contextmanager
+def mutation_lease(prefix):
+    """Hold the same prefix lease through the last write, even after parent loss."""
+    path = prefix + ".claim.lock"
+    fd = None
+    try:
+        inherited, expected = os.fstat(9), os.stat(path)
+        if (inherited.st_dev, inherited.st_ino) == (expected.st_dev, expected.st_ino):
+            fd = 9
+    except OSError:
+        pass
+    if fd is None:
+        close_collector_lease()
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        acquire_lock(fd, 5)
+        yield
+    finally:
+        # Do not LOCK_UN: an inherited descriptor shares the parent's lease.
+        # subprocess close_fds prevents the workload inheriting this descriptor.
+        os.close(fd)
+
+
 def prepare(prefix, alias, model, turns, runner, metadata, version, timeout, argv):
     timeout = float(timeout)
     if not 0 < timeout <= 30:
@@ -164,7 +200,6 @@ def prepare(prefix, alias, model, turns, runner, metadata, version, timeout, arg
                  model_document=json.loads(metadata), ccr_version=version,
                  prompt_file=source, prompt_sha256=hashlib.sha256(prompt).hexdigest())
     atomic(prefix + ".ccr-attempt.json", encode(value))
-    close_collector_lease()
     # Receipt bytes go straight to a private file, even if this collector dies.
     fd = os.open(prefix + ".ccr-receipt.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     expired = False
@@ -354,22 +389,23 @@ def main():
         fd, seconds = int(args[0]), float(args[1])
         if fd != 9 or not 0 < seconds <= 5:
             raise ValueError("invalid collector lock request")
-        deadline = time.monotonic() + seconds
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                return
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise ValueError("collector lock remains held") from None
-                time.sleep(max(0, min(0.05, deadline - time.monotonic())))
-    # Admission retains the inherited lease through durable attempt preparation.
-    if operation != "admit":
-        close_collector_lease()
+        acquire_lock(fd, seconds)
+        return
     if operation == "state":
+        close_collector_lease()
         print(state(json.load(sys.stdin)))
         return
     prefix = str(Path(args.pop(0)).resolve())
+    if operation in ("admit", "recover", "freeze", "mirror"):
+        with mutation_lease(prefix):
+            value = dispatch(operation, prefix, args)
+    else:
+        close_collector_lease()
+        value = dispatch(operation, prefix, args)
+    print(json.dumps(value))
+
+
+def dispatch(operation, prefix, args):
     if operation == "admit":
         value = prepare(prefix, *args[:7], args[7:])
     elif operation == "verify-attempt":
@@ -392,14 +428,14 @@ def main():
             snapshot_log(record["log"], prefix + ".joblog")
         value = {}
     elif operation == "stopped":
-        value = recover(prefix)
+        value = bound_attempt(prefix)
         record = query(prefix, value["receipt"]["job_id"])
         if not stopped(record):
             raise ValueError("CCR has not positively confirmed workload termination")
         value = record
     else:
         raise ValueError("unknown operation")
-    print(json.dumps(value))
+    return value
 
 
 if __name__ == "__main__":

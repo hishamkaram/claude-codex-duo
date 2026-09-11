@@ -62,6 +62,7 @@ umask 077
 # The job API arrived in 0.5.0; 0.5.1 fixes process-group cleanup observation.
 CCR_MIN_VERSION="0.5.1"
 CCR_HELPER="$(exec 9>&-; cd "$(exec 9>&-; dirname "$0")" && pwd)/ccr-job.py"
+CCR_RUNNER="${CCR_HELPER%/*}/${0##*/}"
 # These are assigned inside ccr_preflight, past its early-return failures. The attach path is
 # allowed to run without a successful preflight (the child is already going), so under `set -u`
 # every reader below would abort the collector mid-publication. Declare them empty up front: an
@@ -303,7 +304,7 @@ raise SystemExit(rc)'
       # F-04 required the bound; the CCR job API is how it is now enforced).
       SSTART=$(exec 9>&-; date +%s)
       SADMISSION_WAIT="$SMOKE_MAX_SEC"; [ "$SADMISSION_WAIT" -le 30 ] || SADMISSION_WAIT=30
-      SRECEIPT=$(exec 9>&-; cd "$SMOKE/repo" && python3 "$CCR_HELPER" admit "$CCR_ATTEMPT_PREFIX" "$ALIAS" "$CLAUDE_MODEL" 6 "$0" "$MODEL_JSON" "$CCR_VER" "$SADMISSION_WAIT" "${ARGV[@]}"); SLRC=$?
+      SRECEIPT=$(exec 9>&-; cd "$SMOKE/repo" && python3 "$CCR_HELPER" admit "$CCR_ATTEMPT_PREFIX" "$ALIAS" "$CLAUDE_MODEL" 6 "$CCR_RUNNER" "$MODEL_JSON" "$CCR_VER" "$SADMISSION_WAIT" "${ARGV[@]}"); SLRC=$?
       SJOB=$(exec 9>&-; ccr_job_field "$SRECEIPT" job_id)
       if [ "$SLRC" != 0 ] || [ -z "$SJOB" ]; then
         echo "PROBE UNDETERMINED: admission unresolved; evidence=$SMOKE; do not retry"
@@ -323,7 +324,7 @@ raise SystemExit(rc)'
         else SKILL="cancellation of job $SJOB NOT confirmed (check: ccr status $SJOB --json)"; fi
         echo "PROBE UNAVAILABLE: backend=ccr alias=$ALIAS smoke timed out after ${SMOKE_MAX_SEC}s ($SKILL) ccr=$CCR_VER"; exit 1
       fi
-      SFROZEN=$(exec 9>&-; python3 "$CCR_HELPER" freeze "$CCR_ATTEMPT_PREFIX" "$SJOB") || { echo "PROBE UNDETERMINED: workload stop/result unproven; evidence=$SMOKE"; exit 1; }
+      SFROZEN=$(exec python3 "$CCR_HELPER" freeze "$CCR_ATTEMPT_PREFIX" "$SJOB") || { echo "PROBE UNDETERMINED: workload stop/result unproven; evidence=$SMOKE"; exit 1; }
       [ "$(exec 9>&-; ccr_job_field "$SFROZEN" successful)" = True ] || { echo "PROBE UNAVAILABLE: unsuccessful workload result; evidence=$SMOKE"; exit 1; }
       cp 9>&- "$CCR_ATTEMPT_PREFIX.joblog" "$SMOKE/stream.jsonl"
       SRC=$(exec 9>&-; ccr_job_field "$SJSON" exit_code); SRC=${SRC:-1}
@@ -457,7 +458,8 @@ prompt_digest() { { shasum -a 256 "$1" 2>/dev/null || sha256sum "$1" 2>/dev/null
 # Kernel file locks serialize collectors, admission and claim rotation. The
 # shell owns descriptor 9; the lock helper inherits it. Observation children
 # close it, including their command-substitution shells. Admission execs its
-# helper with the lease until the private attempt record is durable.
+# helper with the lease through receipt binding. Every mutating helper keeps
+# that lease through its final artifact write, including after collector loss.
 # Keep the lock inode permanently: unlinking it would split future contenders.
 # Old directory locks must drain under the old runner before upgrading.
 publish_lock() {  # [--must], bounded acquisition for every caller
@@ -620,8 +622,8 @@ stamp_claim() {
   # and both rotate, each hiding the other's attempt (cycle 4: CL-04/CX-03). The claim-specific
   # work below stays conditional; the lock does not.
   # Taking the claim (token check, mkdir runner, pid) is serialized against the
-  # gate rotating or replacing it by <prefix>.claim.lock, the same atomic-mkdir
-  # lock the gate holds while it rotates (round-38 CX-03). The lock stays held
+  # gate rotating or replacing it by <prefix>.claim.lock, the same kernel file lock
+  # that the gate holds while it rotates (round-38 CX-03). The lock stays held
   # until the previous attempt's sidecars are rotated away (unlock_claim), so a
   # stale <prefix>.exit can never make a concurrent gate treat this runner's
   # claim as finished and rotate it (round-39 CX-01). This takes the lock through the SAME
@@ -691,7 +693,7 @@ if [ "$ATTACH" = 1 ]; then
   publish_lock
   if [ -e "$PREFIX.ccr-attempt.json" ] && [ ! -e "$PREFIX.exit" ]; then
     [ -z "$EXPECTED_JOB" ] || python3 9>&- "$CCR_HELPER" verify-attempt "$PREFIX" "$EXPECTED_JOB" >/dev/null || die4 "saved attach belongs to a different attempt"
-    python3 9>&- "$CCR_HELPER" recover "$PREFIX" >/dev/null || { echo "codex-run.sh: admission unresolved; retain the claim and investigate, never retry launch" >&2; exit 6; }
+    python3 "$CCR_HELPER" recover "$PREFIX" >/dev/null || { echo "codex-run.sh: admission unresolved; retain the claim and investigate, never retry launch" >&2; exit 6; }
   fi
   [ -e "$PREFIX.detached" ] || die4 "--attach: no $PREFIX.detached — nothing detached from this prefix (a launch that finished wrote .exit; a launch that never ran wrote nothing)"
   [ ! -e "$PREFIX.exit" ] || die4 "--attach: $PREFIX.exit exists, so that attempt already finished; re-read its sidecars instead of attaching"
@@ -784,7 +786,7 @@ if [ "$BACKEND" = ccr ]; then
   ADMISSION_WAIT=$(( MAX_MIN*60 - $(exec 9>&-; elapsed) ))
   [ "$ADMISSION_WAIT" -gt 0 ] || ADMISSION_WAIT=1
   [ "$ADMISSION_WAIT" -le 30 ] || ADMISSION_WAIT=30
-  RECEIPT_JSON=$(exec python3 "$CCR_HELPER" admit "$PREFIX" "$ALIAS" "$CLAUDE_MODEL" "$MAX_TURNS" "$0" "$MODEL_JSON" "$CCR_VER" "$ADMISSION_WAIT" "${ARGV[@]}")
+  RECEIPT_JSON=$(exec python3 "$CCR_HELPER" admit "$PREFIX" "$ALIAS" "$CLAUDE_MODEL" "$MAX_TURNS" "$CCR_RUNNER" "$MODEL_JSON" "$CCR_VER" "$ADMISSION_WAIT" "${ARGV[@]}")
   LRC=$?
   if [ "$LRC" != 0 ]; then
     echo "$(exec 9>&-; elapsed)s ADMISSION-UNKNOWN: retain claim; no terminal outcome; never automatically resubmit" >> "$PREFIX.progress"
@@ -832,21 +834,12 @@ if [ "$BACKEND" = ccr ]; then
     if [ "$(exec 9>&-; elapsed)" -ge $(( MAX_MIN * 60 )) ]; then OUTCOME=DETACHED; break; fi
   done
   if [ "$OUTCOME" = DETACHED ]; then
-    # Every field of this record is owned by the LAUNCH, and a re-detaching attach is not it.
-    # Re-deriving identity= would write down whatever holds the number NOW — laundering an
-    # identity this very run refused to act on into one a later attach would signal on — and
-    # re-deriving claude_model_id= or prompt_sha256= would erase what the launch pinned with
-    # values this process cannot know (cycle 2: CL-04). So an attach copies them forward
-    # verbatim; only a launch writes them.
-    if [ "$ATTACH" = 1 ]; then
-      D_MODEL=$(exec 9>&-; detached_field claude_model_id); D_SHA=$(exec 9>&-; detached_field prompt_sha256); D_TURNS=$(exec 9>&-; detached_field max_turns)
-      D_AT=$(exec 9>&-; detached_field detached_at); D_JOBLOG="${JOB_LOG:-}"
-      ATTACH_CMD=$(exec 9>&-; detached_field attach_command); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
-    else
-      D_MODEL="$CLAUDE_MODEL"; D_SHA=$(exec 9>&-; prompt_digest "$PROMPT_FILE"); D_TURNS="$MAX_TURNS"
-      D_AT=$(exec 9>&-; date -u +%Y-%m-%dT%H:%M:%SZ); D_JOBLOG="${JOB_LOG:-}"
-      ATTACH_CMD=$(exec 9>&-; detached_field attach_command); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
-    fi
+    # Admission committed these fields before watching. Never reopen a caller's
+    # prompt here: it may have changed or disappeared while the job was running.
+    D_MODEL=$(exec 9>&-; detached_field claude_model_id); D_SHA=$(exec 9>&-; detached_field prompt_sha256); D_TURNS=$(exec 9>&-; detached_field max_turns)
+    D_AT=$(exec 9>&-; detached_field detached_at); D_JOBLOG="${JOB_LOG:-}"
+    [ -n "$D_AT" ] || D_AT=$(exec 9>&-; date -u +%Y-%m-%dT%H:%M:%SZ)
+    ATTACH_CMD=$(exec 9>&-; detached_field attach_command); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
     echo "$(exec 9>&-; elapsed)s DETACHED → watch bound reached with the job still running; nothing signalled (job $JOB_ID left running under its owner)" >> "$PREFIX.progress"
     # ORDER MATTERS: .detached is what admits an --attach, so it is written LAST, after every other
     # sidecar this attempt owns. Publishing it first opened a window in which an attach could be
@@ -960,7 +953,7 @@ EOD
     exit 6
   fi
   [ -n "${HELD_LOCK:-}" ] || publish_lock --must
-  FROZEN=$(exec 9>&-; python3 "$CCR_HELPER" freeze "$PREFIX" "$JOB_ID") || {
+  FROZEN=$(exec python3 "$CCR_HELPER" freeze "$PREFIX" "$JOB_ID") || {
     echo "codex-run.sh: result observation unresolved; retain attempt for investigation" >&2
     exit 6
   }

@@ -151,7 +151,7 @@ else:
         self.assertEqual(attach.returncode, 6)
         self.assertEqual(list((self.root / "store/fake-ccr-jobs").glob("*.json")), before)
 
-    def test_admission_lease_survives_collector_until_attempt_is_durable(self):
+    def test_admission_lease_survives_collector_through_receipt_binding(self):
         wrapper = self.root / "admission-helper.py"
         helper = RUNNER.with_name("ccr-job.py")
         wrapper.write_text("""import importlib.util, sys, time
@@ -179,11 +179,11 @@ try:
 finally:
     (root / 'helper-done').write_text('done')
 """.replace("HELPER", repr(str(helper))))
-        lock = self.root / "admission-lease"
         prefix = str(self.root / "admission")
+        lock = Path(prefix + ".claim.lock")
         variables = dict(CCR_HELPER=str(wrapper), PREFIX=prefix, ALIAS="x",
                          CLAUDE_MODEL="anthropic.ccr.x", MAX_TURNS="3", MODEL_JSON='{"provider":"fixture"}',
-                         CCR_VER="0.5.1", ADMISSION_WAIT="2")
+                         CCR_VER="0.5.1", ADMISSION_WAIT="2", CCR_RUNNER=str(RUNNER))
         assignment = next(line for line in RUNNER.read_text().splitlines()
                           if line.strip().startswith("RECEIPT_JSON="))
         script = "exec 9>>" + shlex.quote(str(lock)) + "\n"
@@ -205,15 +205,6 @@ finally:
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 release.write_text("release")
-                deadline = time.monotonic() + 3
-                while True:
-                    try:
-                        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        self.assertLess(time.monotonic(), deadline, "admission retained lease after durable attempt")
-                        time.sleep(.02)
-                self.assertTrue(Path(prefix + ".ccr-attempt.json").exists())
                 receipt_path = Path(prefix + ".ccr-receipt.json")
                 deadline = time.monotonic() + 1
                 while not receipt_path.exists() or not receipt_path.stat().st_size:
@@ -221,6 +212,16 @@ finally:
                     time.sleep(.02)
                 self.assertIn("job_id", json.loads(receipt_path.read_text()))
                 self.assertFalse(done.exists(), "admission must still be observing the delayed receipt")
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                deadline = time.monotonic() + 4
+                while not done.exists():
+                    self.assertLess(time.monotonic(), deadline, "helper did not finish publication")
+                    time.sleep(.02)
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                admitted = job.load(prefix + ".ccr-attempt.json")
+                self.assertEqual(admitted["receipt"], job.load(receipt_path))
+                self.assertTrue(Path(prefix + ".detached").exists())
         finally:
             release.write_text("release")
             if process.poll() is None:
@@ -230,6 +231,128 @@ finally:
             while ready.exists() and not done.exists():
                 self.assertLess(time.monotonic(), deadline, "owned admission helper did not finish")
                 time.sleep(.02)
+
+    def test_orphaned_mutators_exclude_replacement_until_final_write(self):
+        for operation in ("recover", "freeze", "mirror"):
+            with self.subTest(operation=operation):
+                self.prefix = self.root / operation
+                self.assertEqual(self.launch().returncode, 0)
+                prefix = str(self.prefix)
+                original_job = job.load(prefix + ".ccr-receipt.json")["job_id"]
+                Path(prefix + ".exit").unlink()
+                Path(prefix + ".ccr-result.json").unlink()
+                wrapper = self.root / (operation + "-helper.py")
+                ready, release, done = [self.root / (operation + suffix) for suffix in ("-ready", "-release", "-done")]
+                wrapper.write_text("""import importlib.util, sys, time
+from pathlib import Path
+spec = importlib.util.spec_from_file_location('helper', HELPER)
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+def pause():
+    Path(READY).write_text('ready')
+    end = time.monotonic() + 20
+    while not Path(RELEASE).exists():
+        if time.monotonic() >= end:
+            raise RuntimeError('fixture release missing')
+        time.sleep(.02)
+original_atomic, original_snapshot = m.atomic, m.snapshot_log
+def atomic(path, data):
+    suffix = '.ccr-attempt.json' if OPERATION == 'recover' else '.ccr-result.json'
+    if OPERATION != 'mirror' and str(path).endswith(suffix):
+        pause()
+    original_atomic(path, data)
+def snapshot(source, destination):
+    if OPERATION == 'mirror':
+        pause()
+    return original_snapshot(source, destination)
+m.atomic, m.snapshot_log = atomic, snapshot
+try:
+    m.main()
+finally:
+    Path(DONE).write_text('done')
+""".replace("HELPER", repr(str(RUNNER.with_name("ccr-job.py"))))
+                    .replace("OPERATION", repr(operation)).replace("READY", repr(str(ready)))
+                    .replace("RELEASE", repr(str(release))).replace("DONE", repr(str(done))))
+                script = "exec 9>>" + shlex.quote(prefix + ".claim.lock") + "\n"
+                script += shlex.join(["python3", str(RUNNER.with_name("ccr-job.py")), "lock", "9", "5"]) + "\n"
+                script += shlex.join(["python3", str(wrapper), operation, prefix, original_job]) + "\ntrue\n"
+                process = subprocess.Popen(["bash", "-c", script], env=self.env,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    deadline = time.monotonic() + 8
+                    while not ready.exists():
+                        self.assertLess(time.monotonic(), deadline, "mutator did not reach final write")
+                        time.sleep(.02)
+                    process.kill()
+                    process.wait()
+                    rejected = self.launch()
+                    self.assertEqual(rejected.returncode, 4, rejected.stdout + rejected.stderr)
+                    self.assertEqual(job.load(prefix + ".ccr-receipt.json")["job_id"], original_job)
+                    self.assertFalse(done.exists(), "helper must remain alive through replacement refusal")
+                    release.write_text("release")
+                    deadline = time.monotonic() + 3
+                    while not done.exists():
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(.02)
+                    replacement = self.launch()
+                    self.assertEqual(replacement.returncode, 0, replacement.stdout + replacement.stderr)
+                    admitted = job.load(prefix + ".ccr-attempt.json")["receipt"]
+                    self.assertNotEqual(admitted["job_id"], original_job)
+                    self.assertEqual(admitted, job.load(prefix + ".ccr-receipt.json"))
+                    self.assertEqual(admitted["job_id"], job.load(prefix + ".ccr-result.json")["job_id"])
+                finally:
+                    release.write_text("release")
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    deadline = time.monotonic() + 3
+                    while ready.exists() and not done.exists():
+                        self.assertLess(time.monotonic(), deadline, "owned helper did not finish")
+                        time.sleep(.02)
+
+    def test_relative_probe_saves_executable_recovery_commands(self):
+        result = subprocess.run(["bash", str(RUNNER.relative_to(ROOT)), "--probe", "--via", "ccr:x",
+                                 "--record-dir", str(self.root)], cwd=ROOT, env=self.env,
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        location = next(line.split(": ", 1)[1] for line in result.stderr.splitlines()
+                        if line.startswith("CCR smoke evidence:"))
+        attempt = job.load(Path(location) / "run.ccr-attempt.json")
+        self.assertEqual(Path(attempt["runner"]).resolve(), RUNNER.resolve())
+        fields = dict(line.split("=", 1) for line in (Path(location) / "run.detached").read_text().splitlines())
+        self.assertTrue(Path(shlex.split(fields["attach_command"])[0]).is_file())
+        self.assertTrue(Path(shlex.split(fields["cancel_command"])[1]).is_file())
+
+    def test_watch_timeout_keeps_admitted_prompt_digest(self):
+        for action in ("edit", "delete"):
+            with self.subTest(action=action):
+                self.prefix = self.root / action
+                self.prompt.write_text("Original prompt bytes")
+                self.fast_clock()
+                process = subprocess.Popen(["bash", str(RUNNER), str(self.prefix), "--via", "ccr:x",
+                                            "--prompt-file", str(self.prompt), "--poll-sec", "1",
+                                            "--max-min", "1", "--stall-min", "10"],
+                                           env=dict(self.env, FAKE_CCR_MODE="sleep"),
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                try:
+                    detached = Path(str(self.prefix) + ".detached")
+                    deadline = time.monotonic() + 8
+                    while not detached.exists():
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(.02)
+                    if action == "edit":
+                        self.prompt.write_text("Changed after admission")
+                    else:
+                        self.prompt.unlink()
+                    self.assertEqual(process.wait(timeout=10), 6)
+                    expected = job.load(str(self.prefix) + ".ccr-attempt.json")["prompt_sha256"]
+                    fields = dict(line.split("=", 1) for line in detached.read_text().splitlines())
+                    self.assertEqual(fields["prompt_sha256"], expected)
+                    self.assertEqual(self.run_runner(str(self.prefix), "--attach", "--cancel").returncode, 0)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
 
     def test_watcher_death_is_immediately_attachable(self):
         ready, release = self.root / "poll-ready", self.root / "poll-release"
