@@ -122,12 +122,14 @@ mkdir -p "$TMP/nohome"; PFX4="$TMP/cx04r15"
 HOME="$TMP/nohome" bash "$R" "$PFX4" --prompt-file "$PROMPT" >/dev/null 2>&1; rc=$?
 [ "$rc" = 4 ] && grep -q '^outcome=LAUNCH-ERROR' "$PFX4.meta" 2>/dev/null && [ "$(cat "$PFX4.exit")" = 4 ] && printf '  ok    %-42s\n' "CX-04r15: missing plugin writes .meta + .exit=4" || { printf '  FAIL  CX-04r15: rc=%s meta=%s\n' "$rc" "$(cat "$PFX4.meta" 2>/dev/null)"; FAIL=1; }
 HOME="$TMP/nohome" bash "$R" "$PFX4" --prompt-file "$PROMPT" >/dev/null 2>&1
-# CX-01r26: a runner killed after launching leaves only .progress/.stderr; the next
-# launch rotates that orphan as a unit instead of truncating it, and the runner
-# records its own pid in the gate's claim so the gate can tell it is alive.
+# Unknown legacy progress cannot establish termination or authorize a new launch.
 PFX5="$TMP/runner-orphan"; printf '10s launched job=orphan\n' > "$PFX5.progress"; mkdir -p "$PFX5.claim"; printf 'pid=1\nat=now\ngate=pre-codex\n' > "$PFX5.claim/owner"
+cp "$PFX5.progress" "$TMP/orphan-progress.before"; cp "$PFX5.claim/owner" "$TMP/orphan-owner.before"
+HOME="$TMP/nohome" bash "$R" "$PFX5" --prompt-file "$PROMPT" >/dev/null 2>&1; rc=$?
+[ "$rc" = 4 ] && cmp -s "$PFX5.progress" "$TMP/orphan-progress.before" && cmp -s "$PFX5.claim/owner" "$TMP/orphan-owner.before" && [ ! -e "$PFX5.exit" ] && [ ! -e "$PFX5.attempt1.progress" ] && [ ! -e "$PFX5.claim/runner" ] && printf '  ok    %-42s\n' "unknown legacy attempt retained without admission" || { printf '  FAIL  unknown legacy attempt changed\n'; FAIL=1; }
+# Claim stamping is tested on a separate fresh attempt, with no uncertain work.
+PFX5="$TMP/runner-fresh-claim"; mkdir -p "$PFX5.claim"; printf 'pid=1\nat=now\ngate=pre-codex\n' > "$PFX5.claim/owner"
 HOME="$TMP/nohome" bash "$R" "$PFX5" --prompt-file "$PROMPT" >/dev/null 2>&1
-grep -q 'job=orphan' "$PFX5.attempt1.progress" 2>/dev/null && [ -s "$PFX5.exit" ] && printf '  ok    %-42s\n' "CX-01r26: orphaned .progress rotated, not truncated" || { printf '  FAIL  CX-01r26: orphaned .progress was not rotated\n'; FAIL=1; }
 grep -q '^runner_pid=[0-9]' "$PFX5.claim/owner" && grep -q '^started=' "$PFX5.claim/owner" && printf '  ok    %-42s\n' "CX-01r26: runner stamps its pid into the claim" || { printf '  FAIL  CX-01r26: claim not stamped by runner\n'; FAIL=1; }
 # CX-02r28: one claim authorizes one runner; a second runner on a stamped claim refuses (exit 4).
 cp "$PFX5.exit" "$TMP/pfx5-exit.bak"

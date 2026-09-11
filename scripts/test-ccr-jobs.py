@@ -204,7 +204,8 @@ finally:
         lock = Path(prefix + ".claim.lock")
         variables = dict(CCR_HELPER=str(wrapper), PREFIX=prefix, ALIAS="x",
                          CLAUDE_MODEL="anthropic.ccr.x", MAX_TURNS="3", MODEL_JSON='{"provider":"fixture"}',
-                         CCR_VER="0.5.1", ADMISSION_WAIT="2", CCR_RUNNER=str(RUNNER))
+                         CCR_VER="0.5.1", ADMISSION_WAIT="2", CCR_RUNNER=str(RUNNER),
+                         STALL_MIN="10", MAX_MIN="1", POLL="1")
         assignment = next(line for line in RUNNER.read_text().splitlines()
                           if line.strip().startswith("RECEIPT_JSON="))
         script = "exec 9>>" + shlex.quote(str(lock)) + "\n"
@@ -343,6 +344,26 @@ finally:
         fields = dict(line.split("=", 1) for line in (Path(location) / "run.detached").read_text().splitlines())
         self.assertTrue(Path(shlex.split(fields["attach_command"])[0]).is_file())
         self.assertTrue(Path(shlex.split(fields["cancel_command"])[1]).is_file())
+
+    def test_saved_attach_preserves_limits_and_explicit_overrides(self):
+        self.assertEqual(self.bounded_launch(FAKE_CCR_MODE="sleep").returncode, 6)
+        fields = dict(line.split("=", 1) for line in
+                      Path(str(self.prefix) + ".detached").read_text().splitlines())
+        command = shlex.split(fields["attach_command"])
+        # Execute the advertised command: checking its text alone would miss
+        # an attach path that ignores the saved cancellation policy.
+        sleeper = self.root / "sleep"
+        sleeper.write_text("#!/bin/sh\nexit 0\n")
+        sleeper.chmod(0o700)
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+        self.assertIn("stall_min=10 max_min=1", Path(str(self.prefix) + ".meta").read_text())
+        self.assertFalse(Path(str(self.prefix) + ".exit").exists())
+        self.assertEqual(command[command.index("--poll-sec") + 1], "1")
+        result = subprocess.run(command + ["--stall-min", "1", "--max-min", "10"],
+                                env=self.env, capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("stall_min=1 max_min=10", Path(str(self.prefix) + ".meta").read_text())
 
     def test_watch_timeout_keeps_admitted_prompt_digest(self):
         for action in ("edit", "delete"):
@@ -550,7 +571,7 @@ os.execv('/bin/ps', ['ps'] + sys.argv[1:])
             with self.subTest(shape=shape):
                 prefix = str(self.root / ("admission-" + shape))
                 args = ["python3", str(RUNNER.with_name("ccr-job.py")), "admit", prefix,
-                        "x", "anthropic.ccr.x", "100", str(RUNNER), "{}", "0.5.1", "0.5",
+                        "x", "anthropic.ccr.x", "100", str(RUNNER), "{}", "0.5.1", "0.5", "10", "1", "1",
                         "ccr", "launch", "--model", "x", "--detach", "--prompt-file", str(self.prompt)]
                 started = time.monotonic()
                 result = subprocess.run(args, env=dict(self.env, FAKE_CCR_HANG_RECEIPT=shape),

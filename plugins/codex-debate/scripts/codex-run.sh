@@ -304,7 +304,7 @@ raise SystemExit(rc)'
       # F-04 required the bound; the CCR job API is how it is now enforced).
       SSTART=$(exec 9>&-; date +%s)
       SADMISSION_WAIT="$SMOKE_MAX_SEC"; [ "$SADMISSION_WAIT" -le 30 ] || SADMISSION_WAIT=30
-      SRECEIPT=$(exec 9>&-; cd "$SMOKE/repo" && python3 "$CCR_HELPER" admit "$CCR_ATTEMPT_PREFIX" "$ALIAS" "$CLAUDE_MODEL" 6 "$CCR_RUNNER" "$MODEL_JSON" "$CCR_VER" "$SADMISSION_WAIT" "${ARGV[@]}"); SLRC=$?
+      SRECEIPT=$(exec 9>&-; cd "$SMOKE/repo" && python3 "$CCR_HELPER" admit "$CCR_ATTEMPT_PREFIX" "$ALIAS" "$CLAUDE_MODEL" 6 "$CCR_RUNNER" "$MODEL_JSON" "$CCR_VER" "$SADMISSION_WAIT" "$(( (SMOKE_MAX_SEC + 59) / 60 ))" "$(( (SMOKE_MAX_SEC + 59) / 60 ))" 2 "${ARGV[@]}"); SLRC=$?
       SJOB=$(exec 9>&-; ccr_job_field "$SRECEIPT" job_id)
       if [ "$SLRC" != 0 ] || [ -z "$SJOB" ]; then
         echo "PROBE UNDETERMINED: admission unresolved; evidence=$SMOKE; do not retry"
@@ -791,7 +791,7 @@ if [ "$BACKEND" = ccr ]; then
   ADMISSION_WAIT=$(( MAX_MIN*60 - $(exec 9>&-; elapsed) ))
   [ "$ADMISSION_WAIT" -gt 0 ] || ADMISSION_WAIT=1
   [ "$ADMISSION_WAIT" -le 30 ] || ADMISSION_WAIT=30
-  RECEIPT_JSON=$(exec python3 "$CCR_HELPER" admit "$PREFIX" "$ALIAS" "$CLAUDE_MODEL" "$MAX_TURNS" "$CCR_RUNNER" "$MODEL_JSON" "$CCR_VER" "$ADMISSION_WAIT" "${ARGV[@]}")
+  RECEIPT_JSON=$(exec python3 "$CCR_HELPER" admit "$PREFIX" "$ALIAS" "$CLAUDE_MODEL" "$MAX_TURNS" "$CCR_RUNNER" "$MODEL_JSON" "$CCR_VER" "$ADMISSION_WAIT" "$STALL_MIN" "$MAX_MIN" "$POLL" "${ARGV[@]}")
   LRC=$?
   if [ "$LRC" != 0 ]; then
     echo "$(exec 9>&-; elapsed)s ADMISSION-UNKNOWN: retain claim; no terminal outcome; never automatically resubmit" >> "$PREFIX.progress"

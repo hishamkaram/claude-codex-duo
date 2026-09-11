@@ -123,7 +123,10 @@ def recover(prefix):
                       provider_model=value["model_document"].get("provider_model", ""),
                       compatibility=value["model_document"].get("compatibility", ""),
                       ccr_version=value["ccr_version"], command=shlex.join(value["argv"]),
-                      attach_command=shlex.join([value["runner"], prefix, "--attach", "--expected-job", admitted["job_id"]]),
+                      attach_command=shlex.join([value["runner"], prefix, "--attach", "--expected-job", admitted["job_id"],
+                                               "--stall-min", str(value.get("stall_min", 6)),
+                                               "--max-min", str(value.get("max_min", 25)),
+                                               "--poll-sec", str(value.get("poll_sec", 15))]),
                       cancel_command=shlex.join(["python3", str(Path(value["runner"]).with_name("ccr-job.py")),
                                                 "cancel-attempt", prefix, admitted["job_id"]]))
         atomic(prefix + ".detached", "".join(f"{k}={v}\n" for k, v in fields.items()).encode())
@@ -172,7 +175,10 @@ def mutation_lease(prefix):
         os.close(fd)
 
 
-def prepare(prefix, alias, model, turns, runner, metadata, version, timeout, argv):
+def prepare(prefix, alias, model, turns, runner, metadata, version, timeout, stall, maximum, poll, argv):
+    limits = [int(item) for item in (stall, maximum, poll)]
+    if any(item <= 0 for item in limits):
+        raise ValueError("watch limits must be positive integers")
     timeout = float(timeout)
     if not 0 < timeout <= 30:
         raise ValueError("admission observation timeout must be between zero and 30 seconds")
@@ -198,6 +204,7 @@ def prepare(prefix, alias, model, turns, runner, metadata, version, timeout, arg
                  cwd=os.getcwd(), executable=argv[0], argv=argv,
                  alias=alias, model=model, max_turns=turns, runner=str(Path(runner).resolve()),
                  model_document=json.loads(metadata), ccr_version=version,
+                 stall_min=limits[0], max_min=limits[1], poll_sec=limits[2],
                  prompt_file=source, prompt_sha256=hashlib.sha256(prompt).hexdigest())
     atomic(prefix + ".ccr-attempt.json", encode(value))
     # Receipt bytes go straight to a private file, even if this collector dies.
@@ -407,7 +414,7 @@ def main():
 
 def dispatch(operation, prefix, args):
     if operation == "admit":
-        value = prepare(prefix, *args[:7], args[7:])
+        value = prepare(prefix, *args[:10], args[10:])
     elif operation == "verify-attempt":
         value = bound_attempt(prefix)
         if value["receipt"]["job_id"] != args[0]:
