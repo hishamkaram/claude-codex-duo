@@ -102,7 +102,8 @@ elif args[0] in ("status", "cancel"):
             record.update(status="cancelled", exit_code=137)
         elif record["status"] == "running" and mode not in ("sleep", "grandchild", "receipt_lost"):
             if mode != "slowok" or time.time() - record["fixture_started"] >= record["fixture_delay"]:
-                record.update(status="failed" if mode == "fail" else "completed", exit_code=1 if mode == "fail" else 0)
+                failed = mode in ("fail", "error_result", "noresult")
+                record.update(status="failed" if failed else "completed", exit_code=1 if failed else 0)
         if record["status"] != "running":
             record.update(admission_state="finished", workload_disposition="stopped")
             record["cleanup"] = dict(coverage="partial", survivors=[], observed=["launch_pgid_members"], reason="")

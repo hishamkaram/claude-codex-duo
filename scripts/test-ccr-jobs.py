@@ -104,6 +104,19 @@ esac
                                     capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, expected, result.stderr)
 
+    def test_malformed_resume_ids_fail_before_claim_mutation(self):
+        claim = Path(str(self.prefix) + ".claim")
+        claim.mkdir()
+        (claim / "owner").write_text("token=original\n")
+        for sid, parent in (("not-a-uuid", "ccr-" + str(uuid.uuid4())),
+                            (str(uuid.uuid4()), "not-a-job")):
+            result = self.run_runner(str(self.prefix), "--via", "ccr:x", "--resume-session", sid,
+                                     "--expected-parent-job", parent, "--prompt-file", str(self.prompt))
+            self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+            self.assertEqual((claim / "owner").read_text(), "token=original\n")
+            self.assertFalse(Path(str(self.prefix) + ".ccr-attempt.json").exists())
+            self.assertFalse(Path(str(self.prefix) + ".exit").exists())
+
     def test_not_started_release_requires_aborted_terminal_evidence(self):
         value = dict(schema_version=2, job_id="ccr-" + str(uuid.uuid4()), session_id=str(uuid.uuid4()),
                      status="failed", exit_code=None, workload_disposition="not_started", admission_state="aborted")

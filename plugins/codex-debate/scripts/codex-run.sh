@@ -4,7 +4,7 @@
 # Usage:
 #   codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file>
 #                [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>]
-#                [--max-turns N]                                  (--max-turns and --resume-session: ccr backend only)
+#                [--max-turns N] [--expected-parent-job <job>]       (CCR options)
 #   codex-run.sh <out-prefix> --attach [--stall-min N] [--max-min M] [--poll-sec S]
 #   codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]
 #
@@ -351,7 +351,7 @@ raise SystemExit(rc)'
     *) echo "PROBE UNAVAILABLE: --via must be codex or ccr:<alias> (got '$VIA')"; exit 1;;
   esac
 fi
-USAGE='usage: codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>] [--max-turns N]
+USAGE='usage: codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>] [--max-turns N] [--expected-parent-job <job>]
        codex-run.sh <out-prefix> --attach [--stall-min N] [--max-min M] [--poll-sec S]
        codex-run.sh <out-prefix> --attach --cancel
        codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]'
@@ -429,8 +429,20 @@ else
   [ -n "$MAX_TURNS" ] || MAX_TURNS=$CCR_MAX_TURNS_DEFAULT
   case "$RESUME_SESSION" in *[!A-Za-z0-9-]*) die4 "--resume-session: a session id has only letters, digits and '-' (got '$RESUME_SESSION')";; esac
 fi
+valid_resume_identity() {
+  python3 - "$1" "$2" <<'PYIDS'
+import sys, uuid
+try:
+    sid, job = sys.argv[1:]
+    valid = str(uuid.UUID(sid)) == sid and job.startswith("ccr-") and str(uuid.UUID(job[4:])) == job[4:]
+except ValueError:
+    valid = False
+sys.exit(0 if valid else 1)
+PYIDS
+}
 if [ "$BACKEND" = ccr ] && [ "$ATTACH" != 1 ] && [ "$MODE" = --resume-session ]; then
   [ -n "$EXPECTED_PARENT" ] || die4 "--resume-session requires --expected-parent-job; resolve the session head before preparing this round's prompt"
+  valid_resume_identity "$RESUME_SESSION" "$EXPECTED_PARENT" || die4 "resume requires a canonical session UUID and ccr-UUID parent job"
 fi
 for v in STALL_MIN MAX_MIN POLL MAX_TURNS; do
   eval "val=\$$v"
@@ -790,6 +802,7 @@ if [ "$BACKEND" = ccr ]; then
     [ -n "$SAVED_PARENT" ] || launch_error "--resume-last: no previous CCR job anchor" "$CMD"
     [ -z "$EXPECTED_PARENT" ] || [ "$EXPECTED_PARENT" = "$SAVED_PARENT" ] || launch_error "saved parent differs from requested parent" "$CMD"
     EXPECTED_PARENT="$SAVED_PARENT"
+    valid_resume_identity "$SESSION" "$EXPECTED_PARENT" || launch_error "saved session or parent identity is malformed" "$CMD"
   elif [ "$MODE" = "--resume-session" ]; then SESSION="$RESUME_SESSION"; fi
   ccr_launch_argv "$ALIAS" "$MAX_TURNS" "$PROMPT_FILE"
   if [ -n "$SESSION" ]; then ARGV+=("--resume=$SESSION" "--expected-parent-job=$EXPECTED_PARENT"); fi
