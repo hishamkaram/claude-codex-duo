@@ -609,6 +609,58 @@ os.execv('/bin/ps', ['ps'] + sys.argv[1:])
         self.assertEqual(result.returncode, 6)
 
 
+class ConsumerSafetyTests(unittest.TestCase):
+    def test_write_escalation_requires_original_owner_identity(self):
+        source = (ROOT / "plugins/codex-deep-plan/scripts/implement-run.sh").read_text()
+        functions = source[source.index("pgid_of()"):source.index("stream_field()")]
+        for scenario in ("unchanged", "owner-unavailable", "identity-changed"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                script = functions + """
+pgid_of() {
+  if [ "$1" = "$$" ]; then echo 222222; return; fi
+  if [ "$SCENARIO" = owner-unavailable ] && [ -e "$FIXTURE/term" ]; then return 1; fi
+  echo 333333
+}
+proc_identity() {
+  if [ "$SCENARIO" = identity-changed ] && [ -e "$FIXTURE/term" ]; then echo replacement; else echo admitted; fi
+}
+kill() {
+  printf '%s\\n' "$*" >> "$FIXTURE/signals"
+  [ "$1" != -TERM ] || : > "$FIXTURE/term"
+  return 0
+}
+sleep() { :; }
+kill_group 333333 333333 admitted
+"""
+                result = subprocess.run(["bash", "-c", script],
+                                        env=dict(os.environ, FIXTURE=directory, SCENARIO=scenario),
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                signals = (Path(directory) / "signals").read_text()
+                self.assertIn("-TERM", signals)
+                self.assertEqual("-KILL" in signals, scenario == "unchanged", signals)
+
+    def test_codex_saved_commands_preserve_every_path_argument(self):
+        source = RUNNER.read_text().splitlines()
+        quote = next(line for line in source if line.startswith("quote_command()"))
+        assignments = [line.strip() for line in source
+                       if ("ATTACH_CMD=" in line and "$PREFIX" in line and "--stall-min" in line)
+                       or ("CANCEL_CMD=" in line and "codex-companion.mjs" in line)]
+        self.assertEqual(len(assignments), 2)
+        runner = "/tmp/runner 'quoted' $(literal)/codex-run.sh"
+        prefix = "/tmp/review with spaces/round;literal"
+        plugin = "/tmp/plugin 'quoted' with spaces"
+        env = dict(os.environ, CCR_RUNNER=runner, PREFIX=prefix, CODEX_ROOT=plugin,
+                   STALL_MIN="1", MAX_MIN="2", POLL="3", JOB="task-123")
+        result = subprocess.run(["bash", "-c", quote + "\n" + "\n".join(assignments)
+                                 + '\nprintf "%s\\n%s\\n" "$ATTACH_CMD" "$CANCEL_CMD"'],
+                                env=env, capture_output=True, text=True, timeout=5, check=True)
+        attach, cancel = result.stdout.splitlines()
+        self.assertEqual(shlex.split(attach), [runner, prefix, "--attach", "--stall-min", "1",
+                                               "--max-min", "2", "--poll-sec", "3"])
+        self.assertEqual(shlex.split(cancel), ["node", plugin + "/scripts/codex-companion.mjs", "cancel", "task-123"])
+
+
 class StopEvidenceTests(unittest.TestCase):
     def record(self):
         return dict(job_id="ccr-" + str(uuid.uuid4()), session_id=str(uuid.uuid4()),

@@ -454,6 +454,7 @@ write_detached() {  # key=value lines on stdin
   mv 9>&- "$tmp" "$PREFIX.detached"
 }
 detached_field() { awk -F= -v k="$1" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$PREFIX.detached" 2>/dev/null; }
+quote_command() { python3 -c 'import shlex,sys; print(shlex.join(sys.argv[1:]))' "$@"; }
 prompt_digest() { { shasum -a 256 "$1" 2>/dev/null || sha256sum "$1" 2>/dev/null; } | awk '{print $1; exit}'; }
 # Kernel file locks serialize collectors, admission and claim rotation. The
 # shell owns descriptor 9; the lock helper inherits it. Observation children
@@ -1114,8 +1115,8 @@ if [ "$OUTCOME" = "DETACHED" ]; then
     # job is still running rather than assume it (cycle 3: CL-03/CX-02). The companion remains the
     # authority; this is the cheap local check, and `job=` is what a relaunch consults.
     D_WPID="${PID:-}"; D_WIDENT=$(exec 9>&-; proc_identity "${PID:-0}")
-    ATTACH_CMD="$0 $PREFIX --attach --stall-min $STALL_MIN --max-min $MAX_MIN --poll-sec $POLL"
-    CANCEL_CMD="node $CODEX_ROOT/scripts/codex-companion.mjs cancel $JOB"
+    ATTACH_CMD=$(exec 9>&-; quote_command "$CCR_RUNNER" "$PREFIX" --attach --stall-min "$STALL_MIN" --max-min "$MAX_MIN" --poll-sec "$POLL")
+    CANCEL_CMD=$(exec 9>&-; quote_command node "$CODEX_ROOT/scripts/codex-companion.mjs" cancel "$JOB")
   fi
   echo "$(exec 9>&-; elapsed)s DETACHED → watch bound reached with job $JOB still running; not cancelled" >> "$PREFIX.progress"
   {

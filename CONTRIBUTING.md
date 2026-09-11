@@ -52,3 +52,8 @@ commands bind the original job: `--expected-job` on attach rejects prefix reuse;
 the cancellation helper enforces the same identity before requesting cancellation.
 An unconfirmed write-runner cancellation returns exit5 without waiting for an
 unproven stop or staging/committing files that the workload may still change.
+
+The separate write runner checks the recorded owner identity again before forceful
+escalation. If the leader disappears or its identity changes, cancellation remains
+unconfirmed and the runner does not wait or commit the live worktree. Saved Codex
+recovery commands quote every argument, including installation and artifact paths.
