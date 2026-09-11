@@ -617,10 +617,10 @@ finally:
                 release.write_text("release")
                 receipt_path = Path(prefix + ".ccr-receipt.json")
                 deadline = time.monotonic() + 1
-                while not receipt_path.exists() or not receipt_path.stat().st_size:
+                while not any(path.stat().st_size for path in job.observation_paths(prefix, "capture")):
                     self.assertLess(time.monotonic(), deadline, "workload admission never returned a receipt")
                     time.sleep(.02)
-                self.assertIn("job_id", json.loads(receipt_path.read_text()))
+                self.assertTrue(any("job_id" in json.loads(path.read_text()) for path in job.observation_paths(prefix, "capture")))
                 self.assertFalse(done.exists(), "admission must still be observing the delayed receipt")
                 with self.assertRaises(BlockingIOError):
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
