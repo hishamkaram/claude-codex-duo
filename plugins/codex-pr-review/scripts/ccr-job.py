@@ -137,11 +137,44 @@ def admission_identity(value, admitted):
     return admitted
 
 
-def observation_paths(prefix):
+def observation_paths(prefix, kind="observation"):
     path = Path(prefix)
     # Avoid glob interpretation of caller-selected artifact directory names.
-    stem = path.name + ".ccr-observation."
+    stem = path.name + ".ccr-" + kind + "."
     return sorted(item for item in path.parent.iterdir() if item.name.startswith(stem))
+
+
+def capture_response(prefix, source, argv, value, timeout, errors):
+    # Publish a locked, named capture BEFORE starting the submitter. Its stdout
+    # inherits this open-file description and lease, so helper loss cannot erase
+    # received bytes or make an unfinished writer look like stable evidence.
+    fd, staging = tempfile.mkstemp(prefix=".ccr-capture-", dir=Path(prefix).parent)
+    expired, code = False, None
+    try:
+        with os.fdopen(fd, "w+b") as output:
+            fcntl.flock(output.fileno(), fcntl.LOCK_EX)
+            os.fsync(output.fileno())
+            os.replace(staging, prefix + ".ccr-capture." + source + "." + uuid.uuid4().hex)
+            directory = os.open(Path(prefix).parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+            try:
+                result = subprocess.run(argv, cwd=value["cwd"], env=environment(value),
+                                        stdin=subprocess.DEVNULL, stdout=output, stderr=errors,
+                                        timeout=timeout, check=False)
+                code = result.returncode
+            except subprocess.TimeoutExpired:
+                expired = True
+            output.flush()
+            os.fsync(output.fileno())
+            output.seek(0)
+            raw = output.read()
+        return raw, expired, code
+    finally:
+        if os.path.exists(staging):
+            os.unlink(staging)
 
 
 def retain_observation(prefix, source, raw):
@@ -162,14 +195,21 @@ def validate_observations(prefix, value, mark_conflict=False):
     observations = [("embedded", value.get("receipt"))]
     paths = [Path(prefix + suffix) for suffix in
              (".ccr-receipt.json", ".ccr-receipt.observed", ".ccr-recovery-receipt.json")]
-    paths.extend(observation_paths(prefix))
+    hashed = observation_paths(prefix)
+    captures = observation_paths(prefix, "capture")
+    paths.extend(hashed + captures)
     for path in paths:
         try:
             with open_regular(path) as stream:
+                if path in captures:
+                    try:
+                        fcntl.flock(stream.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        raise ValueError("admission response is still being captured") from None
                 raw = stream.read()
         except FileNotFoundError:
             continue
-        if path in paths[3:] and hashlib.sha256(raw).hexdigest() != path.name.rsplit(".", 1)[-1]:
+        if path in hashed and hashlib.sha256(raw).hexdigest() != path.name.rsplit(".", 1)[-1]:
             raise ValueError("retained admission observation changed")
         try:
             observations.append((path.name, json.loads(raw)))
@@ -198,14 +238,14 @@ def validate_observations(prefix, value, mark_conflict=False):
 
 
 def lookup_submission(prefix, value):
-    result = subprocess.run([value["executable"], "status", "--submission-id=" + value["submission_id"], "--json"],
-                            cwd=value["cwd"], env=environment(value), capture_output=True,
-                            timeout=20, check=False)
-    retain_observation(prefix, "submission_lookup", result.stdout)
+    raw, expired, code = capture_response(prefix, "submission_lookup",
+        [value["executable"], "status", "--submission-id=" + value["submission_id"], "--json"],
+        value, 20, subprocess.DEVNULL)
+    retain_observation(prefix, "submission_lookup", raw)
     validate_observations(prefix, value, mark_conflict=True)
-    if result.returncode:
+    if expired or code:
         raise ValueError("submission lookup unavailable; admission remains unresolved")
-    return admission_identity(value, json.loads(result.stdout))
+    return admission_identity(value, json.loads(raw))
 
 
 def bound_attempt(prefix):
@@ -371,20 +411,11 @@ def prepare(prefix, alias, model, turns, runner, metadata, version, timeout, sta
                  stall_min=limits[0], max_min=limits[1], poll_sec=limits[2],
                  prompt_file=source, prompt_sha256=hashlib.sha256(prompt).hexdigest())
     atomic(prefix + ".ccr-attempt.json", encode(value))
-    # Receipt bytes go straight to a private file, even if this collector dies.
-    fd = os.open(prefix + ".ccr-receipt.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    expired = False
-    with os.fdopen(fd, "wb") as output, open(prefix + ".stderr", "ab") as errors:
-        try:
-            # subprocess owns this direct submitting child. Its timeout kills
-            # and reaps that child only, never the detached owner or a group.
-            subprocess.run(argv, env=environment(value), cwd=value["cwd"],
-                           stdin=subprocess.DEVNULL, stdout=output, stderr=errors,
-                           timeout=timeout, check=False)
-        except subprocess.TimeoutExpired:
-            expired = True
-        output.flush()
-        os.fsync(output.fileno())
+    with open(prefix + ".stderr", "ab") as errors:
+        raw, expired, _ = capture_response(prefix, "admission_receipt", argv, value, timeout, errors)
+    retain_observation(prefix, "admission_receipt", raw)
+    validate_observations(prefix, value, mark_conflict=True)
+    atomic(prefix + ".ccr-receipt.json", raw)
     admitted = recover(prefix)["receipt"]
     if expired:
         raise ValueError("admission observation timed out; receipt retained; attach to the original attempt")
@@ -601,15 +632,8 @@ def complete_admission(prefix):
         raise ValueError("saved prompt changed; cannot recover admission")
     # Explicit recovery submits the complete matching request under its original
     # token. CCR owns the lease, fingerprint and execution-intent decision.
-    with tempfile.TemporaryFile() as output, open(prefix + ".stderr", "ab") as errors:
-        try:
-            subprocess.run(value["argv"], cwd=value["cwd"], env=environment(value),
-                           stdin=subprocess.DEVNULL, stdout=output, stderr=errors,
-                           timeout=30, check=False)
-        except subprocess.TimeoutExpired:
-            pass
-        output.seek(0)
-        response = output.read()
+    with open(prefix + ".stderr", "ab") as errors:
+        response, _, _ = capture_response(prefix, "resubmission_receipt", value["argv"], value, 30, errors)
     retain_observation(prefix, "resubmission_receipt", response)
     atomic(prefix + ".ccr-recovery-receipt.json", response)
     validate_observations(prefix, value, mark_conflict=True)

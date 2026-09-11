@@ -80,3 +80,11 @@ binding or controlling a job. A conflict remains unresolved across collector
 loss even if no diagnostic marker was published. Fresh attempt rotation preserves
 these observations with the old attempt. CCR's SQLite registry remains the sole
 admission authority; runner observations never authorize execution themselves.
+
+Initial admission, lookup, and replay stdout goes directly to a unique private
+`.ccr-capture.*` file published before spawning CCR. Its exclusive file lease is
+inherited through stdout by the submitting child. Restart readers take a
+nonblocking shared lease, so they refuse unfinished captures even after helper
+loss. Completed or interrupted captures remain discoverable and are checked
+alongside content-addressed observations before any attempt can be controlled.
+These leases cover response writers only; detached workloads remain CCR-owned.

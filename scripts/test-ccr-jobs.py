@@ -105,6 +105,80 @@ esac
         self.assertEqual(value["expected_parent_job"], previous["job_id"])
         self.assertFalse(value["fresh_decision"])
 
+    def test_lookup_timeout_retains_complete_conflicting_stdout(self):
+        self.assertEqual(self.launch().returncode, 0)
+        prefix = str(self.prefix)
+        value = job.load(prefix + ".ccr-attempt.json")
+        conflicting = dict(value["receipt"], job_id="ccr-" + str(uuid.uuid4()))
+        executable = self.root / "ccr"
+        executable.write_text("#!" + sys.executable + "\nimport time\nprint(" + repr(json.dumps(conflicting)) + ", flush=True)\ntime.sleep(25)\n")
+        with self.assertRaises(ValueError):
+            job.lookup_submission(prefix, value)  # Real process, production 20s timeout.
+        self.assertTrue(any(json.loads(path.read_bytes()).get("job_id") == conflicting["job_id"]
+                            for path in job.observation_paths(prefix, "capture")))
+        Path(prefix + ".ccr-admission-conflict.json").unlink(missing_ok=True)
+        executable.write_text("#!" + sys.executable + "\nprint(" + repr(json.dumps(value["receipt"])) + ")\n")
+        with self.assertRaises(ValueError):
+            job.recover(prefix)
+        with self.assertRaises(ValueError):
+            job.bound_attempt(prefix)
+
+    def test_helper_loss_preserves_capture_and_excludes_surviving_writer(self):
+        self.assertEqual(self.launch().returncode, 0)
+        for operation in ("recover", "complete-admission"):
+            with self.subTest(operation=operation):
+                prefix = str(self.root / ("capture-" + operation))
+                value = job.load(str(self.prefix) + ".ccr-attempt.json")
+                original = value["receipt"]
+                if operation == "recover":
+                    value.pop("receipt")
+                job.atomic(prefix + ".ccr-attempt.json", job.encode(value))
+                job.atomic(prefix + ".ccr-receipt.json", job.encode(original))
+                job.atomic(prefix + ".ccr-prompt", self.prompt.read_bytes())
+                conflicting = dict(original, job_id="ccr-" + str(uuid.uuid4()))
+                ready, stop = Path(prefix + ".ready"), Path(prefix + ".stop")
+                script = "#!" + sys.executable + "\nimport sys,time,pathlib\n"
+                if operation == "complete-admission":
+                    script += "if sys.argv[1] == 'status':\n print(" + repr(json.dumps(dict(original, admission_state="prepared"))) + "); sys.exit(0)\n"
+                script += "print(" + repr(json.dumps(conflicting)) + ",flush=True)\npathlib.Path(" + repr(str(ready)) + ").touch()\n"
+                script += "deadline=time.monotonic()+10\nwhile not pathlib.Path(" + repr(str(stop)) + ").exists() and time.monotonic()<deadline: time.sleep(.02)\n"
+                (self.root / "ccr").write_text(script)
+                helper = subprocess.Popen([sys.executable, str(RUNNER.with_name("ccr-job.py")), operation, prefix],
+                                          env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    deadline = time.monotonic() + 5
+                    while not ready.exists() and helper.poll() is None and time.monotonic() < deadline:
+                        time.sleep(.02)
+                    self.assertTrue(ready.exists())
+                    # This is the directly owned test helper, never a workload PID.
+                    helper.kill()
+                    helper.communicate(timeout=5)
+                    self.assertFalse(Path(prefix + ".ccr-admission-conflict.json").exists())
+                    with self.assertRaisesRegex(ValueError, "still being captured"):
+                        job.bound_attempt(prefix)
+                    captures = job.observation_paths(prefix, "capture")
+                    self.assertTrue(captures)
+                    stop.touch()  # The response writer exits cooperatively.
+                    deadline = time.monotonic() + 5
+                    while True:
+                        try:
+                            job.bound_attempt(prefix)
+                        except ValueError as exc:
+                            if "still being captured" not in str(exc):
+                                self.assertIn("conflicting admission", str(exc))
+                                break
+                        else:
+                            self.fail("contradictory capture accepted after helper loss")
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(.02)
+                    self.assertTrue(any(json.loads(path.read_bytes()).get("job_id") == conflicting["job_id"] for path in captures))
+                    self.assertFalse(Path(prefix + ".exit").exists())
+                finally:
+                    stop.touch()
+                    if helper.poll() is None:
+                        helper.kill()
+                    helper.communicate(timeout=5)
+
     def test_persisted_replay_conflict_survives_collector_loss(self):
         self.assertEqual(self.launch().returncode, 0)
         original_value = job.load(str(self.prefix) + ".ccr-attempt.json")
@@ -129,7 +203,8 @@ esac
 
                 def response(argv, **kwargs):
                     if argv[1] == "status":
-                        return subprocess.CompletedProcess(argv, 0, job.encode(dict(original, admission_state="prepared")))
+                        kwargs["stdout"].write(job.encode(dict(original, admission_state="prepared")))
+                        return subprocess.CompletedProcess(argv, 0)
                     kwargs["stdout"].write(job.encode(replacement))
                     return subprocess.CompletedProcess(argv, 0)
 
@@ -179,7 +254,8 @@ esac
     def test_fresh_attempt_rotation_preserves_old_observations(self):
         self.assertEqual(self.launch().returncode, 0)
         prefix = str(self.prefix)
-        previous = {path.name: path.read_bytes() for path in job.observation_paths(prefix)}
+        previous = {path.name: path.read_bytes() for path in
+                    job.observation_paths(prefix) + job.observation_paths(prefix, "capture")}
         self.assertTrue(previous)
         self.assertEqual(self.launch().returncode, 0)
         for name, raw in previous.items():
