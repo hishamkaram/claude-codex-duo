@@ -758,7 +758,7 @@ os.execv('/bin/ps', ['ps'] + sys.argv[1:])
         original = source.read_bytes()
         command = ["python3", str(RUNNER.with_name("ccr-job.py")), "freeze", prefix, evidence["job_id"]]
         for content, code in ((original + b'{"type":"result","result":"late"}\n', 0),
-                              (original[:-1], 6), (b" " + original[1:], 6)):
+                              (original[:-1], 6), (original[:-1] + b" ", 6)):
             Path(prefix + ".ccr-result.json").unlink(missing_ok=True)
             source.write_bytes(content)
             result = subprocess.run(command, env=self.env, capture_output=True, timeout=5)
