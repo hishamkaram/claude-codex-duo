@@ -525,7 +525,8 @@ def resolve_session(prefix, sid):
     if response.returncode:
         raise ValueError("session head lookup failed")
     record = receipt(json.loads(response.stdout))
-    if record["session_id"] != sid or not stopped(record):
+    if (record["session_id"] != sid or record.get("schema_version") not in (1, 2)
+            or not stopped(record) or not releasable(record)):
         raise ValueError("session head is not a positively stopped predecessor")
     anchor = dict(session_id=sid, expected_parent_job=record["job_id"],
                   predecessor_status=record["status"], resolved_at=time.time())

@@ -73,6 +73,37 @@ esac
         self.assertEqual(value["expected_parent_job"], previous["job_id"])
         self.assertFalse(value["fresh_decision"])
 
+    def test_submission_status_mismatch_stays_unresolved(self):
+        result = self.launch(FAKE_CCR_BAD_STATUS=json.dumps(dict(submission_id="different-submission")))
+        self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+        self.assertFalse(Path(str(self.prefix) + ".exit").exists())
+
+    def test_resume_lineage_mismatch_stays_unresolved(self):
+        self.assertEqual(self.launch().returncode, 0)
+        previous = job.load(str(self.prefix) + ".ccr-attempt.json")["receipt"]
+        prefix = self.root / "bad-lineage"
+        self.fast_clock()
+        result = self.run_runner(str(prefix), "--via", "ccr:x", "--resume-session", previous["session_id"],
+                                 "--expected-parent-job", previous["job_id"], "--prompt-file", str(self.prompt),
+                                 "--poll-sec", "1", "--max-min", "1", "--stall-min", "10", FAKE_CCR_BAD_STATUS=json.dumps(dict(resumed_from="ccr-" + str(uuid.uuid4()))))
+        self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+        self.assertFalse(Path(str(prefix) + ".exit").exists())
+
+    def test_anchor_requires_authoritative_stopped_head(self):
+        self.assertEqual(self.launch().returncode, 0)
+        value = job.load(str(self.prefix) + ".ccr-attempt.json")
+        record_path = self.root / "store/fake-ccr-jobs" / (value["receipt"]["job_id"] + ".json")
+        record = job.load(record_path)
+        command = ["python3", str(RUNNER.with_name("ccr-job.py")), "resolve-session",
+                   str(self.root / "anchor"), record["session_id"]]
+        for changes, expected in ((dict(status="failed"), 0),
+                                  (dict(workload_disposition="unknown"), 6),
+                                  (dict(schema_version=3), 6),
+                                  (dict(cleanup=dict(coverage="unknown", survivors=[])), 6)):
+            result = subprocess.run(command, env=dict(self.env, FAKE_CCR_BAD_STATUS=json.dumps(changes)),
+                                    capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, expected, result.stderr)
+
     def test_not_started_release_requires_aborted_terminal_evidence(self):
         value = dict(schema_version=2, job_id="ccr-" + str(uuid.uuid4()), session_id=str(uuid.uuid4()),
                      status="failed", exit_code=None, workload_disposition="not_started", admission_state="aborted")
@@ -718,6 +749,24 @@ os.execv('/bin/ps', ['ps'] + sys.argv[1:])
         self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
         self.assertFalse(Path(str(self.prefix) + ".exit").exists())
         self.assertFalse(Path(str(self.prefix) + ".ccr-result.json").exists())
+
+    def test_first_collection_obeys_ccr_boundary_and_digest(self):
+        self.assertEqual(self.launch().returncode, 0)
+        prefix = str(self.prefix)
+        evidence = job.load(prefix + ".ccr-result.json")
+        source = Path(evidence["status"]["log"])
+        original = source.read_bytes()
+        command = ["python3", str(RUNNER.with_name("ccr-job.py")), "freeze", prefix, evidence["job_id"]]
+        for content, code in ((original + b'{"type":"result","result":"late"}\n', 0),
+                              (original[:-1], 6), (b" " + original[1:], 6)):
+            Path(prefix + ".ccr-result.json").unlink(missing_ok=True)
+            source.write_bytes(content)
+            result = subprocess.run(command, env=self.env, capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, code, result.stderr)
+            if code == 0:
+                self.assertEqual(Path(prefix + ".joblog").read_bytes(), original)
+            else:
+                self.assertFalse(Path(prefix + ".ccr-result.json").exists())
 
     def test_result_append_ignored_but_committed_bytes_cannot_change(self):
         self.assertEqual(self.launch().returncode, 0)
