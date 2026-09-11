@@ -59,8 +59,8 @@
 
 set -u
 umask 077
-# The job API arrived in 0.5.0; 0.5.1 fixes process-group cleanup observation.
-CCR_MIN_VERSION="0.5.1"
+# Transactional submission and guarded same-session continuation require 0.6.0.
+CCR_MIN_VERSION="0.6.0"
 CCR_HELPER="$(exec 9>&-; cd "$(exec 9>&-; dirname "$0")" && pwd)/ccr-job.py"
 CCR_RUNNER="${CCR_HELPER%/*}/${0##*/}"
 # These are assigned inside ccr_preflight, past its early-return failures. The attach path is
@@ -382,12 +382,13 @@ CLAIM_MODE=0; CLAIM_TOKEN=""; for _a in "$@"; do [ "$_a" = "--claim" ] && CLAIM_
 # invocation, so when any of them is present it is reported and nothing is published.
 die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || [ -e "${PREFIX:-/nonexistent}.exit" ] || [ -e "${PREFIX:-/nonexistent}.detached" ] || [ -e "${PREFIX:-/nonexistent}.progress" ] || [ -e "${PREFIX:-/nonexistent}.ccr-attempt.json" ] || [ -e "${PREFIX:-/nonexistent}.ccr-receipt.json" ] || [ -e "${PREFIX:-/nonexistent}.claim.lock" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
 need() { [ $# -ge 2 ] || die4 "$1 requires a value"; case "$2" in -*) die4 "$1 requires a value (got option $2)";; esac; }
-MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""; ATTACH=0; VIA_SET=0; CANCEL_ONLY=0; EXPECTED_JOB=""
+MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""; ATTACH=0; VIA_SET=0; CANCEL_ONLY=0; EXPECTED_JOB=""; EXPECTED_PARENT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --attach) ATTACH=1;;
     --cancel) CANCEL_ONLY=1;;
     --expected-job) need "$@"; EXPECTED_JOB="$2"; shift;;
+    --expected-parent-job) need "$@"; EXPECTED_PARENT="$2"; shift;;
     --fresh|--resume-last) [ "$MODE_SET" != 1 ] || [ "$MODE" = "$1" ] || die4 "$MODE and $1 are exclusive"; MODE="$1"; MODE_SET=1;;
     --via) need "$@"; VIA="$2"; VIA_SET=1; shift;;
     --prompt-file) need "$@"; PROMPT_FILE="$2"; shift;;
@@ -403,6 +404,7 @@ while [ $# -gt 0 ]; do
 done
 # --attach is an operation, not a launch mode: it submits no prompt and chooses no backend. The
 # backend, the launch mode and every identifier come from the detached record the launch left.
+[ -z "$EXPECTED_PARENT" ] || { [ "$ATTACH" != 1 ] && [ "$MODE" != --fresh ]; } || die4 "--expected-parent-job requires a resume launch"
 [ -z "$EXPECTED_JOB" ] || [ "$ATTACH" = 1 ] || die4 "--expected-job requires --attach"
 [ -z "$EXPECTED_JOB" ] || [ -f "$PREFIX.ccr-attempt.json" ] || die4 "--expected-job requires a durable CCR attempt"
 [ "$CANCEL_ONLY" != 1 ] || [ "$ATTACH" = 1 ] || die4 "--cancel is only valid with --attach"
@@ -422,13 +424,13 @@ esac
 if [ "$BACKEND" = codex ]; then
   [ -z "$MAX_TURNS" ] || die4 "--max-turns is ccr-only (pass --via ccr:<alias>)"
   [ -z "$RESUME_SESSION" ] || die4 "--resume-session is ccr-only (pass --via ccr:<alias>)"
+  [ -z "$EXPECTED_PARENT" ] || die4 "--expected-parent-job is ccr-only"
 else
   [ -n "$MAX_TURNS" ] || MAX_TURNS=$CCR_MAX_TURNS_DEFAULT
   case "$RESUME_SESSION" in *[!A-Za-z0-9-]*) die4 "--resume-session: a session id has only letters, digits and '-' (got '$RESUME_SESSION')";; esac
 fi
-if [ "$BACKEND" = ccr ] && [ "$ATTACH" != 1 ] && [ "$MODE" != --fresh ]; then
-  echo "codex-run.sh: CCR detached resume is unavailable in this release; explicitly choose --fresh for a new session (nothing admitted)" >&2
-  exit 4
+if [ "$BACKEND" = ccr ] && [ "$ATTACH" != 1 ] && [ "$MODE" = --resume-session ]; then
+  [ -n "$EXPECTED_PARENT" ] || die4 "--resume-session requires --expected-parent-job; resolve the session head before preparing this round's prompt"
 fi
 for v in STALL_MIN MAX_MIN POLL MAX_TURNS; do
   eval "val=\$$v"
@@ -784,8 +786,13 @@ if [ "$BACKEND" = ccr ]; then
   if [ "$MODE" = "--resume-last" ]; then
     SESSION=$(exec 9>&-; cat "$DIR/.ccr-last-session" 2>/dev/null | head -1 | tr -d ' ')
     [ -n "$SESSION" ] || launch_error "--resume-last: no previous ccr session recorded in $DIR/.ccr-last-session" "$CMD"
+    SAVED_PARENT=$(exec 9>&-; cat "$DIR/.ccr-last-job" 2>/dev/null | head -1)
+    [ -n "$SAVED_PARENT" ] || launch_error "--resume-last: no previous CCR job anchor" "$CMD"
+    [ -z "$EXPECTED_PARENT" ] || [ "$EXPECTED_PARENT" = "$SAVED_PARENT" ] || launch_error "saved parent differs from requested parent" "$CMD"
+    EXPECTED_PARENT="$SAVED_PARENT"
   elif [ "$MODE" = "--resume-session" ]; then SESSION="$RESUME_SESSION"; fi
   ccr_launch_argv "$ALIAS" "$MAX_TURNS" "$PROMPT_FILE"
+  if [ -n "$SESSION" ]; then ARGV+=("--resume=$SESSION" "--expected-parent-job=$EXPECTED_PARENT"); fi
   stamp_claim; rotate_previous_attempt
   : > "$PREFIX.progress"; : > "$PREFIX.stderr"; : > "$PREFIX.joblog"
   ADMISSION_WAIT=$(( MAX_MIN*60 - $(exec 9>&-; elapsed) ))
@@ -1000,6 +1007,8 @@ EOD
     echo "outcome=$OUTCOME"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "detached=no"; echo "attached=${ATTEMPTS:-0}"
     [ -z "${IDENT_NOTE:-}" ] || echo "identity_note=$IDENT_NOTE"; echo "provider=$PROVIDER"; echo "provider_model=$PROVIDER_MODEL"
     echo "claude_model_id=$CLAUDE_MODEL"; echo "routed_model=${ROUTED_MODEL:-unknown}"; echo "route_identity=$ROUTE_OK"; echo "compatibility=$COMPAT"; echo "ccr_version=$CCR_VER"
+    echo "submission_id=$(exec 9>&-; ccr_job_field "$JOB_JSON" submission_id)"; echo "requested_resume_session=$(exec 9>&-; ccr_job_field "$JOB_JSON" requested_resume_session)"; echo "resumed_from=$(exec 9>&-; ccr_job_field "$JOB_JSON" resumed_from)"
+    echo "workload_disposition=$(exec 9>&-; ccr_job_field "$JOB_JSON" workload_disposition)"; echo "reason_code=$(exec 9>&-; ccr_job_field "$JOB_JSON" reason_code)"
     echo "job=$JOB_ID"; echo "session=$CCR_SESSION"; echo "child_exit=$CHILD_RC"; echo "thread=${SESSION_ID:-unknown}"
     # CCR reports what it cleaned up separately from what the workload returned, and an empty
     # survivor list is NOT a claim that everything was cleaned up. Both facts are recorded here

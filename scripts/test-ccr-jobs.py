@@ -34,7 +34,7 @@ class ProtocolTests(unittest.TestCase):
         executable = self.root / "ccr"
         executable.write_text('''#!/bin/sh
 case "$1" in
-version) echo 'ccr 0.5.1';;
+version) echo 'ccr 0.6.0';;
 model) printf '%s\\n' '{"provider":"fixture","provider_model":"model","claude_model_id":"anthropic.ccr.x","compatibility":"degraded","effective_capabilities":{"supports_tools":true}}';;
 *) exec python3 ''' + shlex.quote(str(ROOT / "scripts/fake-ccr-jobs.py")) + ''' "$@";;
 esac
@@ -50,6 +50,74 @@ esac
     def launch(self, **env):
         return self.run_runner(str(self.prefix), "--via", "ccr:x", "--prompt-file", str(self.prompt),
                                "--poll-sec", "1", **env)
+
+    def test_submission_lookup_recovers_lost_receipt_without_another_job(self):
+        before = len(list((self.root / "store/fake-ccr-jobs").glob("*.json")))
+        result = self.launch(FAKE_CCR_DROP_RECEIPT="1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        value = job.load(str(self.prefix) + ".ccr-attempt.json")
+        self.assertEqual(value["submission_id"], value["receipt"]["submission_id"])
+        self.assertEqual(len(list((self.root / "store/fake-ccr-jobs").glob("*.json"))), before + 1)
+
+    def test_guarded_resume_has_new_job_and_same_session(self):
+        first = self.launch()
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        previous = job.load(str(self.prefix) + ".ccr-attempt.json")["receipt"]
+        next_prefix = self.root / "round-two"
+        resumed = self.run_runner(str(next_prefix), "--via", "ccr:x", "--resume-session", previous["session_id"],
+                                  "--expected-parent-job", previous["job_id"], "--prompt-file", str(self.prompt), "--poll-sec", "1")
+        self.assertEqual(resumed.returncode, 0, resumed.stdout + resumed.stderr)
+        value = job.load(str(next_prefix) + ".ccr-attempt.json")
+        self.assertEqual(value["receipt"]["session_id"], previous["session_id"])
+        self.assertNotEqual(value["receipt"]["job_id"], previous["job_id"])
+        self.assertEqual(value["expected_parent_job"], previous["job_id"])
+        self.assertFalse(value["fresh_decision"])
+
+    def test_not_started_release_requires_aborted_terminal_evidence(self):
+        value = dict(schema_version=2, job_id="ccr-" + str(uuid.uuid4()), session_id=str(uuid.uuid4()),
+                     status="failed", exit_code=None, workload_disposition="not_started", admission_state="aborted")
+        self.assertEqual(job.state(value), "ended")
+        for field, wrong in (("status", "completed"), ("exit_code", 0), ("admission_state", "prepared"),
+                             ("workload_disposition", "unknown")):
+            self.assertEqual(job.state(dict(value, **{field: wrong})), "undetermined")
+
+    def test_prepared_recovery_refuses_changed_submission_argument(self):
+        self.assertEqual(self.launch().returncode, 0)
+        prefix = str(self.prefix)
+        value = job.load(prefix + ".ccr-attempt.json")
+        store = self.root / "store/fake-ccr-jobs"
+        original = store / (value["receipt"]["job_id"] + ".json")
+        record = job.load(original)
+        record.update(status="running", admission_state="prepared", workload_disposition="unknown", fixture_mode="sleep")
+        original.write_text(json.dumps(record))
+        value["argv"] = [arg for arg in value["argv"] if not arg.startswith("--submission-id=")]
+        value["argv"].append("--submission-id=" + uuid.uuid4().hex)
+        Path(prefix + ".ccr-attempt.json").write_text(json.dumps(value))
+        before = sorted(store.glob("*.json"))
+        result = subprocess.run(["python3", str(RUNNER.with_name("ccr-job.py")), "complete-admission", prefix],
+                                env=self.env, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 6, result.stderr)
+        self.assertEqual(sorted(store.glob("*.json")), before)
+        self.assertIn("saved invocation identity changed", result.stderr)
+
+    def test_never_started_failure_releases_without_fabricated_exit(self):
+        override = dict(status="failed", admission_state="aborted", workload_disposition="not_started",
+                        reason_code="admission_interrupted", exit_code=None, result_evidence=None,
+                        cleanup=dict(coverage="unknown", survivors=[]))
+        result = self.launch(FAKE_CCR_BAD_STATUS=json.dumps(override))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        evidence = job.load(str(self.prefix) + ".ccr-result.json")
+        self.assertFalse(evidence["successful"])
+        self.assertIsNone(evidence["status"]["exit_code"])
+        self.assertEqual(evidence["status"]["cleanup"]["coverage"], "unknown")
+        self.assertEqual(Path(str(self.prefix) + ".exit").read_text().strip(), "1")
+
+    def test_fifo_attempt_is_rejected_without_blocking(self):
+        os.mkfifo(str(self.prefix) + ".ccr-attempt.json")
+        result = subprocess.run(["python3", str(RUNNER.with_name("ccr-job.py")), "recover", str(self.prefix)],
+                                env=self.env, capture_output=True, text=True, timeout=3)
+        self.assertEqual(result.returncode, 6, result.stderr)
+        self.assertFalse(Path(str(self.prefix) + ".exit").exists())
 
     def fast_clock(self):
         clock = self.root / "date"
@@ -124,7 +192,10 @@ else:
         result = self.launch(FAKE_CCR_ARGV_OUT=str(argv_path), FAKE_CCR_STDIN_OUT=str(input_path))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(input_path.read_bytes(), self.prompt.read_bytes())
-        self.assertEqual(argv_path.read_text().splitlines(), [
+        actual_args = argv_path.read_text().splitlines()
+        submission = job.load(str(self.prefix) + ".ccr-attempt.json")["submission_id"]
+        self.assertEqual(actual_args.pop(), "--submission-id=" + submission)
+        self.assertEqual(actual_args, [
             "--model", "x", "--permission-mode", "plan", "-p", "--no-lifecycle", "--no-statusline",
             "--detach", "--prompt-file", str(self.prefix.resolve()) + ".ccr-prompt",
             "--output-format=stream-json", "--verbose", "--strict-mcp-config",
@@ -136,7 +207,7 @@ else:
         claim.mkdir()
         (claim / "owner").write_text("token=example\n")
         before = list(self.root.iterdir())
-        result = self.run_runner(str(self.prefix), "--via", "ccr:x", "--resume-last",
+        result = self.run_runner(str(self.prefix), "--via", "ccr:x", "--resume-session", str(uuid.uuid4()),
                                  "--prompt-file", str(self.prompt), "--claim", "example")
         self.assertEqual(result.returncode, 4)
         self.assertEqual(list(self.root.iterdir()), before)
@@ -283,10 +354,10 @@ def atomic(path, data):
     if OPERATION != 'mirror' and str(path).endswith(suffix):
         pause()
     original_atomic(path, data)
-def snapshot(source, destination):
+def snapshot(source, destination, boundary=None):
     if OPERATION == 'mirror':
         pause()
-    return original_snapshot(source, destination)
+    return original_snapshot(source, destination, boundary)
 m.atomic, m.snapshot_log = atomic, snapshot
 try:
     m.main()
@@ -642,10 +713,11 @@ os.execv('/bin/ps', ['ps'] + sys.argv[1:])
                 process.kill()
                 process.wait()
 
-    def test_wrong_stream_identity_fails(self):
+    def test_contradictory_committed_model_remains_unresolved(self):
         result = self.launch(FAKE_CCR_CHILD_MODEL="wrong-model")
-        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-        self.assertFalse(job.load(str(self.prefix) + ".ccr-result.json")["successful"])
+        self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+        self.assertFalse(Path(str(self.prefix) + ".exit").exists())
+        self.assertFalse(Path(str(self.prefix) + ".ccr-result.json").exists())
 
     def test_result_append_ignored_but_committed_bytes_cannot_change(self):
         self.assertEqual(self.launch().returncode, 0)

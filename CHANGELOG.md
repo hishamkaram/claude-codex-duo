@@ -2,6 +2,16 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [shared runner — guarded CCR continuation] - 2026-09-11
+
+`codex-pr-review` 6.1.0 · `codex-deep-plan` 3.1.0 · `codex-debate` 2.1.0.
+
+- Require CCR0.6.0 for transactional submissions and same-session continuation.
+- Persist submission identity before launch; recover lost receipts by read-only status.
+- Require explicit expected-parent jobs and resolve session heads before round prompts.
+- Validate committed output boundaries/digests and distinguish stopped from never started.
+- Preserve claims on unresolved admission, ownership, identity, or output evidence.
+
 ## [shared runner — CCR durable job ownership] - 2026-09-11
 
 `codex-pr-review` 6.0.0 · `codex-deep-plan` 3.0.0 · `codex-debate` 2.0.0.

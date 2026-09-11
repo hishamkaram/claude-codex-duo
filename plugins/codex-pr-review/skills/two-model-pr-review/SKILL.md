@@ -71,9 +71,9 @@ must resolve; both must restate the brief's own Target section, which is the
 frozen record of what Codex reviewed), and whether the index differs from the
 working tree.
 
-CCR currently supports fresh detached jobs in this runner. Its resume options fail before
-admission. Record `continuity=unavailable` and explicitly choose a self-contained `--fresh`
-exchange when using CCR in Phases 4 and 6; see codex-protocol.md. Codex resume is unchanged.
+CCR >=0.6.0 supports transactional admission and guarded continuation. Resolve the exchange
+participant’s session head before preparing Phase4 or Phase6 prompts; supply its session
+and expected parent job as described in codex-protocol.md. Codex resume is unchanged.
 
 ## Participants
 

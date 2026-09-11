@@ -26,11 +26,11 @@ Bump `version` in the plugin's `.claude-plugin/plugin.json` and in `.claude-plug
 ### Real CCR lifecycle validation
 
 Run `python3 scripts/test-ccr-live.py --artifacts /tmp/ccr-live-unique --containment process-group`
-on macOS with installed CCR >=0.5.1 and the real Claude CLI. The artifact directory
+on macOS with installed CCR >=0.6.0 and the real Claude CLI. The artifact directory
 must be new. It uses an isolated job/config store and a deterministic local provider;
 it is lifecycle evidence, not proof of provider quality or write-tool refusal.
 The CI workflow runs the same test on macOS, Linux systemd scopes, and forced Linux
-process groups against pinned CCR0.5.1. It records provider entry, versions, source
+process groups against pinned CCR0.6.0. It records provider entry, versions, source
 digests, watcher recovery, owner cancellation and an unrelated interactive chrome
 sentinel. The populated process-group regression also runs separately.
 Configured-provider smoke and real task evidence are still required before release.

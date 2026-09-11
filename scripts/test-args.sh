@@ -241,7 +241,7 @@ if [ "${1:-}" = status ] || [ "${1:-}" = cancel ] || { [ "${1:-}" = launch ] && 
   exec python3 "$FAKE_CCR_JOBS_SCRIPT" "$@"
 fi
 case "${1:-}" in
-  version) echo "ccr ${FAKE_CCR_VERSION:-0.5.1} (fake, test-args.sh)"; exit 0;;
+  version) echo "ccr ${FAKE_CCR_VERSION:-0.6.0} (fake, test-args.sh)"; exit 0;;
   model)
     [ "${2:-}" = show ] || { echo "fake ccr: unsupported model subcommand" >&2; exit 2; }
     [ -z "${FAKE_CCR_SHOW_FAIL:-}" ] || { echo "model alias not found: $3" >&2; exit 1; }
@@ -299,7 +299,7 @@ out=$(PATH="$NOCCR" bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT" 2>&1); r
 [ "$rc" = 4 ] && grep -q 'ccr not found' "$CP.stderr" && grep -q '^outcome=LAUNCH-ERROR' "$CP.meta" && grep -q '^backend=ccr' "$CP.meta" && [ "$(cat "$CP.exit")" = 4 ] && printf '  ok    %-42s\n' "T-3: ccr missing → LAUNCH-ERROR sidecars" || { printf '  FAIL  T-3: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
 rm -f "$CP".*
 # T-4 / T-5 / T-6: the probe — version gate, model show, happy path with JSON and the smoke record
-chk "T-4: ccr below minimum refused"      4 "requires ccr >= 0.5.1" env PATH="$CCRBIN:$PATH" FAKE_CCR_VERSION=0.4.10 bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT"
+chk "T-4: ccr below minimum refused"      4 "requires ccr >= 0.6.0" env PATH="$CCRBIN:$PATH" FAKE_CCR_VERSION=0.4.10 bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT"
 chk "T-4: probe below minimum"            1 "PROBE UNAVAILABLE"     env PATH="$CCRBIN:$PATH" FAKE_CCR_VERSION=0.4.10 bash "$R" --probe --via ccr:x
 chk "T-5: model show failing"             1 "PROBE UNAVAILABLE"     env PATH="$CCRBIN:$PATH" FAKE_CCR_SHOW_FAIL=1 bash "$R" --probe --via ccr:x
 chk "T-5: supports_tools false"           1 "supports_tools=false"  env PATH="$CCRBIN:$PATH" FAKE_CCR_TOOLS=false bash "$R" --probe --via ccr:x
@@ -320,9 +320,9 @@ out=$(PATH="$CCRBIN:$PATH" FAKE_CCR_ARGV_OUT="$TMP/argv-none" bash "$R" "$CP" --
 rm -f "$CP".*
 # T-6: probe happy path records the smoke and prints the JSON
 out=$(PATH="$CCRBIN:$PATH" bash "$R" --probe --via ccr:x --record-dir "$CCRD" 2>&1); rc=$?
-[ "$rc" = 0 ] && printf '%s' "$out" | grep -q '^PROBE SUCCEEDED backend=ccr alias=x provider=litellm model=claude-haiku-4-5 compatibility=degraded tools=true readonly=verified ccr=0.5.1' && printf '%s' "$out" | grep -q '"schema_version"' && grep -qx 'alias=x' "$CCRD/.ccr-smoke.x" && grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" && grep -qx 'ccr=0.5.1' "$CCRD/.ccr-smoke.x" && grep -qx 'claude_model_id=anthropic.ccr.x' "$CCRD/.ccr-smoke.x" && grep -qx 'child_model=anthropic.ccr.x' "$CCRD/.ccr-smoke.x" && grep -q '^launch_sha256=' "$CCRD/.ccr-smoke.x" && printf '  ok    %-42s\n' "T-6: probe SUCCEEDED + JSON + smoke record" || { printf '  FAIL  T-6: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+[ "$rc" = 0 ] && printf '%s' "$out" | grep -q '^PROBE SUCCEEDED backend=ccr alias=x provider=litellm model=claude-haiku-4-5 compatibility=degraded tools=true readonly=verified ccr=0.6.0' && printf '%s' "$out" | grep -q '"schema_version"' && grep -qx 'alias=x' "$CCRD/.ccr-smoke.x" && grep -qx 'readonly=verified' "$CCRD/.ccr-smoke.x" && grep -qx 'ccr=0.6.0' "$CCRD/.ccr-smoke.x" && grep -qx 'claude_model_id=anthropic.ccr.x' "$CCRD/.ccr-smoke.x" && grep -qx 'child_model=anthropic.ccr.x' "$CCRD/.ccr-smoke.x" && grep -q '^launch_sha256=' "$CCRD/.ccr-smoke.x" && printf '  ok    %-42s\n' "T-6: probe SUCCEEDED + JSON + smoke record" || { printf '  FAIL  T-6: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
 # T-5c (continued): a record for another version or a violated record refuses the launch
-sed 's/^ccr=0.5.1$/ccr=0.4.10/; s/^alias=x$/alias=y/; s/^claude_model_id=anthropic.ccr.x$/claude_model_id=anthropic.ccr.y/; s/^child_model=anthropic.ccr.x$/child_model=anthropic.ccr.y/' "$CCRD/.ccr-smoke.x" > "$CCRD/.ccr-smoke.y"
+sed 's/^ccr=0.6.0$/ccr=0.4.10/; s/^alias=x$/alias=y/; s/^claude_model_id=anthropic.ccr.x$/claude_model_id=anthropic.ccr.y/; s/^child_model=anthropic.ccr.x$/child_model=anthropic.ccr.y/' "$CCRD/.ccr-smoke.x" > "$CCRD/.ccr-smoke.y"
 chk "T-5c: record from another ccr version" 4 "another ccr version" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-py" --via ccr:y --prompt-file "$PROMPT"
 sed 's/^readonly=verified/readonly=violated/; s/^alias=x$/alias=z/; s/^claude_model_id=anthropic.ccr.x$/claude_model_id=anthropic.ccr.z/; s/^child_model=anthropic.ccr.x$/child_model=anthropic.ccr.z/' "$CCRD/.ccr-smoke.x" > "$CCRD/.ccr-smoke.z"
 chk "T-5c: violated record"               4 "not 'readonly=verified'" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/02-pz" --via ccr:z --prompt-file "$PROMPT"
@@ -365,8 +365,8 @@ rm -f "$CCRD/02-py".* "$CCRD/02-pz".* "$CCRD/.ccr-smoke.y" "$CCRD/.ccr-smoke.z"
 python3 scripts/test-ccr-jobs.py || FAIL=1
 printf 'review this code\n' > "$CCRD/prompt.md"
 chk "CCR completion uses durable job receipt" 0 "COMPLETED" env PATH="$CCRBIN:$PATH" bash "$R" "$CP" --via ccr:x --prompt-file "$CCRD/prompt.md" --poll-sec 1
-chk "CCR resume-last unavailable before admission" 4 "detached resume is unavailable" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/noresume" --via ccr:x --resume-last --prompt-file "$CCRD/prompt.md"
-chk "CCR explicit resume unavailable before admission" 4 "detached resume is unavailable" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/noresume" --via ccr:x --resume-session example --prompt-file "$CCRD/prompt.md"
+chk "CCR parent option requires resume" 4 "requires a resume launch" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/noresume" --via ccr:x --fresh --expected-parent-job example --prompt-file "$CCRD/prompt.md"
+chk "CCR explicit resume requires parent" 4 "requires --expected-parent-job" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/noresume" --via ccr:x --resume-session example --prompt-file "$CCRD/prompt.md"
 for mode in --fresh --resume-last; do
   chk "explicit resume conflicts with $mode" 4 "exclusive" env PATH="$CCRBIN:$PATH" bash "$R" "$CCRD/noresume" --via ccr:x --resume-session example "$mode" --prompt-file "$CCRD/prompt.md"
 done
@@ -1717,7 +1717,7 @@ pgw pre-codex "$PR" "$G2" >/dev/null 2>&1 || { printf '  FAIL  T-19: preflight\n
 chk "T-19: unknown prefix refused" 1 "unknown phase prefix" bash "$PG" release "$PR" 02-p3
 mkdir -p "$PR/02-p2.claim/runner"; printf '2147483646\n' > "$PR/02-p2.claim/runner/pid"
 CCRH="plugins/codex-pr-review/scripts/ccr-job.py"
-if ! PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=sleep python3 "$CCRH" admit "$PR/02-p2" x anthropic.ccr.x 1 "$R" '{}' 0.5.1 30 6 25 1 ccr launch --model x --detach --prompt-file "$PROMPT" >/dev/null; then
+if ! PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=sleep python3 "$CCRH" admit "$PR/02-p2" x anthropic.ccr.x 1 "$R" '{}' 0.6.0 30 6 25 1 ccr launch --model x --detach --prompt-file "$PROMPT" >/dev/null; then
   printf '  FAIL  CCR gate fixture admission failed before receipt creation\n'
   exit 1
 fi
@@ -1782,7 +1782,7 @@ printf 'p1\tccr\tx\n' > "$CT/00-participants.tsv"
 printf '5\n' > "$CT/02-p1.exit"
 printf 'backend=ccr\npid=2147483646\npgid=2147483646\ncancel_confirmed=no\n' > "$CT/02-p1.meta"
 chk "T-19c: exit-5 blocks before terminal proof" 1 "unconfirmed cancellation" pgw pre-codex "$CT" "$G2"
-if ! PATH="$CCRBIN:$PATH" python3 "$CCRH" admit "$CT/02-p1" x anthropic.ccr.x 1 "$R" '{}' 0.5.1 30 6 25 1 ccr launch --model x --detach --prompt-file "$PROMPT" >/dev/null; then
+if ! PATH="$CCRBIN:$PATH" python3 "$CCRH" admit "$CT/02-p1" x anthropic.ccr.x 1 "$R" '{}' 0.6.0 30 6 25 1 ccr launch --model x --detach --prompt-file "$PROMPT" >/dev/null; then
   printf '  FAIL  CCR gate fixture admission failed before receipt creation\n'
   exit 1
 fi
