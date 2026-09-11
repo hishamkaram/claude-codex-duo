@@ -617,7 +617,7 @@ rotate_previous_attempt() {
     # .detached and .childexit belong to the attempt too: a record left behind would make a bogus
     # --attach admissible against the NEXT, live attempt, and a stale receipt would let it publish
     # a terminal outcome from the previous run's exit status.
-    for ext in stdout stderr progress joblog meta exit detached childexit ccr-attempt.json ccr-receipt.json ccr-prompt ccr-result.json ccr-errorlog ccr-submit.stderr; do [ -e "$PREFIX.$ext" ] && mv "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
+    for ext in stdout stderr progress joblog meta exit detached childexit ccr-attempt.json ccr-receipt.json ccr-receipt.observed ccr-recovery-receipt.json ccr-admission-conflict.json ccr-prompt ccr-result.json ccr-errorlog ccr-submit.stderr; do [ -e "$PREFIX.$ext" ] && mv "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
     echo "codex-run.sh: previous attempt rotated to $PREFIX.attempt$N.*"
   fi
 }

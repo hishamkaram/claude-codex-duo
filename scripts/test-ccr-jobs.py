@@ -65,7 +65,7 @@ esac
         (claim / "owner").write_text("token=original\n")
         before = list((self.root / "store/fake-ccr-jobs").glob("*.json"))
         result = self.run_runner(str(self.prefix), "--via", "ccr:x", "--resume-last",
-                                 "--claim", "original", "--prompt-file", str(self.prompt))
+                                 "--claim", "original", "--prompt-file", str(self.prompt), "--poll-sec", "1")
         self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
         self.assertEqual((claim / "owner").read_text(), "token=original\n")
         self.assertFalse((claim / "runner").exists())
@@ -87,7 +87,7 @@ esac
         self.assertEqual(attached.returncode, 0, attached.stdout + attached.stderr)
         meta = Path(prefix + ".meta").read_text()
         self.assertIn("mode=--resume-session\n", meta)
-        self.assertIn("resume_session=" + previous["session_id"] + "\n", meta)
+        self.assertIn("resume_session=" + previous["session_id"], meta.splitlines())
         self.assertIn("requested_resume_session=" + previous["session_id"] + "\n", meta)
 
     def test_guarded_resume_has_new_job_and_same_session(self):
@@ -103,6 +103,69 @@ esac
         self.assertNotEqual(value["receipt"]["job_id"], previous["job_id"])
         self.assertEqual(value["expected_parent_job"], previous["job_id"])
         self.assertFalse(value["fresh_decision"])
+
+    def test_recovery_preserves_conflicting_complete_receipt(self):
+        self.assertEqual(self.launch().returncode, 0)
+        for operation in ("recover", "complete-admission"):
+            for field in ("job_id", "session_id"):
+                with self.subTest(operation=operation, field=field):
+                    prefix = str(self.root / (operation + field))
+                    value = job.load(str(self.prefix) + ".ccr-attempt.json")
+                    original = value.pop("receipt")
+                    job.atomic(prefix + ".ccr-attempt.json", job.encode(value))
+                    receipt_bytes = json.dumps(original, indent=2).encode()
+                    job.atomic(prefix + ".ccr-receipt.json", receipt_bytes)
+                    replacement = ("ccr-" if field == "job_id" else "") + str(uuid.uuid4())
+                    invoked = self.root / "unexpected-invocation"
+                    command = ["python3", str(RUNNER.with_name("ccr-job.py")), operation, prefix]
+                    result = subprocess.run(command, env=dict(self.env, FAKE_CCR_BAD_STATUS=json.dumps(
+                        {field: replacement, "admission_state": "prepared"}), FAKE_CCR_ARGV_OUT=str(invoked)),
+                        capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+                    self.assertEqual(Path(prefix + ".ccr-receipt.json").read_bytes(), receipt_bytes)
+                    self.assertNotIn("receipt", job.load(prefix + ".ccr-attempt.json"))
+                    conflict = job.load(prefix + ".ccr-admission-conflict.json")
+                    self.assertEqual(conflict["saved_receipt"], original)
+                    self.assertEqual(conflict["observed_identity"][field], replacement)
+                    self.assertFalse(invoked.exists())
+                    retry = subprocess.run(command, env=self.env, capture_output=True, timeout=10)
+                    self.assertEqual(retry.returncode, 6)
+                    self.assertFalse(Path(prefix + ".exit").exists())
+
+    def test_prepared_resubmission_preserves_conflicting_returned_receipt(self):
+        self.assertEqual(self.launch().returncode, 0)
+        prefix = str(self.prefix)
+        value = job.load(prefix + ".ccr-attempt.json")
+        original = value["receipt"]
+        before = Path(prefix + ".ccr-receipt.json").read_bytes()
+        replacement = dict(original, job_id="ccr-" + str(uuid.uuid4()))
+        executable = self.root / "ccr"
+        script = executable.read_text().replace("#!/bin/sh\n", "#!/bin/sh\n" +
+            'if [ "$1" = launch ] && [ -n "${FAKE_REPLAY_RECEIPT:-}" ]; then printf "%s\\n" "$FAKE_REPLAY_RECEIPT"; exit 0; fi\n')
+        executable.write_text(script)
+        result = subprocess.run(["python3", str(RUNNER.with_name("ccr-job.py")), "complete-admission", prefix],
+                                env=dict(self.env, FAKE_REPLAY_RECEIPT=json.dumps(replacement),
+                                         FAKE_CCR_BAD_STATUS=json.dumps(dict(admission_state="prepared"))),
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+        self.assertEqual(Path(prefix + ".ccr-receipt.json").read_bytes(), before)
+        self.assertEqual(job.load(prefix + ".ccr-recovery-receipt.json"), replacement)
+        self.assertEqual(job.load(prefix + ".ccr-admission-conflict.json")["observed_identity"], replacement)
+
+    def test_recovery_repairs_partial_receipt_and_preserves_original_bytes(self):
+        self.assertEqual(self.launch().returncode, 0)
+        for index, partial in enumerate((b"", b'{"job_id":', b'{"job_id":"incomplete"}')):
+            prefix = str(self.root / ("partial-" + str(index)))
+            value = job.load(str(self.prefix) + ".ccr-attempt.json")
+            original = value.pop("receipt")
+            job.atomic(prefix + ".ccr-attempt.json", job.encode(value))
+            job.atomic(prefix + ".ccr-receipt.json", partial)
+            result = subprocess.run(["python3", str(RUNNER.with_name("ccr-job.py")), "recover", prefix],
+                                    env=self.env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(job.load(prefix + ".ccr-attempt.json")["receipt"], original)
+            if partial:
+                self.assertEqual(Path(prefix + ".ccr-receipt.observed").read_bytes(), partial)
 
     def test_submission_status_mismatch_stays_unresolved(self):
         result = self.launch(FAKE_CCR_BAD_STATUS=json.dumps(dict(submission_id="different-submission")))

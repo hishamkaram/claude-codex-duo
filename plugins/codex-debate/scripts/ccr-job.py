@@ -107,6 +107,8 @@ def state(value):
 
 
 def attempt(prefix):
+    if Path(prefix + ".ccr-admission-conflict.json").exists():
+        raise ValueError("conflicting admission evidence retained; admission remains unresolved")
     value = load(prefix + ".ccr-attempt.json")
     if value.get("schema") not in (1, 2) or value.get("uid") != os.geteuid():
         raise ValueError("unsupported attempt or different user")
@@ -152,13 +154,44 @@ def bound_attempt(prefix):
     return value
 
 
+
+def reconcile_receipt(prefix, value, record, source="submission_lookup"):
+    keys = ("submission_id", "job_id", "session_id")
+    admitted = {key: record[key] for key in keys}
+    try:
+        with open_regular(prefix + ".ccr-receipt.json") as stream:
+            original = stream.read()
+    except FileNotFoundError:
+        original = b""
+    try:
+        saved = json.loads(original)
+    except (ValueError, UnicodeError):
+        saved = None
+    observations = [value.get("receipt"), saved]
+    for observation in observations:
+        # A complete identity, even one containing malformed field values, must
+        # never be silently replaced by a different authority observation.
+        if isinstance(observation, dict) and all(key in observation for key in keys):
+            identity = {key: observation[key] for key in keys}
+            if identity != admitted:
+                atomic(prefix + ".ccr-admission-conflict.json",
+                       encode(dict(saved_receipt=saved, embedded_receipt=value.get("receipt"),
+                                   observed_identity=admitted, observation_source=source)))
+                raise ValueError("conflicting admission identities; original receipt retained")
+    admission_identity(value, admitted)
+    # Preserve even partial receipt bytes before repairing delivery from lookup.
+    if original and not Path(prefix + ".ccr-receipt.observed").exists():
+        atomic(prefix + ".ccr-receipt.observed", original)
+    atomic(prefix + ".ccr-receipt.json", encode(admitted))
+    return admitted
+
+
 def recover(prefix):
     value = attempt(prefix)
     if value.get("schema") == 2 and not value.get("receipt"):
         # Status is read-only. A lost receipt never authorizes a fresh admission.
         record = lookup_submission(value)
-        admitted = {key: record[key] for key in ("submission_id", "job_id", "session_id")}
-        atomic(prefix + ".ccr-receipt.json", encode(admitted))
+        reconcile_receipt(prefix, value, record)
     value = bound_attempt(prefix)
     admitted = value["receipt"]
     atomic(prefix + ".ccr-attempt.json", encode(value))
@@ -496,6 +529,7 @@ def complete_admission(prefix):
     if value["argv"][0] != value["executable"]:
         raise ValueError("saved executable identity changed")
     record = lookup_submission(value)
+    reconcile_receipt(prefix, value, record)
     if record.get("admission_state") != "prepared":
         return recover(prefix)
     with open_regular(prefix + ".ccr-prompt") as stream:
@@ -511,6 +545,15 @@ def complete_admission(prefix):
                            timeout=30, check=False)
         except subprocess.TimeoutExpired:
             pass
+        output.seek(0)
+        response = output.read()
+    atomic(prefix + ".ccr-recovery-receipt.json", response)
+    try:
+        returned = json.loads(response)
+    except (ValueError, UnicodeError):
+        returned = None
+    if isinstance(returned, dict) and all(key in returned for key in ("submission_id", "job_id", "session_id")):
+        reconcile_receipt(prefix, value, returned, source="resubmission_receipt")
     return recover(prefix)
 
 
