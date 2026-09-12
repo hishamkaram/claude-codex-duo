@@ -76,6 +76,19 @@ for r in plugins/*/scripts/ccr-job.py; do
   cmp -s "$REF" "$r" && note ok "$r shared CCR protocol" || note FAIL "$r differs from $REF"
 done
 
+echo "4b1. The runner and the phase gate agree on the CCR launch protocol"
+# The gate reads <prefix>.ccr-prelaunch as proof that a launch was interrupted before it submitted
+# any workload, and releases the claim on that proof alone. That is only sound while both sides
+# mean the same thing by the protocol number: a gate that accepted a marker written under an
+# ordering it does not understand would free a claim whose job may be alive.
+RUN_PROTO=$(sed -n 's/^CCR_PROTOCOL=\([0-9][0-9]*\).*/\1/p' plugins/codex-pr-review/scripts/codex-run.sh | head -1)
+GATE_PROTO=$(sed -n 's/^CCR_PROTOCOL=\([0-9][0-9]*\).*/\1/p' plugins/codex-pr-review/skills/two-model-pr-review/scripts/phase-gate.sh | head -1)
+if [ -n "$RUN_PROTO" ] && [ "$RUN_PROTO" = "$GATE_PROTO" ]; then
+  note ok "CCR_PROTOCOL=$RUN_PROTO in both codex-run.sh and phase-gate.sh"
+else
+  note FAIL "CCR_PROTOCOL differs or is missing (codex-run.sh='${RUN_PROTO:-none}', phase-gate.sh='${GATE_PROTO:-none}'): the pre-submission release proof is only sound while both agree"
+fi
+
 echo "4b2. review-workflow.js constants are generated from review_common.py (gen-workflow-constants.py --check)"
 python3 plugins/codex-pr-review/skills/two-model-pr-review/scripts/gen-workflow-constants.py --check >/dev/null 2>&1 && note ok "workflow constants match review_common.py" || note FAIL "review-workflow.js constants differ from review_common.py: run scripts/gen-workflow-constants.py --write"
 

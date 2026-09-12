@@ -293,7 +293,13 @@ chk "T-2: --resume-session + --resume-last" 4 "exclusive"           bash "$R" "$
 chk "T-2: non-numeric --max-turns"        4 "whole number"          bash "$R" "$CP" --via ccr:x --max-turns abc --prompt-file "$PROMPT"
 rm -f "$CP".*
 # T-3: no ccr on PATH → LAUNCH-ERROR sidecars
-NOCCR="$TMP/noccr"; mkdir -p "$NOCCR"; ln -sf "$(command -v bash)" "$NOCCR/bash"; ln -sf "$(command -v python3)" "$NOCCR/python3"
+# The interpreter is linked by its real path, not by `command -v python3`: on a machine where
+# python3 is a version-manager shim (pyenv, asdf), the shim is a shell script that re-execs
+# through helpers of its own — `basename` among them — which this deliberately bare PATH does not
+# carry, so the symlinked shim would fail before the runner could reach the ccr-not-found check
+# and T-3 would fail for a reason it is not testing.
+NOCCR="$TMP/noccr"; mkdir -p "$NOCCR"; ln -sf "$(command -v bash)" "$NOCCR/bash"
+ln -sf "$(python3 -c 'import sys; print(sys.executable)' 2>/dev/null || command -v python3)" "$NOCCR/python3"
 for t in dirname date sed grep head tr cat ls mv wc tail cut ps sleep mkdir rmdir stat shasum find git awk kill; do p=$(command -v $t 2>/dev/null) && ln -sf "$p" "$NOCCR/$t"; done
 out=$(PATH="$NOCCR" bash "$R" "$CP" --via ccr:x --prompt-file "$PROMPT" 2>&1); rc=$?
 [ "$rc" = 4 ] && grep -q 'ccr not found' "$CP.stderr" && grep -q '^outcome=LAUNCH-ERROR' "$CP.meta" && grep -q '^backend=ccr' "$CP.meta" && [ "$(cat "$CP.exit")" = 4 ] && printf '  ok    %-42s\n' "T-3: ccr missing → LAUNCH-ERROR sidecars" || { printf '  FAIL  T-3: rc=%s out=%s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
@@ -375,7 +381,13 @@ done
 # (reproduced: exit 4 on every attempt, the lock still present).
 CP12="$CCRD/p-emptyholder"
 mkdir -p "$CP12.claim.lock"; : > "$CP12.claim.lock/holder"; touch -t 200001010000 "$CP12.claim.lock"
-chk "T-30: empty legacy holder fails closed" 4 "legacy collector lock" env PATH="$CCRBIN:$PATH" bash "$R" "$CP12" --attach
+# A record naming the job, so the bound attach below reaches the lock rather than the earlier guard
+# that requires either durable record to exist before a job can be named.
+printf 'backend=codex\njob=ccr-anything\nmode=--fresh\n' > "$CP12.detached"
+# Bound, because since cycle 10 the binding refusal runs ABOVE publish_lock — an unbound attach
+# never reaches the lock at all, so an unbound call here would assert the binding refusal and stop
+# covering the wedged lock this case exists for.
+chk "T-30: empty legacy holder fails closed" 4 "legacy collector lock" env PATH="$CCRBIN:$PATH" bash "$R" "$CP12" --attach --expected-job ccr-anything
 
 # T-31 (CL-03/CX-02): the relaunch guard was dead code on the codex backend — its detach record
 # carried no identity at all, so a relaunch rotated a LIVE job's record away and started a second
@@ -388,10 +400,29 @@ python3 scripts/fixture-process.py "$CP13.stop" & CJOB=$!
   printf 'mode=--fresh\nattach_command=ATTACH-CODEX\ncancel_command=CANCEL-CODEX\n'; } > "$CP13.detached"
 printf '0s launched job=task-fake-live\n' > "$CP13.progress"
 out=$(bash "$R" "$CP13" --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1); rc=$?
-[ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'has not ended' && printf '%s' "$out" | grep -q 'ATTACH-CODEX' \
+# The recovery command is REGENERATED from the job the record names, not forwarded from the record's
+# own text (cycle 8): this fixture's stored `ATTACH-CODEX` is exactly the shape of a legacy unbound
+# command, and since an attach without --expected-job is now refused, forwarding it would send the
+# operator to a certain refusal. It carries no watch bounds either, and since cycle 10 no bound is
+# invented for a record that does not carry one — so this legacy record yields the job it names and
+# an explicit statement that its bounds are unrecorded, never a runnable command with bounds nothing
+# recorded. The cancel command names its job directly and is still forwarded.
+[ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'has not ended' \
+  && printf '%s' "$out" | grep -q -- '--expected-job task-fake-live' \
+  && printf '%s' "$out" | grep -q 'are not recorded here' \
+  && ! printf '%s' "$out" | grep -q 'ATTACH-CODEX' \
+  && printf '%s' "$out" | grep -q 'CANCEL-CODEX' \
   && [ -e "$CP13.detached" ] && [ ! -e "$CP13.attempt1.detached" ] \
   && printf '  ok    %-42s\n' "T-31: a codex relaunch is refused while alive" \
   || { printf '  FAIL  T-31: rc=%s rotated=%s out=%s\n' "$rc" "$([ -e "$CP13.attempt1.detached" ] && echo yes || echo no)" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+# ...and the same record WITH the bounds a current launch records yields the runnable command.
+{ printf 'backend=codex\njob=task-fake-live\nthread=t\njoblog=\n'
+  printf 'worker_pid=%s\nworker_identity=%s\n' "$CJOB" "$(TZ=UTC ps -o lstart= -p "$CJOB" | tr -s ' ' | sed 's/^ *//;s/ *$//')"
+  printf 'mode=--fresh\nattach_command=/r/codex-run.sh /p --attach --expected-job task-fake-live --stall-min 7 --max-min 30 --poll-sec 12\ncancel_command=CANCEL-CODEX\n'; } > "$CP13.detached"
+out=$(bash "$R" "$CP13" --prompt-file "$CCRD/prompt.md" --poll-sec 1 2>&1 || true)
+printf '%s' "$out" | grep -q -- '--attach --expected-job task-fake-live --stall-min 7 --max-min 30 --poll-sec 12' \
+  && printf '  ok    %-42s\n' "T-31: a bound record yields a runnable command" \
+  || { printf '  FAIL  T-31: bound record produced %s\n' "$(printf '%s' "$out" | sed -n '2p' | head -c 160)"; FAIL=1; }
 : > "$CP13.stop"; wait "$CJOB" 2>/dev/null
 
 # T-16: a refused attach must never rewrite a terminal .exit — the result it would destroy is the
@@ -1775,6 +1806,789 @@ chk "T-19b: legacy process record refused" 1 "stop evidence" env HOME="$TMP/noho
 : > "$PR/02-p2.progress"
 chk "T-19b: missing durable admission refuses release" 1 "stop evidence" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
 rm -rf "$PR"/02-p2.claim.spent* "$PR/02-p2.claim" "$PR/02-p2.progress"
+
+# F-01r43 (cycle 6): an interrupted pre-admission launch is PROVABLY pre-submission, and must be
+# released rather than wedged. Refusing it made a Ctrl-C during admission unrecoverable: release
+# refused, the attach it named could not be admitted (no .detached) and a relaunch refused too, so
+# the whole run directory was lost. The proof is an ordering, not a guess — codex-run.sh writes
+# .ccr-prelaunch before it can submit anything and ccr-job.py persists .ccr-attempt.json before it
+# spawns the submitter — so the three states that only LOOK like it must still fail closed.
+f01_state() {  # <prelaunch-protocol|-> [attempt]
+  rm -rf "$PR"/02-p2.claim.spent* "$PR/02-p2.claim" "$PR"/02-p2.ccr-*
+  mkdir -p "$PR/02-p2.claim/runner"; printf '2147483646\n' > "$PR/02-p2.claim/runner/pid"; : > "$PR/02-p2.progress"
+  [ "$1" = - ] || printf 'protocol=%s\nstage=pre-admission\nbackend=ccr\n' "$1" > "$PR/02-p2.ccr-prelaunch"
+  [ -z "${2:-}" ] || printf '{}' > "$PR/02-p2.ccr-attempt.json"
+}
+f01_state 1
+chk "F-01r43: proven pre-submission releases" 0 "RELEASED 02-p2" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+f01_state -
+chk "F-01r43: no protocol marker still refuses" 1 "stop evidence" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+f01_state 99
+chk "F-01r43: unknown protocol still refuses" 1 "stop evidence" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+f01_state 1 attempt
+chk "F-01r43: marker plus an attempt record still refuses" 1 "stop evidence" env HOME="$TMP/nohome" bash "$PG" release "$PR" 02-p2
+# The proof is only sound while the runner and the gate mean the same thing by the protocol number.
+RP=$(sed -n 's/^CCR_PROTOCOL=\([0-9][0-9]*\).*/\1/p' plugins/codex-pr-review/scripts/codex-run.sh | head -1)
+GP=$(sed -n 's/^CCR_PROTOCOL=\([0-9][0-9]*\).*/\1/p' "$PG" | head -1)
+[ -n "$RP" ] && [ "$RP" = "$GP" ] && printf '  ok    %-42s\n' "F-01r43: runner and gate agree on CCR_PROTOCOL" \
+  || { printf '  FAIL  F-01r43: CCR_PROTOCOL runner=%s gate=%s\n' "${RP:-none}" "${GP:-none}"; FAIL=1; }
+rm -rf "$PR"/02-p2.claim.spent* "$PR/02-p2.claim" "$PR/02-p2.progress" "$PR"/02-p2.ccr-*
+
+# F-02r43 (cycle 6): a saved attach command must name the job it was written for. A prefix is
+# legitimately reusable (the gate rotates a spent claim, the runner rotates the sidecars), so a
+# command that names only a prefix would watch — and on its stall bound cancel — whichever job
+# occupies it now. The gateway backend always carried this binding; the companion backend did not.
+A2="$TMP/attach-identity"; mkdir -p "$A2"
+printf 'backend=codex\njob=task-new-b\nmode=--fresh\nthread=t\njoblog=\ndetached_at=2026-09-11T00:00:00Z\n' > "$A2/02-p1.detached"
+chk "F-02r43: saved attach for a replaced job refused" 4 "names job task-old-a, but" bash "$R" "$A2/02-p1" --attach --expected-job task-old-a
+[ ! -e "$A2/02-p1.progress" ] && printf '  ok    %-42s\n' "F-02r43: the refusal observed nothing" \
+  || { printf '  FAIL  F-02r43: a refused attach wrote .progress\n'; FAIL=1; }
+# --expected-job used to require a CCR attempt, which is exactly what a companion prefix never has.
+out=$(bash "$R" "$A2/02-p1" --attach --expected-job task-old-a 2>&1)
+printf '%s' "$out" | grep -q 'requires a durable CCR attempt' \
+  && { printf '  FAIL  F-02r43: --expected-job still refused on a companion prefix\n'; FAIL=1; } \
+  || printf '  ok    %-42s\n' "F-02r43: --expected-job accepted on a companion prefix"
+# The generator must emit it, or nothing downstream can compare anything. Since cycle 8 there is
+# exactly ONE generator, so this asserts that it binds and that no other path composes an attach.
+grep -q -- '--attach --expected-job "\$job"' plugins/codex-pr-review/scripts/codex-run.sh \
+  && [ "$(grep -c -- 'quote_command .*--attach --expected-job' plugins/codex-pr-review/scripts/codex-run.sh)" = 1 ] \
+  && ! grep -q -- '\$0 \$PREFIX --attach' plugins/codex-pr-review/scripts/codex-run.sh \
+  && printf '  ok    %-42s\n' "F-02r43: one generator, and it carries the job" \
+  || { printf '  FAIL  F-02r43: an attach command is composed outside bound_attach_command\n'; FAIL=1; }
+
+# F-02r44 (cycle 7, tightened in cycle 8): a record written before the binding existed carries an
+# attach command with no --expected-job. Running it supplies nothing to compare, which is the very
+# defect the binding closes, still open for every record an upgrading operator already holds. Since
+# cycle 8 the caller must name a job whatever the record says, so this case is refused by the same
+# rule as every other unbound attach — the legacy record no longer needs a rule of its own.
+printf 'backend=codex\njob=task-new-b\nmode=--fresh\nattach_command=/r/codex-run.sh /p --attach --stall-min 6 --max-min 25 --poll-sec 15\n' > "$A2/02-p4.detached"
+chk "F-02r44: unbound legacy record refused" 4 "must name the job it is for" bash "$R" "$A2/02-p4" --attach
+[ ! -e "$A2/02-p4.progress" ] && printf '  ok    %-42s\n' "F-02r44: the legacy refusal observed nothing" \
+  || { printf '  FAIL  F-02r44: a refused attach wrote .progress\n'; FAIL=1; }
+# The refusal must hand back a command that works, not just say no. Capture first and grep the
+# variable: this file sets `pipefail`, so piping a command that exits 4 into grep yields 4 whatever
+# grep found, and the assertion would fail on a refusal that is exactly right.
+out=$(bash "$R" "$A2/02-p4" --attach 2>&1 || true)
+printf '%s' "$out" | grep -q -- '--expected-job task-new-b' \
+  && printf '  ok    %-42s\n' "F-02r44: refusal names the bound command" \
+  || { printf '  FAIL  F-02r44: refusal does not name the bound command\n'; FAIL=1; }
+# F-01r45 (cycle 8): the binding must be required of the CALLER, not read off the RECORD. Asking
+# "is this record bound?" answers a question about the attempt that is HERE, not about the one the
+# incoming command was written for — and a deliberate interactive attach and a stale pre-binding
+# saved command have identical arguments. So a bound record vouched for every unbound caller, and an
+# old command replayed against a newer attempt was admitted, watched it, and would cancel it on its
+# stall bound. The previous version of this fixture ASSERTED that admission, and reached the live
+# watch loop to do it: with the companion installed it polled an unknown job for a minute and then
+# sent a real cancel, from a suite documented as needing no companion and no network.
+BOUNDREC='backend=codex
+job=task-new-b
+mode=--fresh
+attach_command=/r/codex-run.sh /p --attach --expected-job task-new-b --stall-min 6 --max-min 25 --poll-sec 15
+'
+printf '%s' "$BOUNDREC" > "$A2/02-p5.detached"
+chk "F-01r45: bound record, unbound caller refused" 4 "must name the job it is for" bash "$R" "$A2/02-p5" --attach --max-min 1 --stall-min 1 --poll-sec 5
+[ ! -e "$A2/02-p5.progress" ] && printf '  ok    %-42s\n' "F-01r45: the unbound refusal observed nothing" \
+  || { printf '  FAIL  F-01r45: a refused attach wrote .progress\n'; FAIL=1; }
+# The replay the guard exists to stop: prefix reused for a new job, the old command re-run.
+chk "F-01r45: replayed old job refused" 4 "names job task-old-a" bash "$R" "$A2/02-p5" --attach --expected-job task-old-a
+# Cancellation takes a different path to the same guard, so it must be refused the same way and
+# must cancel nothing. An exemption here would leave the whole defect reachable through --cancel.
+chk "F-01r45: unbound cancellation refused" 4 "must name the job it is for" bash "$R" "$A2/02-p5" --attach --cancel
+[ ! -e "$A2/02-p5.progress" ] && printf '  ok    %-42s\n' "F-01r45: the refused cancel cancelled nothing" \
+  || { printf '  FAIL  F-01r45: a refused --cancel wrote .progress\n'; FAIL=1; }
+# The matching caller must still get through the admission block. HOME is sandboxed so the attach
+# stops at "cannot locate the codex plugin" (exit 6, nothing observed, nothing cancelled) instead of
+# entering a live watch against the operator's installed companion.
+out=$(env HOME="$TMP/nohome" bash "$R" "$A2/02-p5" --attach --expected-job task-new-b --max-min 1 --stall-min 1 --poll-sec 5 2>&1); rc=$?
+[ "$rc" = 6 ] && printf '%s' "$out" | grep -q 'cannot locate the codex plugin' \
+  && ! printf '%s' "$out" | grep -q 'must name the job it is for' \
+  && printf '  ok    %-42s\n' "F-01r45: the matching caller is admitted" \
+  || { printf '  FAIL  F-01r45: a matching attach was refused (rc=%s) %s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+# ...and the guidance it prints must be the bound command, not the unbound fallback it used to
+# compose from "$0 $PREFIX --attach".
+printf '%s' "$out" | grep -q -- '--expected-job task-new-b' \
+  && printf '  ok    %-42s\n' "F-01r45: recovery guidance stays bound" \
+  || { printf '  FAIL  F-01r45: recovery guidance dropped the binding\n'; FAIL=1; }
+# F-03r45 (cycle 8): the command a refusal tells the operator to RUN must survive shlex.split with
+# its argv intact. It was hand-built by interpolating raw paths, so it split at the first space in
+# an installation or artifact path — paths this suite's own quoting tests support.
+SP="$TMP/attach quoting"; mkdir -p "$SP"
+cp "$R" "$SP/codex-run.sh"; cp "$(dirname "$R")/ccr-job.py" "$SP/ccr-job.py"
+printf 'backend=codex\njob=task-new-b\nmode=--fresh\nattach_command=/r/codex-run.sh /p --attach --stall-min 6 --max-min 25 --poll-sec 15\n' > "$SP/p 1.detached"
+out=$(bash "$SP/codex-run.sh" "$SP/p 1" --attach 2>&1 || true)
+printf '%s' "$out" | SPDIR="$SP" python3 -c '
+import os,re,shlex,sys
+t=sys.stdin.read(); d=os.environ["SPDIR"]
+m=re.search(r"Run: (.*)", t)
+if not m: print("NOMATCH"); raise SystemExit
+want=[d+"/codex-run.sh", d+"/p 1", "--attach", "--expected-job", "task-new-b",
+      "--stall-min", "6", "--max-min", "25", "--poll-sec", "15"]
+print("OK" if shlex.split(m.group(1))==want else "SPLIT %r" % (shlex.split(m.group(1)),))' > "$SP/parsed"
+grep -qx OK "$SP/parsed" && printf '  ok    %-42s\n' "F-03r45: the printed command survives spaces" \
+  || { printf '  FAIL  F-03r45: %s\n' "$(head -c 300 "$SP/parsed")"; FAIL=1; }
+rm -rf "$SP" "$A2"
+
+# F-04r46 (cycle 9): a refusal's remedy must carry the bounds the ATTEMPT was launched with, not the
+# bounds of the invocation being refused. The generator interpolated $STALL_MIN/$MAX_MIN/$POLL,
+# which are the current caller's parsed options, so an operator who attached with a short bound was
+# handed a command carrying that short bound back. On an attach the stall bound is not advisory —
+# reaching it sets STALLED and issues a real cancel — so the printed recovery became a cancellation.
+A6="$TMP/attach-bounds"; mkdir -p "$A6"
+printf 'backend=codex\njob=task-new-b\nmode=--fresh\nattach_command=/r/codex-run.sh /p --attach --expected-job task-new-b --stall-min 6 --max-min 25 --poll-sec 15\n' > "$A6/02-p1.detached"
+out=$(bash "$R" "$A6/02-p1" --attach --expected-job task-old-a --stall-min 1 --max-min 2 --poll-sec 5 2>&1 || true)
+printf '%s' "$out" | grep -q -- '--stall-min 6 --max-min 25 --poll-sec 15' \
+  && ! printf '%s' "$out" | grep -q -- '--stall-min 1 --max-min 2 --poll-sec 5' \
+  && printf '  ok    %-42s\n' "F-04r46: the remedy keeps the record's bounds" \
+  || { printf '  FAIL  F-04r46: the remedy carried the caller bounds: %s\n' "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+[ ! -e "$A6/02-p1.progress" ] && printf '  ok    %-42s\n' "F-04r46: the mismatch refusal observed nothing" \
+  || { printf '  FAIL  F-04r46: a refused attach wrote .progress\n'; FAIL=1; }
+# The same property one level up: the gate's hint is regenerated from the record, so it must carry
+# the record's bounds too — a hint with no bounds silently takes the runner's defaults.
+mkdir -p "$A6/art"
+printf 'backend=ccr\njob=ccr-1\nmode=--fresh\nattach_command=/r/codex-run.sh /p --attach --stall-min 9 --max-min 40 --poll-sec 20\n' > "$A6/art/02-p1.detached"
+# The generator is exercised directly: every gate that prints it refuses for its own reasons long
+# before reaching this call, so a whole-gate fixture would assert the earlier refusal instead.
+out=$(ART="$A6/art" ROOT="$(dirname "$(dirname "$PG")")" bash -c "$(awk '/^detached_attach_hint\(\) \{/,/^\}/' "$PG")
+detached_attach_hint 02-p1" 2>&1 || true)
+printf '%s' "$out" | grep -q -- '--expected-job ccr-1 --stall-min 9 --max-min 40 --poll-sec 20' \
+  && printf '  ok    %-42s\n' "F-07r46: the gate's hint keeps the bounds too" \
+  || { printf '  FAIL  F-07r46: gate hint: %s\n' "$(printf '%s' "$out" | tail -1)"; FAIL=1; }
+rm -rf "$A6"
+
+# F-02r46 (cycle 9): the binding must be required BEFORE anything reads, writes or cancels. It sat
+# thirty lines below `recover`, which rewrites .ccr-attempt.json and can publish .detached, so an
+# unbound attach mutated the record it was about to be refused for — and the refusal's own comment
+# claimed nothing had been written. Bytes alone cannot see this (recover replaces the file
+# atomically, so the content can be identical), which is why identity and mtime are compared.
+A7="$TMP/attach-before-recover"; mkdir -p "$A7"; A7P="$A7/02-p1"
+NOCCR="$TMP/noccr"; mkdir -p "$NOCCR"
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> %s/requests\nexit 1\n' "$NOCCR" > "$NOCCR/ccr"; chmod +x "$NOCCR/ccr"
+a7_identity() { python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(s.st_dev, s.st_ino, s.st_mtime_ns, s.st_size)' "$A7P.ccr-attempt.json"; }
+# Every file of the prefix, by name AND identity: `recover` publishes .detached and replaces the
+# attempt record atomically, so a snapshot of names alone would miss both.
+a7_tree() { python3 -c '
+import os, sys
+from pathlib import Path
+for path in sorted(Path(sys.argv[1]).iterdir()):
+    s = path.stat()
+    print(path.name, s.st_ino, s.st_mtime_ns, s.st_size)' "$A7"; }
+if PATH="$CCRBIN:$PATH" python3 "$CCRH" admit "$A7P" x anthropic.ccr.x 1 "$R" '{}' 0.6.0 30 6 25 1 ccr launch --model x --detach --prompt-file "$PROMPT" >/dev/null; then
+  A7_ID=$(a7_identity); A7_SHA=$(shasum "$A7P.ccr-attempt.json" | cut -d' ' -f1); A7_TREE=$(a7_tree)
+  out=$(PATH="$NOCCR:$PATH" bash "$R" "$A7P" --attach 2>&1); rc=$?
+  [ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'must name the job it is for' \
+    && printf '  ok    %-42s\n' "F-02r46: the unbound attach is refused first" \
+    || { printf '  FAIL  F-02r46: unbound attach rc=%s %s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+  [ "$(a7_identity)" = "$A7_ID" ] && [ "$(shasum "$A7P.ccr-attempt.json" | cut -d' ' -f1)" = "$A7_SHA" ] \
+    && printf '  ok    %-42s\n' "F-02r46: the attempt record is the same file" \
+    || { printf '  FAIL  F-02r46: .ccr-attempt.json was replaced or rewritten\n'; FAIL=1; }
+  [ "$(a7_tree)" = "$A7_TREE" ] && [ ! -e "$A7P.exit" ] && [ ! -e "$A7P.progress" ] \
+    && printf '  ok    %-42s\n' "F-02r46: not one file of the prefix changed" \
+    || { printf '  FAIL  F-02r46: a refused attach wrote to the prefix:\n%s\n' "$(diff <(printf '%s\n' "$A7_TREE") <(a7_tree) | head -6)"; FAIL=1; }
+  [ ! -e "$NOCCR/requests" ] && printf '  ok    %-42s\n' "F-02r46: no gateway request occurred" \
+    || { printf '  FAIL  F-02r46: the refusal reached the gateway: %s\n' "$(head -1 "$NOCCR/requests")"; FAIL=1; }
+  # An externally supplied job does not repair a missing receipt either: a lost delivery is
+  # recovered by submission-status discovery and reconciliation, never by attaching unbound.
+  # Since cycle 12 the record's own identity answers this before the receipt does: the prefix here
+  # carries a .detached naming the admitted job, so the refusal names that job and prints the command
+  # for it, instead of reporting the receipt comparison. Both refuse; this one is more useful and,
+  # being above publish_lock, it is also the one that leaves no file behind (F-08).
+  out=$(PATH="$NOCCR:$PATH" bash "$R" "$A7P" --attach --expected-job ccr-not-this-one 2>&1); rc=$?
+  [ "$rc" = 4 ] && printf '%s' "$out" | grep -q 'this attach names job ccr-not-this-one, but' \
+    && printf '%s' "$out" | grep -q -- '--expected-job ccr-' \
+    && printf '  ok    %-42s\n' "F-02r46: a guessed job is refused as another's" \
+    || { printf '  FAIL  F-02r46: guessed-job attach rc=%s %s\n' "$rc" "$(printf '%s' "$out" | head -1)"; FAIL=1; }
+  [ "$(a7_tree)" = "$A7_TREE" ] \
+    && printf '  ok    %-42s\n' "F-08r49: the guessed job wrote nothing either" \
+    || { printf '  FAIL  F-08r49: the guessed-job refusal wrote:\n%s\n' "$(diff <(printf '%s\n' "$A7_TREE") <(a7_tree) | head -6)"; FAIL=1; }
+else
+  printf '  FAIL  F-02r46: fixture admission failed\n'; FAIL=1
+fi
+rm -rf "$A7" "$NOCCR"
+
+# F-03r46 / F-05r46 / F-06r46 (cycle 9): the RUNNER half of the pre-submission-proof item. The
+# release half was asserted (evidence=pre-submission-proof, above); nothing asserted that the runner
+# archives an interrupted staging write or records the proof on the branch that PERMITS a launch.
+W6="$TMP/prelaunch-staging"
+mkdir -p "$W6/part"
+printf 'protocol=1\nstage=pre-admission\nbackend=cc' > "$W6/part/x.ccr-prelaunch.part"   # interrupted mid-write
+W6_PART=$(shasum "$W6/part/x.ccr-prelaunch.part" | cut -d' ' -f1)
+bash "$R" "$W6/part/x" --via ccr:no-such-alias-xyz --prompt-file "$PROMPT" >/dev/null 2>&1 || true
+[ -e "$W6/part/x.attempt1.ccr-prelaunch.part" ] && [ ! -e "$W6/part/x.ccr-prelaunch.part" ] \
+  && [ "$(shasum "$W6/part/x.attempt1.ccr-prelaunch.part" | cut -d' ' -f1)" = "$W6_PART" ] \
+  && printf '  ok    %-42s\n' "F-03r46: an interrupted staging write is archived" \
+  || { printf '  FAIL  F-03r46: .ccr-prelaunch.part was inherited or lost\n'; FAIL=1; }
+# ...and it is archived, never read as authorization: nothing reads .part, so a prefix carrying only
+# a staging file has no proof and must still fail closed.
+mkdir -p "$W6/proof"; printf '0s orphan\n' > "$W6/proof/x.progress"
+printf 'protocol=1\nstage=pre-admission\nbackend=ccr\n' > "$W6/proof/x.ccr-prelaunch.part"
+out=$(bash "$R" "$W6/proof/x" --via ccr:no-such-alias-xyz --prompt-file "$PROMPT" 2>&1 || true)
+printf '%s' "$out" | grep -q 'names an attempt that has not ended' \
+  && printf '  ok    %-42s\n' "F-03r46: a staging file is not a proof" \
+  || { printf '  FAIL  F-03r46: a staging-only prefix was treated as proven pre-submission\n'; FAIL=1; }
+# The permitting branch must leave its trace on every path, including the one that then fails to
+# launch: launch_error truncates .progress with `>`, so the note has to be written after it.
+mkdir -p "$W6/err"; printf '0s orphan\n' > "$W6/err/x.progress"
+printf 'protocol=1\nstage=pre-admission\nbackend=ccr\n' > "$W6/err/x.ccr-prelaunch"
+bash "$R" "$W6/err/x" --via ccr:no-such-alias-xyz --prompt-file "$PROMPT" >/dev/null 2>&1 || true
+[ -e "$W6/err/x.attempt1.progress" ] && grep -q 'LAUNCH-ERROR' "$W6/err/x.progress" \
+  && grep -q 'PRE-SUBMISSION-PROOF' "$W6/err/x.progress" \
+  && printf '  ok    %-42s\n' "F-05r46: a launch error keeps the proof note" \
+  || { printf '  FAIL  F-05r46: the launch-error path archived an orphan with no proof recorded\n'; FAIL=1; }
+rm -rf "$W6"
+
+# F-07r46 (cycle 9): "one generator" was asserted against ONE of the three byte-identical runner
+# copies, and two more composers live outside them. Assert the property where it actually lives.
+G6=1
+for g6copy in plugins/*/scripts/codex-run.sh; do
+  [ "$(grep -c -- 'quote_command .*--attach --expected-job' "$g6copy")" = 1 ] || G6=0
+  ! grep -q -- '\$0 \$PREFIX --attach' "$g6copy" || G6=0
+done
+# Assert the property, not one spelling of it: every list literal that puts "--attach" into a
+# command has "--expected-job" as its next element, whatever the job expression is called.
+for g6src in "$CCRH" "$PG"; do
+  python3 - "$g6src" <<'PY' || G6=0
+import re, sys
+text = open(sys.argv[1], encoding="utf-8").read()
+composers = re.findall(r'"--attach",\s*("--expected-job")?', text)
+if not composers or not all(composers):
+    raise SystemExit(1)
+PY
+done
+[ "$G6" = 1 ] && printf '  ok    %-42s\n' "F-07r46: every attach composer binds the job" \
+  || { printf '  FAIL  F-07r46: an attach command is composed unbound somewhere\n'; FAIL=1; }
+
+# F-01r46 (cycle 9): the live gateway suite is never run by validate.sh, so its calls have to be
+# checked by reading them. Every positive attach or cancellation it invokes must name the job from
+# its own launch receipt; the deliberate refusal fixtures are the allow-listed exceptions.
+python3 - <<'PY' && printf '  ok    %-42s\n' "F-01r46: the live suite attaches bound" \
+  || { printf '  FAIL  F-01r46: an unbound --attach in scripts/test-ccr-live.py\n'; FAIL=1; }
+import ast, sys
+from pathlib import Path
+source = Path("scripts/test-ccr-live.py").read_text()
+tree = ast.parse(source)
+lines = source.splitlines()
+unbound = []
+examined = 0
+for node in ast.walk(tree):
+    if not isinstance(node, ast.List):
+        continue
+    literals = [item.value for item in node.elts if isinstance(item, ast.Constant) and isinstance(item.value, str)]
+    if "--attach" not in literals:
+        continue
+    # An allow-listed negative fixture says so on its own line, in a comment the reader sees.
+    window = "\n".join(lines[max(0, node.lineno - 3):node.end_lineno])
+    if "unbound-on-purpose" in window:
+        continue
+    examined += 1
+    positions = [index for index, item in enumerate(node.elts)
+                 if isinstance(item, ast.Constant) and item.value == "--expected-job"]
+    if not positions or positions[0] + 1 >= len(node.elts):
+        unbound.append(node.lineno)
+        continue
+    if isinstance(node.elts[positions[0] + 1], ast.Constant):
+        unbound.append(node.lineno)   # a literal job id is not this launch's own receipt
+if unbound:
+    print("unbound attach argument lists at lines", unbound, file=sys.stderr)
+# A check that examines nothing proves nothing: the suite has an attach and a cancellation.
+if examined < 2:
+    print("only %d positive attach argument lists found; the check went blind" % examined, file=sys.stderr)
+raise SystemExit(1 if unbound or examined < 2 else 0)
+PY
+
+# F-01r47 (cycle 10): the remedy's bounds must come from the ATTEMPT wherever the attempt records
+# them — and where nothing records them, the refusal must SAY so rather than fill them in from the
+# invocation it is refusing. The previous repair read one source (the detached record) while the job
+# id its own message names is read from three, so the interrupted-admission prefix — receipt written,
+# detached record not yet published — printed a job-bound command carrying the refused caller's
+# stall bound, which cancels.
+A8="$TMP/remedy-bounds"; mkdir -p "$A8/attempt" "$A8/nothing" "$A8/detached"
+printf '{"schema":2,"stall_min":6,"max_min":25,"poll_sec":15,"receipt":{"submission_id":"s","job_id":"ccr-1111","session_id":"x"}}' > "$A8/attempt/02-p1.ccr-attempt.json"
+out=$(bash "$R" "$A8/attempt/02-p1" --attach --stall-min 1 --max-min 2 --poll-sec 5 2>&1 || true)
+printf '%s' "$out" | grep -q -- '--expected-job ccr-1111 --stall-min 6 --max-min 25 --poll-sec 15' \
+  && ! printf '%s' "$out" | grep -q -- '--stall-min 1 --max-min 2 --poll-sec 5' \
+  && printf '  ok    %-42s\n' "F-01r47: bounds come from the attempt record" \
+  || { printf '  FAIL  F-01r47: %s\n' "$(printf '%s' "$out" | head -c 220)"; FAIL=1; }
+# No detached record and no bounds anywhere: a job to name, but nothing to run.
+printf '{"schema":2,"receipt":{"job_id":"ccr-2222"}}' > "$A8/nothing/02-p1.ccr-attempt.json"
+out=$(bash "$R" "$A8/nothing/02-p1" --attach --stall-min 1 --max-min 2 --poll-sec 5 2>&1 || true)
+printf '%s' "$out" | grep -q 'are not recorded here' \
+  && ! printf '%s' "$out" | grep -q -- 'Run: ' \
+  && ! printf '%s' "$out" | grep -q -- '--stall-min 1' \
+  && printf '  ok    %-42s\n' "F-01r47: unknown bounds are stated, not invented" \
+  || { printf '  FAIL  F-01r47: a remedy was offered with no recorded bounds: %s\n' "$(printf '%s' "$out" | head -c 220)"; FAIL=1; }
+# The detached record still wins when it carries them, and an invalid stored bound is not a bound.
+printf 'backend=codex\njob=task-new-b\nmode=--fresh\nattach_command=/r/codex-run.sh /p --attach --expected-job task-new-b --stall-min 0 --max-min 25 --poll-sec 15\n' > "$A8/detached/02-p1.detached"
+out=$(bash "$R" "$A8/detached/02-p1" --attach --expected-job task-old-a --stall-min 1 --max-min 2 --poll-sec 5 2>&1 || true)
+printf '%s' "$out" | grep -q 'are not recorded here' \
+  && printf '  ok    %-42s\n' "F-01r47: a zero bound is not a recorded bound" \
+  || { printf '  FAIL  F-01r47: --stall-min 0 was accepted as the attempt bounds\n'; FAIL=1; }
+# ...and none of those refusals may write anything at all, the lock file included: the refusal is
+# above publish_lock now, because a created .claim.lock made "nothing was written" false.
+[ "$(ls "$A8/nothing")" = "02-p1.ccr-attempt.json" ] \
+  && printf '  ok    %-42s\n' "F-06r47: the refusal writes nothing, lock included" \
+  || { printf '  FAIL  F-06r47: a refused attach left %s\n' "$(ls "$A8/nothing" | tr '\n' ' ')"; FAIL=1; }
+rm -rf "$A8"
+
+# F-03r47 (cycle 10): the gate's pre-submission proof is reached BECAUSE a detached record exists,
+# so it must exclude one. Without that condition a record naming a job was freed on a proof that
+# says nothing was ever submitted.
+A9="$TMP/release-detached"; mkdir -p "$A9/art"
+printf 'backend=ccr\njob=ccr-live-1\nsession=s\n' > "$A9/art/02-p1.detached"
+printf 'protocol=1\nstage=pre-admission\nbackend=ccr\n' > "$A9/art/02-p1.ccr-prelaunch"
+out=$(ART="$A9/art" bash -c "CCR_PROTOCOL=1; RELEASE_EVIDENCE=''; helper=/nonexistent-helper
+fail() { printf 'REFUSED\n'; exit 1; }
+$(awk '/^ccr_release_check\(\) \{/,/^\}/' "$PG")
+ccr_release_check 02-p1 ''; printf 'PERMITTED evidence=%s\n' \"\$RELEASE_EVIDENCE\"" 2>&1 || true)
+printf '%s' "$out" | grep -q '^REFUSED' && ! printf '%s' "$out" | grep -q 'PERMITTED' \
+  && printf '  ok    %-42s\n' "F-03r47: a detached record blocks the proof" \
+  || { printf '  FAIL  F-03r47: released a detached record on the pre-submission proof\n'; FAIL=1; }
+rm -rf "$A9"
+
+# F-04r47 (cycle 10): an unreadable receipt is its own state. The binding is compared against the
+# receipt, so it fails for EVERY job id including the right one, and reporting that as "a different
+# attempt" told an operator in the one recoverable state that their correct command was wrong.
+AA="$TMP/lost-receipt"; mkdir -p "$AA"
+printf '{"schema":2,"submission_id":"s9"}' > "$AA/02-p1.ccr-attempt.json"; : > "$AA/02-p1.ccr-receipt.json"
+out=$(bash "$R" "$AA/02-p1" --attach --expected-job ccr-the-real-one 2>&1 || true)
+printf '%s' "$out" | grep -q 'admission receipt is missing or unreadable' \
+  && printf '%s' "$out" | grep -q 'complete-admission' \
+  && ! printf '%s' "$out" | grep -q 'belongs to a different attempt' \
+  && printf '  ok    %-42s\n' "F-04r47: the lost receipt names its own recovery" \
+  || { printf '  FAIL  F-04r47: %s\n' "$(printf '%s' "$out" | tail -1 | head -c 200)"; FAIL=1; }
+rm -rf "$AA"
+
+# F-05r47 (cycle 10), rewritten for F-04r48 (cycle 11) and again for F-02/F-03/F-04r49 (cycle 12):
+# the policy is a RELATION BETWEEN TWO RELEASES, and the check has to be able to fail.
+#   · cycle 10's version pinned `X.0.0` in every manifest and this release's own heading, so it
+#     asserted "the repository is at 7.0.0/4.0.0/3.0.0" and never compared a manifest to the
+#     changelog at all.
+#   · cycle 11's version compared them, but tested the SHAPE `X.0.0` rather than an increase — a
+#     BREAKING entry repeating the released versions passed — and matched the word BREAKING anywhere
+#     in the entry, so an ordinary release saying "nothing here is BREAKING" was rejected.
+#   · and its `2>&1` sat on its own line after the heredoc terminator, which inside `$(…)` is a
+#     separate, successful command: the substitution's status was 0 however the validator exited, so
+#     none of the above could ever have been reported. The redirection now belongs to the
+#     interpreter, and the negative case below proves the wrapper can fail.
+# What the policy says: the top entry names a version for each plugin; the three manifests and the
+# marketplace record agree with it; each version is strictly greater than the one the most recent
+# earlier entry named for that plugin; and the major component increases exactly when the entry
+# carries a BREAKING label — a line of its own, never a word inside a sentence.
+release_policy() {  # [changelog-relative-root] -> exit 0 when the relation holds
+  python3 - 2>&1 <<'PY'
+import json, re, sys
+
+PLUGINS = ["codex-pr-review", "codex-deep-plan", "codex-debate"]
+
+
+def versions(entry):  # {plugin: (major, minor, patch)} — the first version each entry names
+    found = {}
+    for name, *parts in re.findall(r"`(codex-[a-z-]+)`\s+([0-9]+)\.([0-9]+)\.([0-9]+)", entry):
+        found.setdefault(name, tuple(int(p) for p in parts))
+    return found
+
+
+body = open("CHANGELOG.md", encoding="utf-8").read()
+entries = re.split(r"^## \[", body, flags=re.M)[1:]
+if len(entries) < 2:
+    sys.exit("CHANGELOG.md needs the released entry and the one before it")
+top, earlier = entries[0], entries[1:]
+current = versions(top)
+missing = [name for name in PLUGINS if name not in current]
+if missing:
+    sys.exit("the top entry names no version for: " + ", ".join(missing))
+
+# The label is a line of its own (`BREAKING:` or `**BREAKING**`), so prose that merely mentions the
+# word — including a sentence denying it — is not a release label.
+breaking = re.search(r"^\s*(?:\*\*)?BREAKING(?:\*\*)?\s*:", top, flags=re.M) is not None
+market = {record["name"]: record["version"]
+          for record in json.load(open(".claude-plugin/marketplace.json", encoding="utf-8"))["plugins"]}
+problems = []
+for name in PLUGINS:
+    want = ".".join(str(p) for p in current[name])
+    shipped = json.load(open("plugins/%s/.claude-plugin/plugin.json" % name, encoding="utf-8"))["version"]
+    if shipped != want:
+        problems.append("%s: manifest %s, changelog %s" % (name, shipped, want))
+    if market.get(name) != want:
+        problems.append("%s: marketplace %s, changelog %s" % (name, market.get(name), want))
+    before = next((versions(entry)[name] for entry in earlier if name in versions(entry)), None)
+    if before is None:
+        continue  # a plugin's first release has nothing to increase over
+    if current[name] <= before:
+        problems.append("%s: %s does not increase over %s"
+                        % (name, want, ".".join(str(p) for p in before)))
+    major_bump = current[name][0] > before[0]
+    if breaking and not major_bump:
+        problems.append("%s: %s is not a major bump, but the entry is labelled BREAKING" % (name, want))
+    if major_bump and not breaking:
+        problems.append("%s: %s is a major bump, but the entry carries no BREAKING label" % (name, want))
+if problems:
+    sys.exit("; ".join(problems))
+PY
+}
+V_OUT=$(release_policy) && printf '  ok    %-42s\n' "F-05r47: the release relation holds" \
+  || { printf '  FAIL  F-05r47: %s\n' "$(printf '%s' "$V_OUT" | tail -1 | head -c 200)"; FAIL=1; }
+# F-02r49 (cycle 12): the wrapper must be able to report a failure at all. The shape above is
+# asserted directly — a validator that exits non-zero has to reach the failure branch with its
+# diagnostic in hand, which the previous spelling could not do for any input whatsoever.
+W49=$(bash -c 'V=$(python3 - 2>&1 <<PY
+import sys
+sys.exit("deliberate policy failure")
+PY
+) && echo "REPORTED-OK" || echo "REPORTED-FAIL:$V"')
+[ "$W49" = "REPORTED-FAIL:deliberate policy failure" ] \
+  && printf '  ok    %-42s\n' "F-02r49: a failing policy check is reported" \
+  || { printf '  FAIL  F-02r49: the wrapper reported [%s]\n' "$W49"; FAIL=1; }
+
+# ---- cycle 11 -------------------------------------------------------------------------------
+# F-03r48: the refusals that say "nothing was observed, cancelled or written" must write nothing on
+# a BARE prefix too. die4 suppressed its .exit only when one of eight sidecars already existed, and
+# the binding refusal was deliberately moved above every writer, so the one state it always runs in
+# — an attach on a prefix with no sidecars — was the one state where it published a terminal 4 that
+# every gate reads as a finished attempt. An attach is never the attempt a .exit describes.
+B48="$TMP/bare-attach"; mkdir -p "$B48"
+out=$(bash "$R" "$B48/02-p1" --attach 2>&1); rc=$?
+[ "$rc" = 4 ] && [ -z "$(ls -A "$B48")" ] \
+  && printf '  ok    %-42s\n' "F-03r48: a refused attach publishes nothing" \
+  || { printf '  FAIL  F-03r48: rc=%s left %s\n' "$rc" "$(ls -A "$B48" | tr '\n' ' ')"; FAIL=1; }
+# Bound, and still nothing: the other attach refusals are equally not this attempt's outcome.
+out=$(bash "$R" "$B48/02-p2" --attach --expected-job ccr-nothing-here 2>&1); rc=$?
+[ "$rc" = 4 ] && [ -z "$(ls -A "$B48")" ] \
+  && printf '  ok    %-42s\n' "F-03r48: a bound attach refusal writes nothing" \
+  || { printf '  FAIL  F-03r48: rc=%s left %s\n' "$rc" "$(ls -A "$B48" | tr '\n' ' ')"; FAIL=1; }
+# A launch-shaped argument error still publishes — that IS this invocation's attempt — but not when
+# a prelaunch marker says a launch on this prefix has already begun and may be in flight.
+out=$(bash "$R" "$B48/02-p3" --via bogus --prompt-file "$PROMPT" 2>&1); rc=$?
+[ "$rc" = 4 ] && [ -e "$B48/02-p3.exit" ] \
+  && printf '  ok    %-42s\n' "F-03r48: a launch error is still terminal" \
+  || { printf '  FAIL  F-03r48: a claim-less launch error published no .exit (rc=%s)\n' "$rc"; FAIL=1; }
+for m in ccr-prelaunch ccr-prelaunch.part; do
+  printf 'protocol=1\nstage=pre-admission\nbackend=ccr\n' > "$B48/02-p4.$m"
+  out=$(bash "$R" "$B48/02-p4" --via bogus --prompt-file "$PROMPT" 2>&1); rc=$?
+  [ "$rc" = 4 ] && [ ! -e "$B48/02-p4.exit" ] \
+    && printf '  ok    %-42s\n' "F-03r48: .$m is an attempt marker" \
+    || { printf '  FAIL  F-03r48: .%s did not suppress the .exit\n' "$m"; FAIL=1; }
+  rm -f "$B48/02-p4.$m" "$B48/02-p4.exit"
+done
+rm -rf "$B48"
+
+# F-05r48 (cycle 11): a stored bound is read as a WHOLE token or not at all. The sed that replaced
+# it matched a leading run of digits and ate the rest, so `--stall-min 1e2` was read as 1 — a
+# one-minute cancellation threshold the record never expressed, invented by the reader.
+M48="$TMP/malformed-bounds"; mkdir -p "$M48"
+printf 'backend=codex\njob=task-m\nmode=--fresh\nattach_command=/r/codex-run.sh /p --attach --expected-job task-m --stall-min 1e2 --max-min 25oops --poll-sec 15.5\n' > "$M48/02-p1.detached"
+out=$(bash "$R" "$M48/02-p1" --attach --expected-job task-other --stall-min 1 --max-min 2 --poll-sec 5 2>&1 || true)
+printf '%s' "$out" | grep -q 'are not recorded here' \
+  && ! printf '%s' "$out" | grep -q -- '--stall-min 1 ' \
+  && printf '  ok    %-42s\n' "F-05r48: a malformed bound is not a bound" \
+  || { printf '  FAIL  F-05r48: %s\n' "$(printf '%s' "$out" | head -c 220)"; FAIL=1; }
+rm -rf "$M48"
+
+# F-06r48 (cycle 11): every command a refusal tells an operator to run is shell-quoted. abs_path
+# makes a path absolute; it does not quote it, so the lost-receipt remedy was the one command in
+# this runner that fell apart on the artifact paths the quoting tests already support.
+Q48="$TMP/quote 48"; mkdir -p "$Q48"
+printf '{"schema":2,"submission_id":"s9"}' > "$Q48/02-p1.ccr-attempt.json"; : > "$Q48/02-p1.ccr-receipt.json"
+out=$(bash "$R" "$Q48/02-p1" --attach --expected-job ccr-the-real-one 2>&1 || true)
+REM=$(printf '%s' "$out" | python3 -c 'import re,shlex,sys
+text = sys.stdin.read()
+match = re.search(r"lookup, (.+?), which looks the submission up", text, re.S)
+if not match:
+    raise SystemExit("no remedy in the refusal")
+argv = shlex.split(match.group(1))
+if argv[1:2] != [sys.argv[1]] or argv[2] != "recover" or argv[3] != sys.argv[2]:
+    raise SystemExit("remedy argv is " + repr(argv))
+print("ok")' "$(cd "$(dirname "$R")" && pwd)/ccr-job.py" "$Q48/02-p1" 2>&1)
+[ "$REM" = ok ] \
+  && printf '  ok    %-42s\n' "F-06r48: the remedy survives a spaced path" \
+  || { printf '  FAIL  F-06r48: %s\n' "$(printf '%s' "$REM" | head -c 200)"; FAIL=1; }
+rm -rf "$Q48"
+
+# F-08r48 (cycle 11): on an attach the attach command is REGENERATED at admission and kept. The ccr
+# detach paths read it back out of the record, so on that backend a pre-binding record's unbound
+# command — or the empty one a record carries when its bounds were never recorded — was republished
+# by the very attach that had just computed the correct one. The rule held on one backend only.
+G48=1
+for f in plugins/codex-pr-review/scripts/codex-run.sh; do
+  # every `attach_command` read from the record is guarded by "not on an attach"
+  while IFS= read -r line; do
+    case "$line" in *'[ "$ATTACH" = 1 ] ||'*) ;; *) G48=0;; esac
+  done < <(grep -n 'ATTACH_CMD=.*detached_field attach_command' "$f" | cut -d: -f2-)
+  [ "$(grep -c 'ATTACH_CMD=.*detached_field attach_command' "$f")" = 2 ] || G48=0
+done
+[ "$G48" = 1 ] \
+  && printf '  ok    %-42s\n' "F-08r48: an attach never republishes the record" \
+  || { printf '  FAIL  F-08r48: a ccr detach path re-reads attach_command on an attach\n'; FAIL=1; }
+
+# ---- cycle 12 -------------------------------------------------------------------------------
+# F-01r49: the gate's hint is generated UNDER `set -u`, and the whole command is asserted — prefix
+# included. The previous fixture ran the extracted function without `set -u` and grepped for flags,
+# so it could not see that line 76's `set --` had deleted the function's own arguments: both
+# regeneration branches dereferenced an unset $1, aborted, and printed nothing at all. Without
+# `set -u` they would instead have composed a command naming the run directory rather than the
+# prefix — which is why the assertion is the full command and not a substring of it.
+H49="$TMP/hint-set-u"; mkdir -p "$H49/art"
+RUNNER_ABS=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' plugins/codex-pr-review/scripts/codex-run.sh)
+printf 'backend=ccr\njob=ccr-1\nattach_command=/r/codex-run.sh /p --attach --expected-job ccr-1 --stall-min 9 --max-min 40 --poll-sec 20\n' > "$H49/art/02-p1.detached"
+printf 'backend=ccr\njob=ccr-2\nattach_command=/r/codex-run.sh /p --attach --stall-min 9 --max-min 40 --poll-sec 20\n' > "$H49/art/02-p2.detached"
+printf 'backend=ccr\njob=ccr-3\nattach_command=\nattach_guidance=Watch bounds are unrecorded; no runnable attach command is available.\n' > "$H49/art/02-p3.detached"
+hint49() { ART="$H49/art" ROOT="$(dirname "$(dirname "$PG")")" bash -uc "$(awk '/^detached_attach_hint\(\) \{/,/^\}/' "$PG")
+detached_attach_hint $1" 2>&1; }
+h1=$(hint49 02-p1); h2=$(hint49 02-p2); h3=$(hint49 02-p3)
+[ "$h1" = "/r/codex-run.sh /p --attach --expected-job ccr-1 --stall-min 9 --max-min 40 --poll-sec 20" ] \
+  && printf '  ok    %-42s\n' "F-01r49: a bound, bounded command is forwarded" \
+  || { printf '  FAIL  F-01r49: forwarded [%s]\n' "$h1"; FAIL=1; }
+[ "$h2" = "$RUNNER_ABS $H49/art/02-p2 --attach --expected-job ccr-2 --stall-min 9 --max-min 40 --poll-sec 20" ] \
+  && printf '  ok    %-42s\n' "F-01r49: an unbound command is regenerated" \
+  || { printf '  FAIL  F-01r49: regenerated [%s]\n' "$h2"; FAIL=1; }
+case "$h3" in
+  "$RUNNER_ABS $H49/art/02-p3 --attach --expected-job ccr-3 --stall-min/--max-min/--poll-sec ("*"stall bound cancels)")
+    printf '  ok    %-42s\n' "F-01r49: unknown bounds keep the prefix";;
+  *) printf '  FAIL  F-01r49: no-bounds branch produced [%s]\n' "$h3"; FAIL=1;;
+esac
+printf '%s\n%s\n%s\n' "$h1" "$h2" "$h3" | grep -q 'unbound variable' \
+  && { printf '  FAIL  F-01r49: the generator aborted under set -u\n'; FAIL=1; } \
+  || printf '  ok    %-42s\n' "F-01r49: nothing aborts under set -u"
+rm -rf "$H49"
+
+# F-03r49 / F-04r49 (cycle 12): the release relation is exercised in both directions against scratch
+# copies, because asserting it only against the repository's own files proves nothing about what it
+# REJECTS. Cycle 11's clause passed every one of these three cases.
+P49="$TMP/policy"; rm -rf "$P49"; mkdir -p "$P49/plugins"
+cp .claude-plugin/marketplace.json "$P49/.marketplace.json"; mkdir -p "$P49/.claude-plugin"
+cp .claude-plugin/marketplace.json "$P49/.claude-plugin/marketplace.json"; cp CHANGELOG.md "$P49/CHANGELOG.md"
+for p in codex-pr-review codex-deep-plan codex-debate; do
+  mkdir -p "$P49/plugins/$p/.claude-plugin"; cp "plugins/$p/.claude-plugin/plugin.json" "$P49/plugins/$p/.claude-plugin/"
+done
+policy49() { (cd "$P49" && release_policy >/dev/null 2>&1; echo $?); }
+[ "$(policy49)" = 0 ] && printf '  ok    %-42s\n' "F-03r49: the released relation holds" \
+  || { printf '  FAIL  F-03r49: the check rejects the repository as it stands\n'; FAIL=1; }
+python3 - "$P49" <<'PY'
+import sys
+root = sys.argv[1]
+body = open(root + "/CHANGELOG.md", encoding="utf-8").read()
+head, rest = body.split("## [", 1)
+entry = ("## [a breaking release that forgot to bump] - 2026-09-13\n\n**BREAKING**: something else changed.\n\n"
+         "`codex-pr-review` 7.0.0 · `codex-deep-plan` 4.0.0 · `codex-debate` 3.0.0\n\n## [")
+with open(root + "/CHANGELOG.md", "w", encoding="utf-8") as stream:
+    stream.write(head + entry + rest)
+PY
+[ "$(policy49)" != 0 ] && printf '  ok    %-42s\n' "F-03r49: a labelled release must increase" \
+  || { printf '  FAIL  F-03r49: a BREAKING entry repeating the released versions passed\n'; FAIL=1; }
+python3 - "$P49" <<'PY'
+import json, re, sys
+root = sys.argv[1]
+body = open(root + "/CHANGELOG.md", encoding="utf-8").read()
+head, rest = body.split("## [", 1)
+rest = "## [" + rest.split("## [", 1)[1]          # drop the entry written above
+entry = ("## [an ordinary release] - 2026-09-14\n\n`codex-pr-review` 7.1.0 · `codex-deep-plan` 4.1.0 · "
+         "`codex-debate` 3.1.0 — nothing here is BREAKING for `--attach`.\n\n")
+with open(root + "/CHANGELOG.md", "w", encoding="utf-8") as stream:
+    stream.write(head + entry + rest)
+want = {"codex-pr-review": "7.1.0", "codex-deep-plan": "4.1.0", "codex-debate": "3.1.0"}
+for name, version in want.items():
+    path = root + "/plugins/%s/.claude-plugin/plugin.json" % name
+    with open(path, encoding="utf-8") as stream:
+        text = stream.read()
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(re.sub(r'"version": "[0-9.]+"', '"version": "%s"' % version, text, count=1))
+with open(root + "/.claude-plugin/marketplace.json", encoding="utf-8") as stream:
+    market = json.load(stream)
+for record in market["plugins"]:
+    record["version"] = want[record["name"]]
+with open(root + "/.claude-plugin/marketplace.json", "w", encoding="utf-8") as stream:
+    json.dump(market, stream, indent=2)
+PY
+[ "$(policy49)" = 0 ] && printf '  ok    %-42s\n' "F-04r49: the word in prose is not a label" \
+  || { printf '  FAIL  F-04r49: an ordinary release was forced to a major bump\n'; FAIL=1; }
+python3 - "$P49" <<'PY'
+import re, sys
+path = sys.argv[1] + "/plugins/codex-debate/.claude-plugin/plugin.json"
+with open(path, encoding="utf-8") as stream:
+    text = stream.read()
+with open(path, "w", encoding="utf-8") as stream:
+    stream.write(re.sub(r'"version": "[0-9.]+"', '"version": "3.0.9"', text, count=1))
+PY
+[ "$(policy49)" != 0 ] && printf '  ok    %-42s\n' "F-03r49: manifest drift is caught" \
+  || { printf '  FAIL  F-03r49: a manifest disagreeing with the changelog passed\n'; FAIL=1; }
+rm -rf "$P49"
+
+# F-06r49 (cycle 12): the relaunch refusal's attach line is never blank. The job was read only in the
+# codex arm, so on the gateway backend the regeneration and its no-bounds sentence were both skipped
+# and the record's own command — deliberately empty for a bounds-less record — was echoed.
+X49="$TMP/relaunch-blank"; mkdir -p "$X49"; printf 'p\n' > "$X49/p.md"
+printf 'backend=ccr\nalias=x\njob=ccr-9\nsession=s\nattach_command=\nattach_guidance=Watch bounds are unrecorded; no runnable attach command is available.\ncancel_command=CANCEL-HERE\n' > "$X49/x.detached"
+out=$(bash "$R" "$X49/x" --via ccr:no-such-alias-xyz --prompt-file "$X49/p.md" 2>&1 || true)
+line=$(printf '%s\n' "$out" | sed -n '2p' | sed 's/^  //')
+[ -n "$line" ] && printf '%s' "$line" | grep -q -- '--expected-job ccr-9' \
+  && printf '  ok    %-42s\n' "F-06r49: the gateway refusal names a remedy" \
+  || { printf '  FAIL  F-06r49: attach line was [%s]\n' "$line"; FAIL=1; }
+rm -rf "$X49"
+
+# F-07r49 (cycle 12): a receipt that parses but carries an incomplete identity is the LOST-RECEIPT
+# state, not another attempt's. The runner's predicate accepted any non-empty job_id while the
+# binding requires all three fields, so the one recoverable state was reported as the operator's
+# mistake and named nothing to run.
+Y49="$TMP/partial-receipt"; U49=$(id -u)
+for case in partial nonobject empty complete; do
+  d="$Y49/$case"; mkdir -p "$d"
+  printf '{"schema":2,"submission_id":"s9","uid":%s}' "$U49" > "$d/p.ccr-attempt.json"
+  case "$case" in
+    partial)   printf '{"job_id":"incomplete"}' > "$d/p.ccr-receipt.json";;
+    nonobject) printf 'null' > "$d/p.ccr-receipt.json";;
+    empty)     : > "$d/p.ccr-receipt.json";;
+    complete)  printf '{"submission_id":"s9","job_id":"ccr-00000000-0000-4000-8000-000000000000","session_id":"00000000-0000-4000-8000-000000000000"}' > "$d/p.ccr-receipt.json";;
+  esac
+  out=$(bash "$R" "$d/p" --attach --expected-job ccr-the-real-one 2>&1 || true)
+  case "$case" in
+    complete) want='belongs to a different attempt';;
+    *)        want='admission receipt is missing or unreadable';;
+  esac
+  printf '%s' "$out" | grep -q "$want" \
+    && printf '  ok    %-42s\n' "F-07r49: $case receipt is diagnosed as $(printf '%s' "$want" | cut -c1-9)…" \
+    || { printf '  FAIL  F-07r49: %s receipt did not report "%s"\n' "$case" "$want"; FAIL=1; }
+done
+rm -rf "$Y49"
+
+# F-08r49 (cycle 12): the identity-mismatch refusal writes nothing either — it was below
+# publish_lock, which creates <prefix>.claim.lock and never unlinks it, so the one refusal that says
+# "nothing was observed or cancelled" left a file behind on a prefix it had just refused.
+Z49="$TMP/mismatch-lock"; mkdir -p "$Z49"
+printf 'backend=codex\njob=task-new-b\nmode=--fresh\nattach_command=/r/codex-run.sh /p --attach --expected-job task-new-b --stall-min 6 --max-min 25 --poll-sec 15\n' > "$Z49/p.detached"
+bash "$R" "$Z49/p" --attach --expected-job task-old-a --stall-min 1 --max-min 2 --poll-sec 5 >/dev/null 2>&1
+[ "$(ls -A "$Z49" | tr '\n' ' ')" = "p.detached " ] \
+  && printf '  ok    %-42s\n' "F-08r49: the mismatch refusal writes nothing" \
+  || { printf '  FAIL  F-08r49: left %s\n' "$(ls -A "$Z49" | tr '\n' ' ')"; FAIL=1; }
+rm -rf "$Z49"
+
+# F-09r49 (cycle 12): an empty attach command travels with the reason it is empty. Both publication
+# blocks copied the command and dropped attach_guidance, so a republished record stopped explaining
+# its own empty field — asserted at the source, because reaching either block needs a live job.
+G49=1
+for g49 in plugins/*/scripts/codex-run.sh; do
+  [ "$(grep -c '^attach_guidance=\$D_GUIDE$' "$g49")" = 2 ] || G49=0
+  [ "$(grep -c 'D_GUIDE=""; \[ -n "\$ATTACH_CMD" \] || D_GUIDE=' "$g49")" = 2 ] || G49=0
+done
+[ "$G49" = 1 ] \
+  && printf '  ok    %-42s\n' "F-09r49: a republished record keeps its reason" \
+  || { printf '  FAIL  F-09r49: a write_detached block drops attach_guidance\n'; FAIL=1; }
+
+# F-01r44 (cycle 7): the pre-submission proof must reach the RUNNER, not only the release gate.
+# Teaching it to the gate alone left the prefix wedged while reporting RELEASED: release does not
+# remove .progress, and refuse_if_in_flight exits 4 on it before rotate_previous_attempt would
+# archive the orphan that causes the refusal. The regression that matters is therefore the whole
+# sequence — interrupted admission, release, replacement claim, launch — not the release alone,
+# which is what the r43 fixture asserted before deleting .progress and hiding this.
+W4="$TMP/prelaunch-relaunch"
+w4_state() {  # <dir> <marker-protocol|-> [attempt|receipt|stage=<s>]
+  rm -rf "$1"; mkdir -p "$1"; : > "$1/x.progress"
+  case "${3:-}" in stage=*) printf 'protocol=1\n%s\nbackend=ccr\n' "${3#stage=}" > "$1/x.ccr-prelaunch";;
+    *) [ "$2" = - ] || printf 'protocol=%s\nstage=pre-admission\nbackend=ccr\n' "$2" > "$1/x.ccr-prelaunch";; esac
+  case "${3:-}" in attempt) printf '{}' > "$1/x.ccr-attempt.json";; receipt) printf '{}' > "$1/x.ccr-receipt.json";; esac
+}
+w4_launch() { bash "$R" "$1/x" --via ccr:no-such-alias-xyz --prompt-file "$PROMPT" 2>&1; }
+w4_state "$W4/a" 1
+out=$(w4_launch "$W4/a")
+printf '%s' "$out" | grep -q 'names an attempt that has not ended' \
+  && { printf '  FAIL  F-01r44: proven pre-submission still refused the relaunch\n'; FAIL=1; } \
+  || printf '  ok    %-42s\n' "F-01r44: proven pre-submission relaunches"
+[ -e "$W4/a/x.attempt1.progress" ] && [ -e "$W4/a/x.attempt1.ccr-prelaunch" ] \
+  && printf '  ok    %-42s\n' "F-01r44: the abandoned attempt is preserved" \
+  || { printf '  FAIL  F-01r44: the orphan was not archived as attempt1.*\n'; FAIL=1; }
+w4_refuses() {  # <marker-protocol|-> <label>
+  w4_state "$W4/r" "$1"
+  printf '%s' "$(w4_launch "$W4/r")" | grep -q 'names an attempt that has not ended' \
+    && printf '  ok    %-42s\n' "F-01r44: $2 still refuses" \
+    || { printf '  FAIL  F-01r44: %s was allowed to relaunch\n' "$2"; FAIL=1; }
+}
+w4_refuses - "no marker"
+w4_refuses 99 "an unknown protocol"
+w4_state "$W4/s" 1 "stage=stage=submitted"
+printf '%s' "$(w4_launch "$W4/s")" | grep -q 'names an attempt that has not ended' \
+  && printf '  ok    %-42s\n' "F-01r44: an unknown marker stage still refuses" \
+  || { printf '  FAIL  F-01r44: an unknown marker stage was accepted as a proof\n'; FAIL=1; }
+for evidence in attempt receipt; do
+  w4_state "$W4/$evidence" 1 "$evidence"
+  printf '%s' "$(w4_launch "$W4/$evidence")" | grep -qE 'durable CCR attempt is still open|names an attempt that has not ended' \
+    && printf '  ok    %-42s\n' "F-01r44: marker plus an $evidence record still refuses" \
+    || { printf '  FAIL  F-01r44: marker plus an %s record was allowed to relaunch\n' "$evidence"; FAIL=1; }
+done
+# A marker written with no .progress (interrupted between those two lines) must be ARCHIVED by the
+# next launch, never inherited: once the runner honours a marker, an inherited one could vouch for
+# an attempt it knows nothing about and authorize a launch beside work that may be live.
+rm -rf "$W4/lone"; mkdir -p "$W4/lone"
+printf 'protocol=1\nstage=pre-admission\nbackend=ccr\n' > "$W4/lone/x.ccr-prelaunch"
+w4_launch "$W4/lone" >/dev/null 2>&1
+[ -e "$W4/lone/x.attempt1.ccr-prelaunch" ] && [ ! -e "$W4/lone/x.ccr-prelaunch" ] \
+  && printf '  ok    %-42s\n' "F-01r44: a lone marker is archived, not inherited" \
+  || { printf '  FAIL  F-01r44: a lone marker survived into the next attempt\n'; FAIL=1; }
+rm -rf "$W4"
+
+# F-02r45 (cycle 8): the regression that matters is ONE PREFIX carried through the whole sequence —
+# interrupted admission, release, replacement claim, launch — and the fixtures above are not that.
+# They are two disjoint halves: the release assertions rebuild $PR/02-p2 from scratch before each
+# case, and the launch assertions build a claimless directory elsewhere and reach rotation through a
+# launch error. Nothing exercises the handoff, so a regression between a successful release and a
+# successful replacement admission would pass. Everything below runs on one prefix, with the real
+# gate issuing the claims and the fake gateway serving the launch.
+E2E="$TMP/recovery-e2e"; mkdir -p "$E2E"; printf 'scope\n' > "$E2E/00-scope.md"; mkbrief "$E2E"
+printf 'p1\tccr\tx\n' > "$E2E/00-participants.tsv"
+cp "$CCRD/.ccr-smoke.x" "$E2E/"                     # a successful smoke for alias x, beside the prefix
+E2EP="$E2E/02-p1"
+# One participant on alias x: pre-codex mints the launch claim and prints its token.
+E2E_OUT=$(pgw pre-codex "$E2E" "$G2" 2>&1) || { printf '  FAIL  F-02r45: pre-codex refused: %s\n' "$(printf '%s' "$E2E_OUT" | tail -1)"; FAIL=1; }
+E2E_T1=$(printf '%s' "$E2E_OUT" | sed -n 's/.*claim\.p1=\([0-9a-f]*\).*/\1/p')
+# Interrupted admission under THAT claim: the runner had written the marker and .progress and was
+# killed before ccr-job.py could persist an attempt record. Nothing was ever submitted.
+mkdir -p "$E2EP.claim/runner"; printf '2147483646\n' > "$E2EP.claim/runner/pid"
+printf 'protocol=1\nstage=pre-admission\nbackend=ccr\n' > "$E2EP.ccr-prelaunch"
+printf '0s interrupted before admission\n' > "$E2EP.progress"
+E2E_PROG=$(shasum "$E2EP.progress" | cut -d' ' -f1); E2E_MARK=$(shasum "$E2EP.ccr-prelaunch" | cut -d' ' -f1)
+[ -n "$E2E_T1" ] && [ ! -e "$E2EP.ccr-attempt.json" ] && [ ! -e "$E2EP.ccr-receipt.json" ] \
+  && printf '  ok    %-42s\n' "F-02r45: interrupted admission, one taken claim" \
+  || { printf '  FAIL  F-02r45: the interrupted state is not what it claims to be\n'; FAIL=1; }
+# The gate is called DIRECTLY from here on. pgw runs top_up_claims, which would manufacture the very
+# claim this fixture exists to prove was issued, and hide an accounting defect completely.
+E2E_REL=$(bash "$PG" release "$E2E" 02-p1 2>&1); rc=$?
+[ "$rc" = 0 ] && printf '%s' "$E2E_REL" | grep -q 'RELEASED 02-p1' \
+  && printf '  ok    %-42s\n' "F-02r45: proven pre-submission releases" \
+  || { printf '  FAIL  F-02r45: release refused (rc=%s) %s\n' "$rc" "$(printf '%s' "$E2E_REL" | tail -1)"; FAIL=1; }
+# The permitting branch must say which evidence freed the claim, on the claim it spent.
+printf '%s' "$E2E_REL" | grep -q 'evidence=pre-submission-proof' \
+  && grep -q '^evidence=pre-submission-proof' "$E2E"/02-p1.claim.spent*/owner \
+  && printf '  ok    %-42s\n' "F-02r45: the release records its evidence" \
+  || { printf '  FAIL  F-02r45: a proof-backed release left no evidence\n'; FAIL=1; }
+# release must NOT clear the interrupted state: that is precisely what hid the runner-side half.
+[ "$(shasum "$E2EP.progress" | cut -d' ' -f1)" = "$E2E_PROG" ] \
+  && [ "$(shasum "$E2EP.ccr-prelaunch" | cut -d' ' -f1)" = "$E2E_MARK" ] \
+  && printf '  ok    %-42s\n' "F-02r45: release preserves the abandoned state" \
+  || { printf '  FAIL  F-02r45: release altered .progress or the marker\n'; FAIL=1; }
+# A replacement claim, from the real gate, with a token distinct from the spent one.
+E2E_OUT2=$(bash "$PG" pre-codex "$E2E" "$G2" 2>&1) || { printf '  FAIL  F-02r45: replacement pre-codex refused: %s\n' "$(printf '%s' "$E2E_OUT2" | tail -1)"; FAIL=1; }
+E2E_T2=$(printf '%s' "$E2E_OUT2" | sed -n 's/.*claim\.p1=\([0-9a-f]*\).*/\1/p')
+[ -n "$E2E_T2" ] && [ "$E2E_T2" != "$E2E_T1" ] \
+  && printf '  ok    %-42s\n' "F-02r45: a distinct replacement claim is issued" \
+  || { printf '  FAIL  F-02r45: replacement token %s vs original %s\n' "${E2E_T2:-none}" "${E2E_T1:-none}"; FAIL=1; }
+# ...and the same prefix launches under it, through the fake gateway, to a real COMPLETED outcome.
+E2E_L=$(PATH="$CCRBIN:$PATH" FAKE_CCR_MODE=ok bash "$R" "$E2EP" --via ccr:x --claim "$E2E_T2" --prompt-file "$PROMPT" --poll-sec 1 2>&1); rc=$?
+[ "$rc" = 0 ] && [ "$(cat "$E2EP.exit" 2>/dev/null)" = 0 ] && grep -q '^outcome=COMPLETED' "$E2EP.meta" \
+  && printf '  ok    %-42s\n' "F-02r45: the replacement claim launches and completes" \
+  || { printf '  FAIL  F-02r45: relaunch rc=%s %s\n' "$rc" "$(printf '%s' "$E2E_L" | tail -1)"; FAIL=1; }
+# The abandoned attempt is archived byte-for-byte, not truncated and not inherited.
+[ "$(shasum "$E2EP.attempt1.progress" 2>/dev/null | cut -d' ' -f1)" = "$E2E_PROG" ] \
+  && [ "$(shasum "$E2EP.attempt1.ccr-prelaunch" 2>/dev/null | cut -d' ' -f1)" = "$E2E_MARK" ] \
+  && printf '  ok    %-42s\n' "F-02r45: the abandoned attempt is archived intact" \
+  || { printf '  FAIL  F-02r45: the orphan was not preserved as attempt1.*\n'; FAIL=1; }
+# Claim accounting across the whole sequence: exactly two taken claims, the spent one untouched.
+E2E_TAKEN=0; for d in "$E2E"/02-p1.claim "$E2E"/02-p1.claim.spent*; do [ -d "$d/runner" ] && E2E_TAKEN=$((E2E_TAKEN+1)); done
+[ "$E2E_TAKEN" = 2 ] && grep -q "^token=$E2E_T2" "$E2E/02-p1.claim/owner" \
+  && printf '  ok    %-42s\n' "F-02r45: two taken claims, the launch used the new one" \
+  || { printf '  FAIL  F-02r45: %s taken claims across the sequence\n' "$E2E_TAKEN"; FAIL=1; }
+# ...and the launch that landed is the replacement's, with a marker for the NEW attempt only.
+grep -q '^[0-9]*s launched backend=ccr ' "$E2EP.progress" \
+  && printf '  ok    %-42s\n' "F-02r45: the new attempt reached admission" \
+  || { printf '  FAIL  F-02r45: no launch line on the replacement attempt\n'; FAIL=1; }
+rm -rf "$E2E"
+
 # A finished exit-5 remains fail-closed until the operator asks the separate recovery command
 # to prove the recorded CCR process group has gone. The original sidecars are never rewritten.
 CT="$TMP/cancel-resolved"; mkdir -p "$CT"; printf 'scope\n' > "$CT/00-scope.md"; mkbrief "$CT"

@@ -72,13 +72,24 @@ line) — one smoke per alias per run, checked before every launch.
 After exit 6 the watch is resumed, never relaunched:
 
 ```bash
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/<prefix>" --attach [--stall-min 6] [--max-min 20]
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/<prefix>" --attach --expected-job <job> [--stall-min 6] [--max-min 20]
 ```
+
+**Run the `attach_command` the runner recorded; do not compose this by hand.** `--expected-job` is
+mandatory on every attach, cancellation included, and the runner refuses an attach that names no
+job. The reason is that a prefix outlives its attempts — the gate rotates a spent claim, the runner
+rotates the previous attempt's sidecars — so only the caller can say which job it meant, and a
+deliberate attach and a stale saved command from an earlier attempt are otherwise indistinguishable.
+An attach whose job does not match the one the record names is refused too, with the command for the
+job that is actually here; both refusals observe and cancel nothing. Commands saved before this
+requirement existed carry no job and are refused: re-run them bound, using the command the refusal
+prints.
 
 `--attach` is an operation, not a launch mode: it takes no prompt, no `--via` and no claim, spends
 no launch budget, rotates no sidecar, and leaves `mode=` in `.meta` as the original launch mode, so
 every gate anchors its thread exactly as before. It records `attached=<n>` and publishes the
-terminal `.exit` under the claim lock. `--attach --cancel` ends the job instead, by requesting cancellation from its CCR owner using the durable job ID.
+terminal `.exit` under the claim lock. `--attach --expected-job <job> --cancel` ends the job instead,
+by requesting cancellation from its CCR owner using the durable job ID.
 
 CCR continuation requires the participant’s session ID and expected parent job. Resolve
 the authoritative head before preparing the exchange prompt. The runner persists the
@@ -95,7 +106,29 @@ The private `.ccr-attempt.json`, `.ccr-prompt`, and `.ccr-receipt.json` bind the
 attempt and control context. `.ccr-result.json` freezes the accepted log length and digest.
 Later log appends cannot replace that result. `--attach` can recover a watcher that died
 immediately after admission; if the receipt itself is missing or malformed, retain the
-claim and investigate. Never conclude that the workload was not started.
+claim and investigate. Never conclude from a missing receipt that the workload was not started.
+
+There is exactly one state from which that conclusion IS sound, and it is read from an ordering
+rather than inferred from absence. `codex-run.sh` writes `.ccr-prelaunch`, carrying its
+`CCR_PROTOCOL`, before it can submit anything, and `ccr-job.py prepare()` persists
+`.ccr-attempt.json` before it spawns the submitting process. A prefix with the marker at the
+protocol the gate understands, and no `.ccr-attempt.json` and no `.ccr-receipt.json`, was
+interrupted before admission: no workload exists, so `phase-gate.sh release` frees the claim and
+the runner accepts the relaunch that freed claim exists to authorize — the runner applies the same
+predicate, in the one branch where the attempt is otherwise unidentifiable, and archives the orphan
+as `.attemptN.*`. Both halves are required: a release the next launch still refuses leaves the
+prefix wedged while reporting success. A prefix WITHOUT the marker is not covered by this and never
+will be — a legacy attempt and externally deleted evidence look exactly the same — so it stays
+refused, as does a marker whose protocol or stage this version does not recognise.
+
+The marker is written one line before `.progress`, so an interruption between them leaves it alone
+on the prefix; it is therefore itself a rotation trigger, and the next launch archives it. An
+inherited marker must never be able to vouch for an attempt it knows nothing about.
+
+A saved attach command names the job it was written for, on both backends: `--expected-job` is
+embedded when the record is created and compared under the collector lock before anything is
+observed or cancelled. A prefix may legitimately be reused by a later attempt, so running a stale
+saved command is refused (exit 4) rather than silently retargeted.
 
 `.meta` retains route, model, job, session, exit, and cleanup evidence. A generated model
 mismatch is `UNAVAILABLE` (exit 4), without an alias or Claude fallback. Release and
@@ -245,7 +278,7 @@ the join. The runner exits with:
 | 1 | FAILED (plugin reported failure, or worker process died) | retry once: re-run the launch gate (it rotates the spent claim and prints a new `claim=` token) and launch with that token; if it fails again record FAILED |
 | 2 | STALLED (no job-log activity for `--stall-min`, cancel confirmed) | retry once the same way; then FAILED |
 | 3 | TIMEOUT — **retired.** No path assigns it any more: `--max-min` now detaches (6). Kept so sidecars written by an older runner stay readable | if you see it, an older runner wrote it; record FAILED with the partial `.stdout` if any |
-| 6 | DETACHED (`--max-min` reached with the job still running) | The runner did not cancel it and deliberately wrote no `.exit`, so the phase gate still counts the attempt as in flight and will not authorise a second launch. **Attach again, never relaunch:** run the `attach_command` from `<prefix>.detached`; it resumes the watch under the same claim, spends no launch budget, and publishes the terminal outcome. `phase-gate.sh release` refuses it while the job is not provably finished (a matching identity, a group that is not provably empty, or a companion that cannot be consulted); once the job is provably over it releases normally — the escape when the attach cannot reach its backend at all. Do NOT plan to release after a successful attach: the attach writes `.exit`, and release refuses a finished attempt because the next launch gate rotates that claim itself |
+| 6 | DETACHED (`--max-min` reached with the job still running) | The runner did not cancel it and deliberately wrote no `.exit`, so the phase gate still counts the attempt as in flight and will not authorise a second launch. **Attach again, never relaunch:** run the `attach_command` from `<prefix>.detached`; it resumes the watch under the same claim, spends no launch budget, and publishes the terminal outcome. `phase-gate.sh release` refuses it while the job is not provably finished, and what counts as proof is the job's owner, never a process record: for CCR, `ccr-job.py stopped` — a terminal status with an integer exit code, known cleanup coverage and no survivors; for the companion, the plugin reporting the job completed/failed/cancelled. Once the job is provably over it releases normally — the escape when the attach cannot reach its backend at all. One state is released without asking either owner, because no job exists to ask about: a CCR prefix carrying `<prefix>.ccr-prelaunch` at the current protocol with no `<prefix>.ccr-attempt.json` and no `<prefix>.ccr-receipt.json` was interrupted before it could submit anything, and the write ordering proves it. Without that marker the same-looking state is a legacy attempt or damaged evidence and stays refused. Do NOT plan to release after a successful attach: the attach writes `.exit`, and release refuses a finished attempt because the next launch gate rotates that claim itself |
 | 4 | LAUNCH-ERROR, or any invalid invocation (missing option value, unknown argument, unreadable prompt file, `--write`) | record UNAVAILABLE with `.stderr`; a usage message means fix the call, not retry |
 | 5 | STALLED or TIMEOUT **and the cancel could not be confirmed** — a Codex worker may still be running | DO NOT retry: a second job would run alongside the first. Report the job id, quote `.progress`, and treat the phase as failed. |
 
@@ -399,8 +432,22 @@ A changed head is refused by CCR. Never select an older successful job to bypass
 newer unresolved attempt. Keep separate anchors for separate participants.
 
 The private attempt persists its submission token and complete invocation before admission.
-Attach recovers a lost receipt through read-only submission status; it never submits another
-workload. An unavailable lookup remains unresolved with no terminal `.exit`.
+A lost receipt is repaired by the read-only submission-status lookup, `ccr-job.py recover
+<prefix>`, which looks the submission up, rewrites the delivered receipt under the same
+identity-conflict checks, and never submits anything. It repairs either lost-delivery state: the
+attempt record carrying no receipt, and the delivered receipt missing or unreadable while the record
+still carries its own copy. `complete-admission` is a DIFFERENT operation and not the remedy for
+this state: when the gateway still reports the admission prepared it replays the saved launch
+request under its original token and may start execution — it never requests a replacement job, but
+it is a deliberate decision to finish the original admission, not an observation.
+
+That repair is a step BEFORE the attach, not something the attach performs on the caller's behalf:
+every attach must name its job (`--attach --expected-job <job>`), and the binding check requires a
+readable receipt, so an unbound attach — or one naming a job discovered elsewhere while the receipt
+is still missing — is refused with nothing observed, cancelled or written. The refusal for an
+unreadable receipt says so and names the lookup, rather than reporting the attach as naming another
+attempt's job. An unavailable lookup remains unresolved
+with no terminal `.exit`.
 A proven aborted `not_started` admission may close as failure without inventing a child exit.
 Successful output is restricted to CCR's committed byte boundary and verified digest.
 

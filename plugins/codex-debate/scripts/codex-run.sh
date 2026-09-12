@@ -5,7 +5,7 @@
 #   codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file>
 #                [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>]
 #                [--max-turns N] [--expected-parent-job <job>]       (CCR options)
-#   codex-run.sh <out-prefix> --attach [--stall-min N] [--max-min M] [--poll-sec S]
+#   codex-run.sh <out-prefix> --attach --expected-job <job> [--stall-min N] [--max-min M] [--poll-sec S]
 #   codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]
 #
 #   --attach: resume the WATCH on a job this process did not launch, after a previous
@@ -13,6 +13,10 @@
 #   submitted, no claim is taken, no launch budget is spent, no sidecar is rotated, and `mode=`
 #   in .meta keeps the original launch mode so the review gates' thread anchoring is unchanged.
 #   It requires <out-prefix>.detached with no <out-prefix>.exit; anything else is exit 4.
+#   --expected-job is MANDATORY on every attach, cancellation included: a prefix is reusable, so
+#   only the caller can say which job it meant, and a deliberate attach and a stale saved command
+#   are otherwise indistinguishable. Run the attach_command the runner printed, never a hand-typed
+#   `--attach`; a refusal prints the bound command for the job this prefix names now.
 #
 #   --via codex (default): the Codex CLI plugin's companion (task/status/result/cancel).
 #   --via ccr:<alias>: a headless Claude Code launched through the claude-code-router gateway
@@ -49,6 +53,11 @@
 #                           backend, the job or process identity and its start time, the original
 #                           launch mode, the prompt digest, and the verbatim attach and cancel
 #                           commands. Removed when an attach publishes the terminal outcome.
+#   <out-prefix>.ccr-prelaunch  (ccr only) written before anything can be submitted, carrying the
+#                           launch protocol. Present with NO <out-prefix>.ccr-attempt.json, it is
+#                           proof that this launch was interrupted before it submitted any
+#                           workload — which is what lets `phase-gate.sh release` free the claim
+#                           instead of refusing forever. Its absence proves nothing either way.
 #   Exit 4 with NO sidecar written: another runner already took <out-prefix>.claim/, or (--claim)
 #   no claim exists / the arguments are invalid.
 #   CCR continuation requires an explicit session and authoritative parent job.
@@ -61,6 +70,12 @@ set -u
 umask 077
 # Transactional submission and guarded same-session continuation require 0.6.0.
 CCR_MIN_VERSION="0.6.0"
+# The launch protocol this runner writes. It appears in <out-prefix>.ccr-prelaunch and is what
+# lets a later recovery tell "this runner started a launch and was interrupted before it could
+# submit anything" from "some older runner left this, and nothing here can be trusted". Bump it
+# only when the pre-admission ordering itself changes; phase-gate.sh carries the same literal and
+# scripts/validate.sh check 4b1 fails the build if the two ever disagree.
+CCR_PROTOCOL=1
 CCR_HELPER="$(exec 9>&-; cd "$(exec 9>&-; dirname "$0")" && pwd)/ccr-job.py"
 CCR_RUNNER="${CCR_HELPER%/*}/${0##*/}"
 # These are assigned inside ccr_preflight, past its early-return failures. The attach path is
@@ -352,8 +367,8 @@ raise SystemExit(rc)'
   esac
 fi
 USAGE='usage: codex-run.sh <out-prefix> [--via codex|ccr:<alias>] [--fresh|--resume-last|--resume-session <id>] --prompt-file <file> [--stall-min N] [--max-min M] [--poll-sec S] [--claim <token>] [--max-turns N] [--expected-parent-job <job>]
-       codex-run.sh <out-prefix> --attach [--stall-min N] [--max-min M] [--poll-sec S]
-       codex-run.sh <out-prefix> --attach --cancel
+       codex-run.sh <out-prefix> --attach --expected-job <job> [--stall-min N] [--max-min M] [--poll-sec S]
+       codex-run.sh <out-prefix> --attach --expected-job <job> --cancel
        codex-run.sh --probe [--via ccr:<alias> [--record-dir <dir>]]'
 # Every invocation error exits 4 (LAUNCH-ERROR). Never exit 1 for a bad command line:
 # 1 means "the second model failed, retry once" in the documented contract, and a typo must not look like that.
@@ -366,7 +381,11 @@ shift
 # stat, portable: GNU (-c) on Linux, BSD (-f) on macOS; a wrong-flavour call must never "succeed" with garbage.
 if stat --version >/dev/null 2>&1; then fmtime() { stat -c %Y "$1" 2>/dev/null; }; fsig() { stat -c '%s:%Y' "$1" 2>/dev/null; }
 else fmtime() { stat -f %m "$1" 2>/dev/null; }; fsig() { stat -f '%z:%m' "$1" 2>/dev/null; }; fi
-CLAIM_MODE=0; CLAIM_TOKEN=""; for _a in "$@"; do [ "$_a" = "--claim" ] && CLAIM_MODE=1; done  # exact argument, never a substring of a value (round-33 CX-03)
+CLAIM_MODE=0; CLAIM_TOKEN=""; ATTACH_MODE=0
+for _a in "$@"; do  # exact arguments, never a substring of a value (round-33 CX-03)
+  [ "$_a" = "--claim" ] && CLAIM_MODE=1
+  [ "$_a" = "--attach" ] && ATTACH_MODE=1
+done
 # An argument error writes <prefix>.exit only for the claim-less sibling plugins: with --claim, or when a launch claim exists for the prefix (a gate-issued prefix), nothing is written (round-42 CL-04).
 # .exit is terminal in BOTH directions: an attempt that has published one must not have it
 # rewritten (a refused --attach would otherwise overwrite a COMPLETED 0 with a 4 and destroy the
@@ -380,7 +399,28 @@ CLAIM_MODE=0; CLAIM_TOKEN=""; for _a in "$@"; do [ "$_a" = "--claim" ] && CLAIM_
 # present in the window between a launch starting and its first outcome — the window an --attach
 # that arrives too early lands in (cycle 2: CL-05). An argument error is a fact about THIS
 # invocation, so when any of them is present it is reported and nothing is published.
-die4() { echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2; [ "$CLAIM_MODE" = 1 ] || [ -d "${PREFIX:-/nonexistent}.claim" ] || [ -e "${PREFIX:-/nonexistent}.exit" ] || [ -e "${PREFIX:-/nonexistent}.detached" ] || [ -e "${PREFIX:-/nonexistent}.progress" ] || [ -e "${PREFIX:-/nonexistent}.ccr-attempt.json" ] || [ -e "${PREFIX:-/nonexistent}.ccr-receipt.json" ] || [ -e "${PREFIX:-/nonexistent}.claim.lock" ] || echo 4 > "$PREFIX.exit" 2>/dev/null || true; exit 4; }
+# --attach NEVER publishes, marker or no marker (cycle 11: F-03). An attach does not own the
+# attempt a .exit would describe: it is a second watcher of a job some other invocation launched,
+# so "this attach was malformed" is never the same statement as "that attempt ended 4". The bare
+# prefix is the case that exposed it — the binding refusal below runs before any sidecar exists,
+# so every marker disjunct is false and the refusal that promises "nothing was written" wrote the
+# one file every gate reads as a finished attempt.
+# .ccr-prelaunch and its staging name .ccr-prelaunch.part are markers here for the same reason
+# rotation already treats them as attempt markers: the prelaunch record is written before anything
+# can be submitted, so its presence means a launch on this prefix has begun and may be in flight.
+publishing_marker() {  # a sidecar that says "an attempt owns this prefix" exists
+  local ext
+  for ext in claim exit detached progress ccr-prelaunch ccr-prelaunch.part ccr-attempt.json ccr-receipt.json claim.lock; do
+    [ ! -e "${PREFIX:-/nonexistent}.$ext" ] || return 0
+  done
+  return 1
+}
+die4() {
+  echo "codex-run.sh: $1" >&2; echo "$USAGE" >&2
+  [ "$CLAIM_MODE" = 1 ] || [ "$ATTACH_MODE" = 1 ] || publishing_marker \
+    || echo 4 > "$PREFIX.exit" 2>/dev/null || true
+  exit 4
+}
 need() { [ $# -ge 2 ] || die4 "$1 requires a value"; case "$2" in -*) die4 "$1 requires a value (got option $2)";; esac; }
 MODE="--fresh"; MODE_SET=0; PROMPT_FILE=""; STALL_MIN=6; MAX_MIN=25; POLL=15; VIA=codex; MAX_TURNS=""; RESUME_SESSION=""; ATTACH=0; VIA_SET=0; CANCEL_ONLY=0; EXPECTED_JOB=""; EXPECTED_PARENT=""
 while [ $# -gt 0 ]; do
@@ -406,7 +446,10 @@ done
 # backend, the launch mode and every identifier come from the detached record the launch left.
 [ -z "$EXPECTED_PARENT" ] || { [ "$ATTACH" != 1 ] && [ "$MODE" != --fresh ]; } || die4 "--expected-parent-job requires a resume launch"
 [ -z "$EXPECTED_JOB" ] || [ "$ATTACH" = 1 ] || die4 "--expected-job requires --attach"
-[ -z "$EXPECTED_JOB" ] || [ -f "$PREFIX.ccr-attempt.json" ] || die4 "--expected-job requires a durable CCR attempt"
+# Either durable record names the job this attach was written for: the CCR attempt for a gateway
+# job, the detached record for a companion one. Requiring the CCR attempt alone made the guard
+# unavailable to exactly the backend that had no other job binding at all.
+[ -z "$EXPECTED_JOB" ] || [ -f "$PREFIX.ccr-attempt.json" ] || [ -f "$PREFIX.detached" ] || die4 "--expected-job requires a durable CCR attempt or a detached record naming the job"
 [ "$CANCEL_ONLY" != 1 ] || [ "$ATTACH" = 1 ] || die4 "--cancel is only valid with --attach"
 if [ "$ATTACH" = 1 ]; then
   [ "$MODE_SET" != 1 ] || die4 "--attach and $MODE are exclusive: an attach resumes the watch on the job the launch already started"
@@ -470,6 +513,139 @@ write_detached() {  # key=value lines on stdin
 }
 detached_field() { awk -F= -v k="$1" '$1 == k {sub(/^[^=]*=/, ""); print; exit}' "$PREFIX.detached" 2>/dev/null; }
 quote_command() { python3 -c 'import shlex,sys; print(shlex.join(sys.argv[1:]))' "$@"; }
+abs_path() { python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"; }
+# THE one generator of a companion attach command. Every emitted `--attach` — the saved command a
+# detach records, the fallback a failed attach prints, the remedy a refusal offers — comes from
+# here, so no path can print a command the admission block would reject (cycle 8: CX-01). It is
+# quoted and absolute because the messages that carry it say "run this": PREFIX is whatever the
+# caller passed (it is `"${1:-}"`, not normalized), and a raw interpolation splits on the first
+# space in an installation or artifact path the quoting tests explicitly support (cycle 8: CX-02).
+bound_attach_command() {  # <job> <stall-min> <max-min> <poll-sec> [extra args…]
+  local job="$1" s="$2" m="$3" p="$4"; shift 4
+  quote_command "$CCR_RUNNER" "$(exec 9>&-; abs_path "$PREFIX")" --attach --expected-job "$job" \
+    --stall-min "$s" --max-min "$m" --poll-sec "$p" "$@"
+}
+# What to print on the "attach:" line of a detach. A record whose watch bounds were never recorded
+# carries an EMPTY attach_command and says why in attach_guidance, because a command with no bound
+# options is not silent about bounds — it means this parser's defaults, and the stall bound cancels
+# (cycle 11: F-01). Print the guidance rather than an empty line, and never invent a fallback.
+# ONE refusal for "this attach is for a different job than the record names", reached from two
+# places: before the publication lock, as soon as the record names a job at all, and again over the
+# record this attach goes on to use. Two spellings of one message would drift; a single one cannot.
+refuse_if_other_job() {  # <job the record names>
+  [ "$EXPECTED_JOB" != "$1" ] || return 0
+  die4 "--attach: this attach names job $EXPECTED_JOB, but $PREFIX.detached now names job $1 — that attempt was collected and the prefix reused. Nothing was observed or cancelled. Read the earlier attempt's rotated sidecars (<prefix>.attemptN.*) instead of attaching, or attach to the job that is here.$(exec 9>&-; remedy_for "$1" $CANCEL_FLAG)"
+}
+attach_line() {  # <command-or-empty>
+  local guidance
+  [ -z "$1" ] || { printf '%s' "$1"; return 0; }
+  guidance=$(exec 9>&-; detached_field attach_guidance)
+  printf '%s' "${guidance:-no attach command is recorded for this attempt: attach with --expected-job and --stall-min/--max-min/--poll-sec you choose deliberately, knowing the stall bound cancels}"
+}
+# WHOSE BOUNDS the printed command carries is not cosmetic. On an attach `--stall-min` is not
+# advisory: reaching it sets OUTCOME=STALLED and issues a real cancel. A refusal that stamps its
+# remedy with the REFUSING invocation's bounds therefore hands the operator a command that can end a
+# healthy job the recorded command would have waited for (cycle 9: CL-01) — the refusal turns a
+# recovery into a cancellation. So a remedy about an existing attempt carries that attempt's own
+# bounds, read from the saved command the launch recorded, and only a command that describes THIS
+# attach carries this invocation's.
+# There are exactly TWO durable sources for an attempt's bounds and they are not the same as the
+# three the job id has. The detached record carries them inside the command it stored; the attempt
+# record carries them as numeric fields, written before the job can detach — which is precisely the
+# window an interrupted admission leaves behind, where the job id is readable and the detached
+# record does not exist yet (cycle 10: F-01/CX-01). The receipt is NOT a third source: reconciliation
+# keeps submission_id, job_id and session_id only.
+attempt_bounds() {  # -> "<stall> <max> <poll>" from the attempt record, or nothing with status 1
+  [ -e "$PREFIX.ccr-attempt.json" ] || return 1
+  python3 9>&- -c 'import json,sys
+d = json.load(open(sys.argv[1]))
+v = [d.get(k) for k in ("stall_min", "max_min", "poll_sec")]
+if not all(isinstance(x, int) and not isinstance(x, bool) and x > 0 for x in v):
+    raise SystemExit(1)
+print(*v)' "$PREFIX.ccr-attempt.json" 2>/dev/null
+}
+# Whether a delivered receipt exists at all — the difference between "this attach names the wrong
+# job" and "no job can be named yet", which the binding check cannot tell apart because it loads the
+# receipt before it compares anything (cycle 10: CL-03).
+# "Is the DELIVERED receipt usable?" — the same question the helper's delivered_receipt_readable
+# asks, and deliberately the same answer. This test used to accept any document with a non-empty
+# job_id, while the binding it guards requires a complete identity: a receipt that parsed but was
+# incomplete therefore failed the binding and then passed here, so the refusal fell through to
+# "belongs to a different attempt" for an operator whose command was correct, in a state the
+# recovery lookup repairs (cycle 12: F-07). A document that is not an object is not a receipt.
+receipt_readable() {
+  [ -s "$PREFIX.ccr-receipt.json" ] || return 1
+  python3 9>&- -c 'import json,sys
+d = json.load(open(sys.argv[1]))
+raise SystemExit(0 if isinstance(d, dict) and all(
+    isinstance(d.get(k), str) and d[k] for k in ("submission_id", "job_id", "session_id")) else 1)' "$PREFIX.ccr-receipt.json" 2>/dev/null
+}
+recorded_bounds() {  # -> "<stall> <max> <poll>" AS LAUNCHED, or nothing with status 1
+  local cmd stored b
+  cmd=$(exec 9>&-; detached_field attach_command)
+  # Each option's WHOLE value is validated, because a numeric prefix is not a number: a regex that
+  # anchors only the start reads `--stall-min 1e2` as 1 and hands back a one-minute cancellation
+  # threshold the record never expressed (cycle 11: CX-03). A malformed stored bound is no bound.
+  stored=$(exec 9>&-; printf '%s' "$cmd" | python3 9>&- -c 'import shlex,sys
+try:
+    argv = shlex.split(sys.stdin.read())
+except ValueError:
+    raise SystemExit(1)
+out = []
+for flag in ("--stall-min", "--max-min", "--poll-sec"):
+    if flag not in argv:
+        raise SystemExit(1)
+    index = argv.index(flag) + 1
+    value = argv[index] if index < len(argv) else ""
+    if not value.isdigit() or int(value) <= 0:
+        raise SystemExit(1)
+    out.append(value)
+print(" ".join(out))') && [ -n "$stored" ] && { printf '%s' "$stored"; return 0; }
+  # No fallback to THIS invocation's options. A partial or unreadable record means the bounds are
+  # unknown, and an unknown bound must be said, never substituted: the caller's own numbers are the
+  # one set of numbers that is certainly not the attempt's.
+  b=$(exec 9>&-; attempt_bounds) || return 1
+  [ -n "$b" ] || return 1
+  printf '%s' "$b"
+}
+recorded_attach_command() {  # <job> [extra args…] -> the remedy for an ATTEMPT, in its own bounds
+  local job="$1" b; shift
+  b=$(exec 9>&-; recorded_bounds) || return 1
+  bound_attach_command "$job" $b "$@"
+}
+# What a refusal appends to its message: a ready-to-run command when the attempt's own bounds are
+# recorded, and otherwise an explicit statement that they are not. A refusal must never manufacture
+# a bound — on an attach `--stall-min` cancels, so a printed command carrying a number nothing
+# recorded is a guess the operator would run, which is the defect this whole path exists to avoid.
+remedy_for() {  # <job> [extra args…] -> " Run: <cmd>" | " <no-bounds sentence>" | ""
+  local job="$1" cmd; shift
+  [ -n "$job" ] || return 0
+  cmd=$(exec 9>&-; recorded_attach_command "$job" "$@") && [ -n "$cmd" ] \
+    && { printf ' Run: %s' "$cmd"; return 0; }
+  printf ' The job on this prefix is %s, but the watch bounds it was launched with are not recorded here, so no ready-to-run command is offered: attach with --expected-job %s and --stall-min/--max-min/--poll-sec you choose deliberately, knowing the stall bound cancels.' "$job" "$job"
+}
+# The job this prefix's own durable records name, read WITHOUT running recovery: a refusal must be
+# able to print a usable remedy without first mutating the attempt it is refusing to address
+# (cycle 9: CX-02). The detached record is preferred because it is what an attach is admitted
+# against; the admission records answer for an attempt that has not detached yet.
+recorded_job_id() {
+  local j f src
+  j=$(exec 9>&-; detached_field job); [ -z "$j" ] || { printf '%s' "$j"; return 0; }
+  # The two sources are kept as separate path/field pairs. Packing them as "path:field" and
+  # splitting on the first colon truncated any prefix that contained one, so the record was never
+  # found and the refusal silently offered no remedy at all (cycle 11: CL-05) — on paths this
+  # suite's own quoting fixtures exist to support.
+  for f in "receipt" ""; do
+    case "$f" in receipt) src="$PREFIX.ccr-attempt.json";; *) src="$PREFIX.ccr-receipt.json";; esac
+    [ -e "$src" ] || continue
+    j=$(exec 9>&-; python3 -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+if sys.argv[2]: d=d.get(sys.argv[2]) or {}
+print(d.get("job_id") or "")' "$src" "$f" 2>/dev/null) || j=""
+    [ -z "$j" ] || { printf '%s' "$j"; return 0; }
+  done
+  printf ''
+}
 prompt_digest() { { shasum -a 256 "$1" 2>/dev/null || sha256sum "$1" 2>/dev/null; } | awk '{print $1; exit}'; }
 # Kernel file locks serialize collectors, admission and claim rotation. The
 # shell owns descriptor 9; the lock helper inherits it. Observation children
@@ -502,6 +678,30 @@ trap 'publish_unlock; exit 143' TERM
 # and reports as a runner in flight for a process that has exited — so four refusals could exhaust
 # a review's budget without a single job being launched (cycle 5: CL-05). This function only ever
 # reads and refuses; it never rotates or writes.
+# THE SAME PREDICATE phase-gate.sh's ccr_release_check uses, stated here because the two decisions
+# must agree: the gate frees the claim on this proof, and the runner must then accept the relaunch
+# the freed claim exists to authorize. Every field the marker carries is checked, so adding a
+# second marker stage later cannot silently pass as a pre-admission proof.
+#
+# It is deliberately NOT a general escape from refuse_if_in_flight. It is consulted only where the
+# attempt is otherwise unidentifiable — no CCR launch line, no companion job id — because in every
+# other case there is a job whose owner can be asked, and asking is always better than inferring.
+PRELAUNCH_PROOF_NOTE=""
+note_prelaunch_proof() {  # record the permitting branch, once, in the NEW attempt's .progress
+  [ -n "$PRELAUNCH_PROOF_NOTE" ] || return 0
+  echo "0s PRE-SUBMISSION-PROOF: $PRELAUNCH_PROOF_NOTE" >> "$PREFIX.progress"
+  PRELAUNCH_PROOF_NOTE=""
+}
+proven_pre_submission() {  # -> 0 only when this prefix provably never submitted a workload
+  local marker="$PREFIX.ccr-prelaunch" field
+  [ -e "$marker" ] || return 1
+  for field in "protocol=$CCR_PROTOCOL" stage=pre-admission backend=ccr; do
+    grep -qxF -- "$field" "$marker" 2>/dev/null || return 1
+  done
+  # An attempt record or a receipt means admission was reached, so a workload may exist and only
+  # its owner may say otherwise. The marker alone never overrides either.
+  [ ! -e "$PREFIX.ccr-attempt.json" ] && [ ! -e "$PREFIX.ccr-receipt.json" ]
+}
 refuse_if_in_flight() {
   if [ -e "$PREFIX.ccr-attempt.json" ] && [ ! -e "$PREFIX.exit" ]; then
     python3 9>&- "$CCR_HELPER" stopped "$PREFIX" >/dev/null 2>&1 || {
@@ -551,6 +751,21 @@ refuse_if_in_flight() {
         else
           mlive="the codex companion could not be consulted for job $ljob"
         fi
+      elif proven_pre_submission; then
+        # Nothing was ever submitted from this prefix, and that is proved rather than assumed
+        # (see proven_pre_submission). There is no workload to collide with, so fall through to
+        # rotate_previous_attempt, which archives the orphaned .progress and the marker as
+        # .attemptN.* and lets this launch proceed. Without this branch `phase-gate.sh release`
+        # frees the claim and the very next launch is still refused here, which leaves the
+        # interrupted-admission prefix wedged while reporting RELEASED.
+        #
+        # This is the only branch in the mechanism that PERMITS rather than refuses, so it says so.
+        # Silently falling through left nothing in the run directory distinguishing a launch this
+        # proof authorized from an ordinary rotation, which is exactly the evidence an incident
+        # involving a second job beside a live one would need (cycle 8: CL-04). The note is recorded
+        # for the NEW attempt, after this orphan has been rotated away — writing it here would
+        # archive the note together with the attempt it is about.
+        PRELAUNCH_PROOF_NOTE="pre-submission proof (protocol=$CCR_PROTOCOL stage=pre-admission backend=ccr, no attempt record, no receipt) authorized this launch over an orphaned .progress"
       else
         mlive="unfinished legacy attempt has no verifiable workload identity; drain it before upgrading"
       fi
@@ -566,7 +781,7 @@ refuse_if_in_flight() {
   # owner cannot positively confirm termination. Missing or malformed backend
   # metadata is unresolved and cannot authorize replacement.
   if [ -e "$PREFIX.detached" ] && [ ! -e "$PREFIX.exit" ]; then
-    local dbackend dpid dident djob dstatus droot dlive="undetermined (detached backend is missing or unrecognized)"
+    local dbackend dpid dident djob dstatus droot dattach dlive="undetermined (detached backend is missing or unrecognized)"
     dbackend=$(exec 9>&-; detached_field backend)
     case "$dbackend" in
       ccr)
@@ -597,8 +812,24 @@ refuse_if_in_flight() {
         ;;
     esac
     if [ "$dlive" != no ]; then
+      # Regenerated from the job this record names, not forwarded from the record's own text: a
+      # record written before the binding existed carries an unbound command, and the attach
+      # admission now refuses those, so forwarding it would send the operator to a certain refusal
+      # (cycle 8: CX-01). When the record names no job there is nothing to bind to, and the stored
+      # text — whatever it is — is still the most the record can offer.
+      dattach=$(exec 9>&-; detached_field attach_command)
+      # …and when the record names a job whose launch bounds are not recorded anywhere, the operator
+      # is told that rather than handed a command carrying bounds nothing recorded (cycle 10: F-01).
+      # The job is read HERE, for both backends. It used to be read only inside the codex arm above,
+      # so on the gateway backend neither the regeneration nor its fallback sentence ran and the
+      # record's own command was echoed — a blank line for the record shape whose command is
+      # deliberately empty (cycle 12: F-06). attach_line supplies the record's own guidance for
+      # anything still empty after that.
+      djob=$(exec 9>&-; detached_field job)
+      [ -z "$djob" ] || dattach=$(exec 9>&-; recorded_attach_command "$djob") \
+        || dattach="(no ready-to-run command: the watch bounds this attempt was launched with are not recorded here. Attach with --expected-job $djob and --stall-min/--max-min/--poll-sec you choose deliberately, knowing the stall bound cancels.)"
       echo "codex-run.sh: $PREFIX.detached names an attempt that has not ended — $dlive. Launching here would strand it and start a second job beside it. Attach to it or cancel it first:" >&2
-      echo "  $(exec 9>&-; detached_field attach_command)" >&2
+      echo "  $(exec 9>&-; attach_line "$dattach")" >&2
       echo "  $(exec 9>&-; detached_field cancel_command)" >&2
       exit 4
     fi
@@ -612,12 +843,28 @@ rotate_previous_attempt() {
   # A launch error leaves .exit without .meta, and a runner killed mid-flight
   # leaves .progress without either, so all three are attempt markers and an
   # orphaned attempt is rotated as a unit, never truncated.
-  if [ -e "$PREFIX.meta" ] || [ -e "$PREFIX.exit" ] || [ -e "$PREFIX.progress" ]; then
+  # `.ccr-prelaunch` is in this trigger, not only in the rotated list below, because it is written
+  # one line BEFORE `.progress`: an interruption between those two lines leaves a prefix carrying a
+  # marker and none of the other three, which nothing would then archive. A later attempt would
+  # inherit it, and once proven_pre_submission honours a marker, an inherited one could vouch for an
+  # attempt it knows nothing about — authorizing a launch beside work that may be live. A lone
+  # marker must therefore be archived by the next launch like any other orphan.
+  # `.ccr-prelaunch.part` is in the trigger for a WEAKER but still sufficient reason, and the
+  # distinction matters: nothing reads the staging file, so it can never vouch for anything — but it
+  # can be the only file on a prefix (it is written after rotation has moved everything else away),
+  # and adding it to the rotated list alone left it surviving the next launch and then archived with
+  # the sidecars of the launch that FOLLOWED it (cycle 9: CL-06/CX-03). Deleting it instead would
+  # discard the one trace that a staging write was interrupted, and would not cover the companion and
+  # launch-error paths, which write no marker at all. Archive it; never read it.
+  if [ -e "$PREFIX.meta" ] || [ -e "$PREFIX.exit" ] || [ -e "$PREFIX.progress" ] || [ -e "$PREFIX.ccr-prelaunch" ] || [ -e "$PREFIX.ccr-prelaunch.part" ]; then
     N=1; while ls "$PREFIX.attempt$N."* >/dev/null 2>&1; do N=$((N+1)); done
     # .detached and .childexit belong to the attempt too: a record left behind would make a bogus
     # --attach admissible against the NEXT, live attempt, and a stale receipt would let it publish
     # a terminal outcome from the previous run's exit status.
-    for ext in stdout stderr progress joblog meta exit detached childexit ccr-attempt.json ccr-receipt.json ccr-receipt.observed ccr-recovery-receipt.json ccr-admission-conflict.json ccr-prompt ccr-result.json ccr-errorlog ccr-submit.stderr; do [ -e "$PREFIX.$ext" ] && mv "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
+    # ccr-prelaunch.part is the marker's staging name. A kill between its write and the rename that
+    # publishes it leaves a file that reads as a marker beside the real ones, in a directory whose
+    # names are load-bearing evidence, and nothing else ever removes it (cycle 8: CL-05).
+    for ext in stdout stderr progress joblog meta exit detached childexit ccr-prelaunch ccr-prelaunch.part ccr-attempt.json ccr-receipt.json ccr-receipt.observed ccr-recovery-receipt.json ccr-admission-conflict.json ccr-prompt ccr-result.json ccr-errorlog ccr-submit.stderr; do [ -e "$PREFIX.$ext" ] && mv "$PREFIX.$ext" "$PREFIX.attempt$N.$ext"; done
     for observation in "$PREFIX.ccr-observation."* "$PREFIX.ccr-capture."*; do
       [ -e "$observation" ] || continue
       mv "$observation" "$PREFIX.attempt$N.${observation#"$PREFIX."}"
@@ -690,6 +937,12 @@ unlock_claim() { publish_unlock; }   # one release for one acquisition: the hold
 launch_error() {  # <message> <command>
   stamp_claim; rotate_previous_attempt
   echo "codex-run.sh: $1" >&2; printf 'LAUNCH-ERROR\n%s\n' "$1" > "$PREFIX.stderr"; printf '0s LAUNCH-ERROR: %s\n' "$1" > "$PREFIX.progress"
+  # This path CONSUMED the pre-submission proof: rotate_previous_attempt above archived the orphan on
+  # its strength. Recording the note only on the two success paths left the one branch that permits
+  # rather than refuses with no trace at all whenever the launch then failed its preflight — which is
+  # every unresolvable alias, every failed smoke and every missing companion (cycle 9: CL-03). The
+  # note goes after the truncation, not before it, or the `>` above would erase it.
+  note_prelaunch_proof
   printf 'outcome=LAUNCH-ERROR\nbackend=%s\nlast_error=%s\nmode=%s\nprompt_file=%s\ncommand=%s\n' "$BACKEND" "$1" "$MODE" "$PROMPT_FILE" "$2" > "$PREFIX.meta"; echo 4 > "$PREFIX.exit"; exit 4
 }
 START=$(exec 9>&-; date +%s); now() { date +%s; }; elapsed() { echo $(( $(exec 9>&-; now) - START )); }
@@ -706,7 +959,13 @@ if [ "$ATTACH" = 1 ]; then
   # Cancellation addresses the admitted job and does not publish collector
   # artifacts. It must remain available while another collector holds its lease.
   if [ "$CANCEL_ONLY" = 1 ] && [ -e "$PREFIX.ccr-attempt.json" ]; then
-    CANCEL_RESULT=$(exec 9>&-; python3 "$CCR_HELPER" cancel-attempt "$PREFIX" ${EXPECTED_JOB:+"$EXPECTED_JOB"}) || exit 6
+    # This branch ends a job, and it runs before the record is read, so the admission block's
+    # requirement has not been applied yet. It is applied here instead: a cancellation that names no
+    # job would stop whichever admitted attempt occupies the prefix now, which is the companion
+    # defect (cycle 8: CX-01) with a gateway job at the other end. verify-attempt then decides
+    # whether the name matches; it is the attempt record, not this process, that answers that.
+    [ -n "$EXPECTED_JOB" ] || die4 "--attach --cancel: name the job to stop with --expected-job. A prefix outlives its attempts, so an unnamed cancellation would stop whichever admitted job is here now. The job id is in $PREFIX.ccr-attempt.json and in the cancel_command the launch recorded; nothing was cancelled."
+    CANCEL_RESULT=$(exec 9>&-; python3 "$CCR_HELPER" cancel-attempt "$PREFIX" "$EXPECTED_JOB") || exit 6
     echo "codex-run.sh: stopped job $(exec 9>&-; ccr_job_field "$CANCEL_RESULT" job_id) (cleanup coverage=$(exec 9>&-; ccr_job_field "$CANCEL_RESULT" cleanup.coverage))"
     exit 0
   fi
@@ -714,9 +973,41 @@ if [ "$ATTACH" = 1 ]; then
   # attach cannot pass the same guard and end up as a concurrent collector of one job. Testing
   # `.exit` outside the lock only proved it was absent at some moment in the past; by the time
   # this process published, another collector could already have finished.
+  # THE CALLER NAMES THE JOB — asked above the gateway recovery step, because that step writes
+  # (`recover` atomically replaces <prefix>.ccr-attempt.json and, when no detached record exists,
+  # publishes one), and above publish_lock, because that CREATES <prefix>.claim.lock with an
+  # append redirect. With the requirement below either one, "nothing was written" was false: first
+  # by two durable sidecars (cycle 9: CX-02), then by the lock file itself (cycle 10: CL-06). This
+  # refusal reads the durable records and nothing else, so it needs neither the lock nor recovery.
+  # The identity comparison against the detached record stays below, where the record is read.
+  CANCEL_FLAG=""; [ "$CANCEL_ONLY" != 1 ] || CANCEL_FLAG=--cancel
+  if [ -z "$EXPECTED_JOB" ]; then
+    RJOB=$(exec 9>&-; recorded_job_id)
+    die4 "--attach: every attach must name the job it is for, and this one named none. A prefix outlives its attempts, so nothing here can prove this attach was meant for the job now on this prefix rather than an earlier attempt at the same one; nothing was observed, cancelled or written.$(exec 9>&-; remedy_for "$RJOB" $CANCEL_FLAG)"
+  fi
+  # The identity comparison runs here too, whenever the record already names a job. It used to run
+  # only below publish_lock, so the refusal that says nothing was observed or cancelled still left
+  # <prefix>.claim.lock behind — the same file the binding-presence refusal above was moved up to
+  # avoid creating (cycle 12: F-08). The record is published by an atomic rename, so reading it
+  # without the lock reads one version or another, never a partial one. The comparison below stays:
+  # it is the authoritative one, over the record this attach goes on to use, and it is what refuses a
+  # record that names no job at all.
+  if [ -e "$PREFIX.detached" ]; then
+    EJOB=$(exec 9>&-; detached_field job)
+    [ -z "$EJOB" ] || refuse_if_other_job "$EJOB"
+  fi
   publish_lock
   if [ -e "$PREFIX.ccr-attempt.json" ] && [ ! -e "$PREFIX.exit" ]; then
-    [ -z "$EXPECTED_JOB" ] || python3 9>&- "$CCR_HELPER" verify-attempt "$PREFIX" "$EXPECTED_JOB" >/dev/null || die4 "saved attach belongs to a different attempt"
+    if ! python3 9>&- "$CCR_HELPER" verify-attempt "$PREFIX" "$EXPECTED_JOB" >/dev/null; then
+      # Two failures reach here and they are not the same fact. The binding is compared against the
+      # delivered receipt, so an unreadable one fails before any comparison — for EVERY job id,
+      # including the right one. Reporting that as "a different attempt" told an operator in the one
+      # recoverable state that their correct command was wrong, and named nothing to run (cycle 10:
+      # CL-03). The discovery step is read-only and never resubmits: it looks the submission up and
+      # reconciles the receipt, after which an ordinary bound attach works.
+      receipt_readable || die4 "--attach: this prefix's admission receipt is missing or unreadable, so no attach can be bound to it — not even one naming the correct job, because the binding is checked against the receipt. This is the lost-receipt state, and it is recoverable: repair delivery first with the read-only submission-status lookup, $(exec 9>&-; quote_command python3 "$(exec 9>&-; abs_path "$CCR_HELPER")" recover "$(exec 9>&-; abs_path "$PREFIX")"), which looks the submission up and rewrites the receipt and never submits anything; then attach with --expected-job. (Do NOT reach for complete-admission here unless you mean to finish the original admission: when the gateway still reports it prepared, that command replays the saved launch request under its original token and may start execution, though it never requests a replacement job.) Nothing was observed, cancelled or written."
+      die4 "saved attach belongs to a different attempt: $PREFIX.ccr-receipt.json names a different job than $EXPECTED_JOB. Read the receipt for the job this prefix holds; nothing was observed, cancelled or written."
+    fi
     python3 "$CCR_HELPER" recover "$PREFIX" >/dev/null || { echo "codex-run.sh: admission unresolved; retain the claim and investigate, never retry launch" >&2; exit 6; }
   fi
   [ -e "$PREFIX.detached" ] || die4 "--attach: no $PREFIX.detached — nothing detached from this prefix (a launch that finished wrote .exit; a launch that never ran wrote nothing)"
@@ -726,7 +1017,32 @@ if [ "$ATTACH" = 1 ]; then
   DPID=$(exec 9>&-; detached_field pid); PGID=$(exec 9>&-; detached_field pgid); IDENT=$(exec 9>&-; detached_field identity)
   ATTEMPTS=$(exec 9>&-; awk -F= '$1=="attached"{print $2; exit}' "$PREFIX.meta" 2>/dev/null); ATTEMPTS=$(( ${ATTEMPTS:-0} + 1 ))
   case "$BACKEND" in codex|ccr) ;; *) die4 "--attach: $PREFIX.detached names no usable backend (backend='$BACKEND')";; esac
-  ATTACH_CMD=$(exec 9>&-; detached_field attach_command); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
+  # THE CALLER NAMES THE JOB. Always, on both backends, cancellation included.
+  #
+  # A prefix is legitimately reusable — the review gate rotates a spent claim and the runner rotates
+  # the previous attempt's sidecars — so the prefix alone cannot say which execution a command was
+  # written for. The previous shape of this guard asked the RECORD instead: it accepted an attach
+  # that named no job whenever the record now on the prefix carried a binding. That answers a
+  # question about the attempt that is here, not about the one the incoming command was written for,
+  # and a deliberate interactive attach and a stale pre-binding saved command have IDENTICAL
+  # arguments — so a bound record vouched for every unbound caller, and an old command replayed
+  # against a newer attempt was admitted, watched it, and on its stall bound cancelled it: exactly
+  # the defect the binding exists to prevent (cycle 8: CX-01). There is no weaker check that
+  # separates the two cases, because there is nothing in the process to separate them by.
+  #
+  # This is a deliberate interface change: `--attach` with no job is gone, for humans too. Every
+  # command this repository emits carries the binding (see bound_attach_command), and a refusal
+  # prints the command for the job this prefix names now, so the operator's next step is a copy.
+  # The presence of a job was required above, before anything was read for recovery or written; this
+  # is the identity comparison, which needs the record and so belongs here. The remedy it prints is
+  # the command for the operation the caller attempted, so a refused cancellation is answered with a
+  # cancellation and not with a watch.
+  refuse_if_other_job "$JOB"
+  # Regenerated, never copied. A record written before the binding existed carries an unbound
+  # command, and propagating it forward would hand the next operator a command this block now
+  # refuses — the upgrade would break recovery for every attempt already in flight. These bounds are
+  # this attach's, deliberately: the command describes the watch that is starting now.
+  ATTACH_CMD=$(exec 9>&-; bound_attach_command "$JOB" "$STALL_MIN" "$MAX_MIN" "$POLL"); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
   echo "$(exec 9>&-; elapsed)s ATTACH #$ATTEMPTS backend=$BACKEND ${JOB:+job=$JOB}${DPID:+pid=$DPID pgid=$PGID}" >> "$PREFIX.progress"
 
   # ---- the job's state, asked of its owner ----------------------------------
@@ -771,7 +1087,7 @@ if [ "$ATTACH" = 1 ]; then
     # still absent, so every gate still reports this phase in flight and `release` still refuses.
     # Exit 0 alone reads as "recovery finished", which it is not (cycle 3: CL-09).
     echo "codex-run.sh: the attempt is still open — .detached remains and no .exit was written. Attach once more to publish the outcome and free the claim:"
-    echo "  ${ATTACH_CMD:-$0 $PREFIX --attach}"
+    echo "  ${ATTACH_CMD:-$(exec 9>&-; bound_attach_command "$JOB" "$STALL_MIN" "$MAX_MIN" "$POLL")}"
     exit 0
   fi
 fi
@@ -807,7 +1123,16 @@ if [ "$BACKEND" = ccr ]; then
   ccr_launch_argv "$ALIAS" "$MAX_TURNS" "$PROMPT_FILE"
   if [ -n "$SESSION" ]; then ARGV+=("--resume=$SESSION" "--expected-parent-job=$EXPECTED_PARENT"); fi
   stamp_claim; rotate_previous_attempt
+  # WRITTEN BEFORE ANYTHING CAN BE SUBMITTED, and this ordering is the whole point of the file.
+  # `admit` below persists <prefix>.ccr-attempt.json (fsync + atomic replace) strictly before it
+  # spawns the process that submits to CCR, so a prefix that has this marker at the current
+  # protocol and NO attempt record is proof that no workload was ever submitted — not a guess.
+  # phase-gate.sh reads exactly that to release an interrupted pre-admission prefix instead of
+  # wedging it forever. A prefix without the marker is a legacy attempt or externally damaged
+  # state, is NOT provably pre-submission, and is still refused.
+  printf 'protocol=%s\nstage=pre-admission\nbackend=ccr\n' "$CCR_PROTOCOL" > "$PREFIX.ccr-prelaunch.part" && mv "$PREFIX.ccr-prelaunch.part" "$PREFIX.ccr-prelaunch"
   : > "$PREFIX.progress"; : > "$PREFIX.stderr"; : > "$PREFIX.joblog"
+  note_prelaunch_proof
   ADMISSION_WAIT=$(( MAX_MIN*60 - $(exec 9>&-; elapsed) ))
   [ "$ADMISSION_WAIT" -gt 0 ] || ADMISSION_WAIT=1
   [ "$ADMISSION_WAIT" -le 30 ] || ADMISSION_WAIT=30
@@ -864,7 +1189,16 @@ if [ "$BACKEND" = ccr ]; then
     D_MODEL=$(exec 9>&-; detached_field claude_model_id); D_SHA=$(exec 9>&-; detached_field prompt_sha256); D_TURNS=$(exec 9>&-; detached_field max_turns)
     D_AT=$(exec 9>&-; detached_field detached_at); D_JOBLOG="${JOB_LOG:-}"
     [ -n "$D_AT" ] || D_AT=$(exec 9>&-; date -u +%Y-%m-%dT%H:%M:%SZ)
-    ATTACH_CMD=$(exec 9>&-; detached_field attach_command); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
+    # Same rule as the codex branch at the bottom of this file: on an attach the attach command was
+    # regenerated and bound when this attach was admitted, and that value is kept. Reading the record
+    # back republishes whatever it holds — an unbound command from a pre-binding record, or the empty
+    # one a record carries when its bounds were never recorded (cycle 11: F-01/F-08).
+    [ "$ATTACH" = 1 ] || ATTACH_CMD=$(exec 9>&-; detached_field attach_command)
+    CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
+    # An empty attach command is published together with the reason it is empty, or the republished
+    # record stops explaining its own empty field (cycle 12: F-09). A record that HAS a command
+    # carries no guidance, so the field is written empty and reads as absent.
+    D_GUIDE=""; [ -n "$ATTACH_CMD" ] || D_GUIDE=$(exec 9>&-; detached_field attach_guidance)
     echo "$(exec 9>&-; elapsed)s DETACHED → watch bound reached with the job still running; nothing signalled (job $JOB_ID left running under its owner)" >> "$PREFIX.progress"
     # ORDER MATTERS: .detached is what admits an --attach, so it is written LAST, after every other
     # sidecar this attempt owns. Publishing it first opened a window in which an attach could be
@@ -895,12 +1229,13 @@ prompt_sha256=$D_SHA
 prompt_file=$PROMPT_FILE
 detached_at=$D_AT
 attach_command=$ATTACH_CMD
+attach_guidance=$D_GUIDE
 cancel_command=$CANCEL_CMD
 EOD
     # NO .exit: an existing .exit tells every review gate the attempt finished, and it would then
     # rotate the claim and authorize a second launch against this still-running job.
     echo "codex-run.sh: DETACHED backend=ccr alias=$ALIAS job=$JOB_ID elapsed=$(exec 9>&-; elapsed)s — the job is still running."
-    echo "  attach: $ATTACH_CMD"
+    echo "  attach: $(exec 9>&-; attach_line "$ATTACH_CMD")"
     echo "  cancel: $CANCEL_CMD"
     exit 6
   fi
@@ -963,7 +1298,8 @@ EOD
   # documented recovery is still an attach.
   if [ "$OUTCOME" = DETACHED ]; then
     ATTEMPTS=${ATTEMPTS:-0}
-    ATTACH_CMD=$(exec 9>&-; detached_field attach_command); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
+    [ "$ATTACH" = 1 ] || ATTACH_CMD=$(exec 9>&-; detached_field attach_command)  # see above: bound at admission
+    CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
     echo "$(exec 9>&-; elapsed)s DETACHED (re-detached): $REDETACH_REASON" >> "$PREFIX.progress"
     {
       echo "outcome=DETACHED"; echo "backend=ccr"; echo "alias=$ALIAS"; echo "detached=yes"; echo "attached=$ATTEMPTS"
@@ -974,7 +1310,7 @@ EOD
     } > "$PREFIX.meta"
     publish_unlock
     echo "codex-run.sh: DETACHED backend=ccr alias=$ALIAS elapsed=$(exec 9>&-; elapsed)s — $REDETACH_REASON; the attempt is still open."
-    echo "  attach: $ATTACH_CMD"
+    echo "  attach: $(exec 9>&-; attach_line "$ATTACH_CMD")"
     exit 6
   fi
   [ -n "${HELD_LOCK:-}" ] || publish_lock --must
@@ -1060,7 +1396,7 @@ if [ -z "$CODEX_ROOT" ] || [ ! -f "$CODEX_ROOT/scripts/codex-companion.mjs" ]; t
     # launch against a job that is still running (cycle 2: CX-06). Leave the attempt as found.
     echo "$(exec 9>&-; elapsed)s ATTACH: cannot locate the codex plugin; nothing was observed and the attempt stays open" >> "$PREFIX.progress"
     echo "codex-run.sh: --attach: cannot locate the codex plugin (installed_plugins.json or ~/.claude/plugins/cache/openai-codex/codex/*); job $JOB is untouched and still detached." >&2
-    echo "  attach: ${ATTACH_CMD:-$0 $PREFIX --attach}"
+    echo "  attach: ${ATTACH_CMD:-$(exec 9>&-; bound_attach_command "$JOB" "$STALL_MIN" "$MAX_MIN" "$POLL")}"
     exit 6
   fi
   launch_error "cannot locate the codex plugin (installed_plugins.json or ~/.claude/plugins/cache/openai-codex/codex/*)" "task $MODE --background --prompt-file $PROMPT_FILE"
@@ -1080,6 +1416,7 @@ else
 # A completed companion job does not mean this collector has finished writing.
 stamp_claim; rotate_previous_attempt
 : > "$PREFIX.progress"; : > "$PREFIX.stderr"
+note_prelaunch_proof
 CMD="task $MODE --background --prompt-file $PROMPT_FILE"
 LAUNCH=$(cc task "$MODE" --background --prompt-file "$PROMPT_FILE" 2>>"$PREFIX.stderr") || true
 JOB=$(exec 9>&-; printf '%s' "$LAUNCH" | grep -oE 'task-[a-z0-9]+-[a-z0-9]+' | head -1)
@@ -1135,7 +1472,12 @@ if [ "$OUTCOME" = "DETACHED" ]; then
   if [ "$ATTACH" = 1 ]; then
     D_THREAD=$(exec 9>&-; detached_field thread); D_SHA=$(exec 9>&-; detached_field prompt_sha256); D_AT=$(exec 9>&-; detached_field detached_at)
     D_JOBLOG=$(exec 9>&-; detached_field joblog); D_WPID=$(exec 9>&-; detached_field worker_pid); D_WIDENT=$(exec 9>&-; detached_field worker_identity)
-    ATTACH_CMD=$(exec 9>&-; detached_field attach_command); CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
+    # The attach command is the exception to "copy, never re-derive": it is not the launch's
+    # testimony, it is the next operator's instruction, and an unbound one inherited from a
+    # pre-binding record is an instruction the admission block now refuses (cycle 8: CX-01). It was
+    # already regenerated when this attach was admitted; keep that value rather than reading the
+    # record back. The cancel command names the job directly and needs no rebinding.
+    CANCEL_CMD=$(exec 9>&-; detached_field cancel_command)
   else
     D_THREAD=$(exec 9>&-; grep -oE 'Codex session ID: [0-9a-f-]+' "${LOGFILE:-/dev/null}" 2>/dev/null | head -1 | awk '{print $4}')
     D_SHA=$(exec 9>&-; prompt_digest "$PROMPT_FILE"); D_AT=$(exec 9>&-; date -u +%Y-%m-%dT%H:%M:%SZ); D_JOBLOG="${LOGFILE:-}"
@@ -1143,9 +1485,13 @@ if [ "$OUTCOME" = "DETACHED" ]; then
     # job is still running rather than assume it (cycle 3: CL-03/CX-02). The companion remains the
     # authority; this is the cheap local check, and `job=` is what a relaunch consults.
     D_WPID="${PID:-}"; D_WIDENT=$(exec 9>&-; proc_identity "${PID:-0}")
-    ATTACH_CMD=$(exec 9>&-; quote_command "$CCR_RUNNER" "$(exec 9>&-; python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$PREFIX")" --attach --stall-min "$STALL_MIN" --max-min "$MAX_MIN" --poll-sec "$POLL")
+    # --expected-job binds this command to THIS job. Without it the command names only a prefix,
+    # which a later attempt may legitimately occupy (see the attach admission block above).
+    ATTACH_CMD=$(exec 9>&-; bound_attach_command "$JOB" "$STALL_MIN" "$MAX_MIN" "$POLL")
     CANCEL_CMD=$(exec 9>&-; quote_command node "$CODEX_ROOT/scripts/codex-companion.mjs" cancel "$JOB")
   fi
+  # See the gateway branch: an empty command travels with the reason it is empty (cycle 12: F-09).
+  D_GUIDE=""; [ -n "$ATTACH_CMD" ] || D_GUIDE=$(exec 9>&-; detached_field attach_guidance)
   echo "$(exec 9>&-; elapsed)s DETACHED → watch bound reached with job $JOB still running; not cancelled" >> "$PREFIX.progress"
   {
     echo "outcome=DETACHED"; echo "backend=codex"; echo "job=$JOB"; echo "detached=yes"; echo "attached=${ATTEMPTS:-0}"
@@ -1167,6 +1513,7 @@ prompt_sha256=$D_SHA
 prompt_file=$PROMPT_FILE
 detached_at=$D_AT
 attach_command=$ATTACH_CMD
+attach_guidance=$D_GUIDE
 cancel_command=$CANCEL_CMD
 EOD
   # NO .exit — see the ccr branch: a terminal sidecar would free the claim for a second launch.

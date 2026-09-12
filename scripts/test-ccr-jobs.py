@@ -52,6 +52,30 @@ esac
         return self.run_runner(str(self.prefix), "--via", "ccr:x", "--prompt-file", str(self.prompt),
                                "--poll-sec", "1", **env)
 
+    @staticmethod
+    def recorded_job(prefix):
+        """The job id this prefix's own durable record names."""
+        detached = Path(str(prefix) + ".detached")
+        if detached.exists():
+            for line in detached.read_text().splitlines():
+                if line.startswith("job="):
+                    return line[len("job="):]
+        attempt = Path(str(prefix) + ".ccr-attempt.json")
+        if attempt.exists():
+            return job.load(attempt)["receipt"]["job_id"]
+        raise AssertionError("no durable record names a job for " + str(prefix))
+
+    def attach(self, prefix, *extra, **env):
+        """--attach bound to the job the prefix names, which is the only admitted form.
+
+        Since cycle 8 `--expected-job` is mandatory on every attach, cancellation included: a prefix
+        outlives its attempts, so a command that names only a prefix would watch — and on its stall
+        bound cancel — whichever job occupies it when the command is eventually run. Tests that omit
+        the binding on purpose assert the refusal and call run_runner directly.
+        """
+        return self.run_runner(str(prefix), "--attach", "--expected-job", self.recorded_job(prefix),
+                               *extra, **env)
+
     def test_submission_lookup_recovers_lost_receipt_without_another_job(self):
         before = len(list((self.root / "store/fake-ccr-jobs").glob("*.json")))
         result = self.launch(FAKE_CCR_DROP_RECEIPT="1")
@@ -59,6 +83,17 @@ esac
         value = job.load(str(self.prefix) + ".ccr-attempt.json")
         self.assertEqual(value["submission_id"], value["receipt"]["submission_id"])
         self.assertEqual(len(list((self.root / "store/fake-ccr-jobs").glob("*.json"))), before + 1)
+        # Submission-status discovery is the recovery mechanism for a lost delivery, and it
+        # is what supplies the binding: the looked-up identity is written back as the
+        # receipt, and that is the job id an attach on this prefix must name. Attaching
+        # without a binding is never the recovery path — it is refused outright.
+        delivered = job.load(str(self.prefix) + ".ccr-receipt.json")
+        self.assertEqual(delivered, {key: value["receipt"][key] for key in delivered})
+        stored = json.loads((self.root / "store/fake-ccr-jobs"
+                             / (delivered["job_id"] + ".json")).read_text())
+        self.assertEqual(stored["submission_id"], delivered["submission_id"])
+        self.assertEqual(stored["session_id"], delivered["session_id"])
+        self.assertEqual(self.recorded_job(self.prefix), delivered["job_id"])
 
     def test_resume_last_rejected_before_claim_or_admission(self):
         claim = Path(str(self.prefix) + ".claim")
@@ -84,7 +119,7 @@ esac
                 "--resume=" + previous["session_id"], "--expected-parent-job=" + previous["job_id"]]
         admitted = subprocess.run(args, env=self.env, capture_output=True, text=True, timeout=10)
         self.assertEqual(admitted.returncode, 0, admitted.stderr)
-        attached = self.run_runner(prefix, "--attach", "--poll-sec", "1")
+        attached = self.attach(prefix, "--poll-sec", "1")
         self.assertEqual(attached.returncode, 0, attached.stdout + attached.stderr)
         meta = Path(prefix + ".meta").read_text()
         self.assertIn("mode=--resume-session\n", meta)
@@ -474,12 +509,43 @@ else:
         store = self.root / "store/fake-ccr-jobs"
         self.assertEqual(job.load(store / (jid + ".json"))["status"], "running")
         count = len(list(store.glob("*.json")))
-        cancel = self.run_runner(str(self.prefix), "--attach", "--cancel")
+        cancel = self.attach(self.prefix, "--cancel")
         self.assertEqual(cancel.returncode, 0, cancel.stdout + cancel.stderr)
         self.assertFalse(Path(str(self.prefix) + ".exit").exists())
-        result = self.run_runner(str(self.prefix), "--attach", "--poll-sec", "1")
+        result = self.attach(self.prefix, "--poll-sec", "1")
         self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
         self.assertEqual(len(list(store.glob("*.json"))), count)
+
+    def test_unbound_attach_and_cancel_are_refused_on_a_live_gateway_job(self):
+        """The caller names the job, on this backend too, and a refusal touches nothing.
+
+        The companion backend's version of this defect asked whether the RECORD was bound, so a
+        bound record vouched for every unbound caller and an old command replayed against a newer
+        attempt watched and cancelled it (cycle 8: CX-01). The gateway backend generates bound
+        commands but did not require one: its comparison was conditional on a job being supplied and
+        its early cancellation passed the job only when present, so a hand-typed unbound command had
+        the same reach. Both are now required, and both refusals must be inert.
+        """
+        result = self.bounded_launch(FAKE_CCR_MODE="sleep")
+        self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
+        jid = self.recorded_job(self.prefix)
+        store = self.root / "store/fake-ccr-jobs"
+        self.assertEqual(job.load(store / (jid + ".json"))["status"], "running")
+        progress = Path(str(self.prefix) + ".progress").read_text()
+        for extra in ([], ["--cancel"]):
+            refused = self.run_runner(str(self.prefix), "--attach", *extra, "--poll-sec", "1")
+            self.assertEqual(refused.returncode, 4, refused.stdout + refused.stderr)
+            self.assertIn("--expected-job", refused.stderr)
+            # nothing observed, nothing cancelled, nothing published
+            self.assertEqual(job.load(store / (jid + ".json"))["status"], "running")
+            self.assertEqual(Path(str(self.prefix) + ".progress").read_text(), progress)
+            self.assertFalse(Path(str(self.prefix) + ".exit").exists())
+        # A caller naming some OTHER job is refused too, and just as inertly.
+        stale = self.run_runner(str(self.prefix), "--attach", "--expected-job", "ccr-not-this-one", "--poll-sec", "1")
+        self.assertEqual(stale.returncode, 4, stale.stdout + stale.stderr)
+        self.assertEqual(job.load(store / (jid + ".json"))["status"], "running")
+        # ...and the bound caller still works, which is what makes the refusals a guard and not a wall.
+        self.assertEqual(self.attach(self.prefix, "--cancel").returncode, 0)
 
     def test_receipt_status_identity_mismatch_is_unresolved(self):
         result = self.bounded_launch(FAKE_CCR_BAD_STATUS=json.dumps({"session_id": str(uuid.uuid4())}))
@@ -534,12 +600,62 @@ else:
         result = self.launch(FAKE_CCR_MODE="receipt_lost")
         self.assertEqual(result.returncode, 6, result.stdout + result.stderr)
         self.assertFalse(Path(str(self.prefix) + ".exit").exists())
-        before = list((self.root / "store/fake-ccr-jobs").glob("*.json"))
+        # The genuine lost-receipt state: an attempt record with no delivered identity.
+        self.assertEqual(Path(str(self.prefix) + ".ccr-receipt.json").read_bytes(), b"")
+        before = sorted((self.root / "store/fake-ccr-jobs").glob("*.json"))
         retry = self.launch()
         self.assertEqual(retry.returncode, 4)
-        attach = self.run_runner(str(self.prefix), "--attach")
-        self.assertEqual(attach.returncode, 6)
-        self.assertEqual(list((self.root / "store/fake-ccr-jobs").glob("*.json")), before)
+        # An unbound attach is refused before anything is read, cancelled or written — and
+        # an unresolved admission is precisely the state that cannot supply the binding
+        # from the prefix, since no receipt names a job. Recovery is submission-status
+        # discovery and receipt reconciliation, never an unbound attach.
+        unbound = self.run_runner(str(self.prefix), "--attach")
+        self.assertEqual(unbound.returncode, 4, unbound.stdout + unbound.stderr)
+        self.assertIn("must name the job it is for", unbound.stderr)
+        # Nor does naming a job from outside repair the delivery: the binding is compared against
+        # the receipt, so an unreadable one fails for every job id — the correct one included. That
+        # is its own state, and the refusal says so and names the read-only discovery command,
+        # rather than reporting a correct command as another attempt's (cycle 10: CL-03).
+        guessed = self.run_runner(str(self.prefix), "--attach",
+                                  "--expected-job", "ccr-" + str(uuid.uuid4()))
+        self.assertEqual(guessed.returncode, 4, guessed.stdout + guessed.stderr)
+        self.assertIn("admission receipt is missing or unreadable", guessed.stderr)
+        self.assertIn("complete-admission", guessed.stderr)
+        self.assertNotIn("belongs to a different attempt", guessed.stderr)
+        for sidecar in (".exit", ".detached"):
+            self.assertFalse(Path(str(self.prefix) + sidecar).exists())
+        self.assertEqual(sorted((self.root / "store/fake-ccr-jobs").glob("*.json")), before)
+
+    def test_recover_repairs_unreadable_delivery_under_an_embedded_receipt(self):
+        """F-02r48 (cycle 11): lost delivery is a state of the DELIVERED receipt.
+
+        The refusal an operator meets in this state names `ccr-job.py recover` as the read-only
+        repair, and until this cycle that command did nothing here: an embedded receipt suppressed
+        the lookup on its own, so the one operation that repairs delivery was unavailable in the one
+        state that needs it, and the only command that did anything was the one that can replay the
+        saved launch request.
+        """
+        self.assertEqual(self.launch().returncode, 0)
+        prefix = str(self.prefix)
+        expected = job.load(prefix + ".ccr-attempt.json")["receipt"]
+        before = sorted((self.root / "store/fake-ccr-jobs").glob("*.json"))
+        # b"null" and b"[]" parse as valid JSON that is not an object: the predicate used to call
+        # .get() on them and raise AttributeError out of recover() itself (cycle 12: F-05).
+        for lost in (b"", b"{tru", b'{"job_id": ""}', b"null", b"[]", b'"text"'):
+            with self.subTest(lost=lost):
+                Path(prefix + ".ccr-receipt.json").write_bytes(lost)
+                Path(prefix + ".detached").unlink(missing_ok=True)
+                self.assertFalse(job.delivered_receipt_readable(prefix))
+                with mock.patch.dict(os.environ, self.env):  # the fixture gateway's store
+                    job.recover(prefix)
+                self.assertEqual(job.load(prefix + ".ccr-receipt.json"), expected)
+                # Read-only: the repair looks the submission up and submits nothing.
+                self.assertEqual(sorted((self.root / "store/fake-ccr-jobs").glob("*.json")), before)
+                self.assertEqual(job.load(prefix + ".ccr-attempt.json")["receipt"], expected)
+        # A readable delivered receipt still suppresses the lookup, so an ordinary recover on a
+        # healthy prefix stays a local operation.
+        Path(prefix + ".ccr-receipt.json").write_bytes(job.encode(expected))
+        self.assertTrue(job.delivered_receipt_readable(prefix))
 
     def test_invalid_attach_preserves_unresolved_smoke_admission(self):
         result = self.run_runner("--probe", "--via", "ccr:x", "--record-dir", str(self.root),
@@ -551,14 +667,22 @@ else:
         self.addCleanup(shutil.rmtree, evidence)
         self.assertTrue(Path(prefix + ".ccr-attempt.json").exists())
         self.assertFalse(Path(prefix + ".progress").exists())
+        # Argument validation still precedes every other diagnostic, including the binding.
         rejected = self.run_runner(prefix, "--attach", "--poll-sec", "0")
         self.assertEqual(rejected.returncode, 4)
+        self.assertIn("--poll must be between", rejected.stderr)
         self.assertFalse(Path(prefix + ".exit").exists())
-        attach = self.run_runner(prefix, "--attach")
-        self.assertEqual(attach.returncode, 6)
+        unbound = self.run_runner(prefix, "--attach")
+        self.assertEqual(unbound.returncode, 4, unbound.stdout + unbound.stderr)
+        self.assertIn("must name the job it is for", unbound.stderr)
+        guessed = self.run_runner(prefix, "--attach", "--expected-job", "ccr-" + str(uuid.uuid4()))
+        self.assertEqual(guessed.returncode, 4, guessed.stdout + guessed.stderr)
         retry = self.run_runner(prefix, "--via", "ccr:x", "--prompt-file", str(self.prompt))
         self.assertEqual(retry.returncode, 4)
-        self.assertFalse(Path(prefix + ".exit").exists())
+        # The smoke's unresolved admission is preserved by every refusal above: not closed,
+        # not detached, not resubmitted.
+        for sidecar in (".exit", ".detached", ".progress"):
+            self.assertFalse(Path(prefix + sidecar).exists())
 
     def test_admission_lease_survives_collector_through_receipt_binding(self):
         wrapper = self.root / "admission-helper.py"
@@ -778,7 +902,7 @@ finally:
                     expected = job.load(str(self.prefix) + ".ccr-attempt.json")["prompt_sha256"]
                     fields = dict(line.split("=", 1) for line in detached.read_text().splitlines())
                     self.assertEqual(fields["prompt_sha256"], expected)
-                    self.assertEqual(self.run_runner(str(self.prefix), "--attach", "--cancel").returncode, 0)
+                    self.assertEqual(self.attach(self.prefix, "--cancel").returncode, 0)
                 finally:
                     if process.poll() is None:
                         process.kill()
@@ -812,7 +936,7 @@ else:
                 time.sleep(.05)
             process.kill()
             process.wait(timeout=3)
-            result = self.run_runner(str(self.prefix), "--attach", "--poll-sec", "1")
+            result = self.attach(self.prefix, "--poll-sec", "1")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertFalse((self.root / "poll-done").exists(), "polling child exited before recovery")
         finally:
@@ -829,8 +953,8 @@ else:
         self.assertEqual(self.bounded_launch(FAKE_CCR_MODE="sleep").returncode, 6)
         fields = dict(line.split("=", 1) for line in Path(str(self.prefix) + ".detached").read_text().splitlines())
         old_job = fields["job"]
-        self.assertEqual(self.run_runner(str(self.prefix), "--attach", "--cancel").returncode, 0)
-        self.assertEqual(self.run_runner(str(self.prefix), "--attach", "--poll-sec", "1").returncode, 1)
+        self.assertEqual(self.attach(self.prefix, "--cancel").returncode, 0)
+        self.assertEqual(self.attach(self.prefix, "--poll-sec", "1").returncode, 1)
         self.assertEqual(self.bounded_launch(FAKE_CCR_MODE="sleep").returncode, 6)
         current = job.load(str(self.prefix) + ".ccr-attempt.json")["receipt"]["job_id"]
         self.assertNotEqual(old_job, current)
@@ -840,7 +964,7 @@ else:
                                         capture_output=True, text=True, timeout=10)
                 self.assertIn(result.returncode, (4, 6), result.stdout + result.stderr)
                 self.assertEqual(job.load(self.root / "store/fake-ccr-jobs" / (current + ".json"))["status"], "running")
-        self.assertEqual(self.run_runner(str(self.prefix), "--attach", "--cancel").returncode, 0)
+        self.assertEqual(self.attach(self.prefix, "--cancel").returncode, 0)
 
     def test_write_cancel_refusal_returns_without_wait_or_commit(self):
         repo = self.root / "repository"
@@ -1018,10 +1142,10 @@ os.execv('/bin/ps', ['ps'] + sys.argv[1:])
             self.assertEqual(wrong.returncode, 6)
             record = self.root / "store/fake-ccr-jobs" / (receipt["job_id"] + ".json")
             self.assertEqual(job.load(record)["status"], "running")
-            invalid = self.run_runner(str(self.prefix), "--attach", "--cancel", "--fresh")
+            invalid = self.attach(self.prefix, "--cancel", "--fresh")
             self.assertEqual(invalid.returncode, 4)
             self.assertEqual(job.load(record)["status"], "running")
-            result = self.run_runner(str(self.prefix), "--attach", "--cancel")
+            result = self.attach(self.prefix, "--cancel")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertEqual(process.wait(timeout=8), 1)
             self.assertEqual(job.load(record)["status"], "cancelled")
@@ -1094,10 +1218,41 @@ printf replacement > "$PREFIX.launched"
                 self.assertFalse(Path(prefix + ".exit").exists())
                 self.assertEqual(detached.read_bytes(), before)
 
-    def test_saved_codex_command_resolves_relative_prefix_before_cwd_changes(self):
+    @staticmethod
+    def _attach_generator_source():
+        """quote_command, abs_path and bound_attach_command, verbatim from the runner.
+
+        Since cycle 8 there is exactly ONE place that composes a companion attach command, so these
+        tests exercise that function rather than an assignment line: a second generator would be the
+        defect, not something to extract alongside.
+        """
         source = RUNNER.read_text().splitlines()
         quote = next(line for line in source if line.startswith("quote_command()"))
-        assignment = next(line.strip() for line in source if "ATTACH_CMD=" in line and "$PREFIX" in line and "--stall-min" in line)
+        absolute = next(line for line in source if line.startswith("abs_path()"))
+        start = next(i for i, line in enumerate(source) if line.startswith("bound_attach_command()"))
+        end = next(i for i in range(start, len(source)) if source[i] == "}")
+        return "\n".join([quote, absolute] + source[start:end + 1])
+
+    @staticmethod
+    def _saved_attach_assignment():
+        """The assignment the runner itself makes at detach time, lifted verbatim.
+
+        Never hand-written here. A synthesized call reproduces a caller from memory, so it keeps
+        passing after the generator's signature changes — with `shift 4` failing, the bounds empty
+        and the job left over as a trailing argument, while a permissive stub reports success
+        (cycle 10: F-02/CX-02). The two fixtures that exercise a saved command share this extraction,
+        and both require exactly one unambiguous match so a second form cannot be picked silently.
+        """
+        saved = [line.strip() for line in RUNNER.read_text().splitlines()
+                 if line.strip().startswith("ATTACH_CMD=$(exec 9>&-; bound_attach_command ")
+                 and "CANCEL_CMD" not in line]
+        assert saved, "the runner no longer saves an attach command"
+        assert len(set(saved)) == 1, "the runner saves an attach command in more than one shape: %r" % (sorted(set(saved)),)
+        return saved[0]
+
+    def test_saved_codex_command_resolves_relative_prefix_before_cwd_changes(self):
+        quote = self._attach_generator_source()
+        assignment = self._saved_attach_assignment()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             other = root / "other"
@@ -1106,11 +1261,16 @@ printf replacement > "$PREFIX.launched"
             runner.write_text("#!/bin/sh\n[ -f \"$1.detached\" ]\n")
             runner.chmod(0o700)
             (root / "relative.detached").write_text("owned attempt")
-            env = dict(os.environ, CCR_RUNNER=str(runner), PREFIX="relative", STALL_MIN="1", MAX_MIN="2", POLL="3")
+            env = dict(os.environ, CCR_RUNNER=str(runner), PREFIX="relative", STALL_MIN="1", MAX_MIN="2", POLL="3", JOB="task-123")
             result = subprocess.run(["bash", "-c", quote + "\n" + assignment + '\nprintf "%s\\n" "$ATTACH_CMD"'],
                                     cwd=root, env=env, capture_output=True, text=True, check=True)
             command = shlex.split(result.stdout)
             self.assertTrue(Path(command[1]).is_absolute())
+            # The whole vector, not only the prefix: an argument list the runner would refuse is
+            # not evidence that a saved command resolves its prefix correctly.
+            self.assertEqual(command, [str(runner), str((root / "relative").resolve()), "--attach",
+                                       "--expected-job", "task-123",
+                                       "--stall-min", "1", "--max-min", "2", "--poll-sec", "3"])
             attached = subprocess.run(command, cwd=other, capture_output=True, text=True)
             self.assertEqual(attached.returncode, 0, attached.stderr)
 
@@ -1192,11 +1352,15 @@ kill_group 333333 333333 admitted
 
     def test_codex_saved_commands_preserve_every_path_argument(self):
         source = RUNNER.read_text().splitlines()
-        quote = next(line for line in source if line.startswith("quote_command()"))
-        assignments = [line.strip() for line in source
-                       if ("ATTACH_CMD=" in line and "$PREFIX" in line and "--stall-min" in line)
-                       or ("CANCEL_CMD=" in line and "codex-companion.mjs" in line)]
-        self.assertEqual(len(assignments), 2)
+        quote = self._attach_generator_source()
+        cancels = [line.strip() for line in source
+                   if "CANCEL_CMD=" in line and "codex-companion.mjs" in line]
+        self.assertEqual(len(cancels), 1)
+        # The call the runner actually makes at detach time, taken from the runner so this fixture
+        # cannot keep exercising a signature the generator no longer has (cycle 9: F-04 gave
+        # bound_attach_command explicit bounds, since a refusal must quote the ATTEMPT's, not the
+        # current invocation's). Shared with the relative-prefix fixture (cycle 10: F-02).
+        assignments = [self._saved_attach_assignment()] + cancels
         runner = "/tmp/runner 'quoted' $(literal)/codex-run.sh"
         prefix = "/tmp/review with spaces/round;literal"
         plugin = "/tmp/plugin 'quoted' with spaces"
@@ -1206,8 +1370,11 @@ kill_group 333333 333333 admitted
                                  + '\nprintf "%s\\n%s\\n" "$ATTACH_CMD" "$CANCEL_CMD"'],
                                 env=env, capture_output=True, text=True, timeout=5, check=True)
         attach, cancel = result.stdout.splitlines()
-        self.assertEqual(shlex.split(attach), [runner, prefix, "--attach", "--stall-min", "1",
-                                               "--max-min", "2", "--poll-sec", "3"])
+        # --expected-job is part of the shape, not an extra: a saved command that named only the
+        # prefix would bind to whichever job occupies it when the command is eventually run, and a
+        # prefix is legitimately reused after a spent claim is rotated (cycle 6, F-02).
+        self.assertEqual(shlex.split(attach), [runner, prefix, "--attach", "--expected-job", "task-123",
+                                               "--stall-min", "1", "--max-min", "2", "--poll-sec", "3"])
         self.assertEqual(shlex.split(cancel), ["node", plugin + "/scripts/codex-companion.mjs", "cancel", "task-123"])
 
 
