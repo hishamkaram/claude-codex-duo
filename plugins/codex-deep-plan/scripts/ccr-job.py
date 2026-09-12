@@ -289,10 +289,69 @@ def reconcile_receipt(prefix, value, record, source="submission_lookup"):
     return admitted
 
 
+BOUNDS_UNRECORDED = ("Watch bounds are unrecorded; no runnable attach command is available. "
+                     "Choose all three bounds explicitly; the stall bound cancels.")
+
+
+def recorded_bounds_argv(value):
+    """The watch bounds the attempt was LAUNCHED with, as command arguments, or None.
+
+    Absent or invalid fields are never filled in with this module's idea of a default. On an attach
+    the stall bound is not advisory — reaching it cancels the job — so a saved command carrying a
+    number nothing recorded is a guess that an operator, or a phase gate quoting the record, would
+    run against a live job (cycle 10: F-01).
+
+    Returning an empty argument list was not enough, and the distinction matters: a command with no
+    bound options is not silent about bounds, because the runner substitutes its own defaults for
+    every option it is not given, and the gate forwards any command that carries the binding
+    (cycle 11: F-01). So an unresolvable tuple returns None, and the caller records no runnable
+    command at all — it records BOUNDS_UNRECORDED instead.
+    """
+    bounds = [value.get(key) for key in ("stall_min", "max_min", "poll_sec")]
+    if not all(isinstance(item, int) and not isinstance(item, bool) and item > 0 for item in bounds):
+        return None
+    return ["--stall-min", str(bounds[0]), "--max-min", str(bounds[1]), "--poll-sec", str(bounds[2])]
+
+
+def saved_attach_command(value, prefix, job):
+    """The attach command to record, or the unrecorded-bounds sentence in its place."""
+    bounds = recorded_bounds_argv(value)
+    if bounds is None:
+        return ""
+    return shlex.join([value["runner"], prefix, "--attach", "--expected-job", job] + bounds)
+
+
+def delivered_receipt_readable(prefix):
+    """Whether <prefix>.ccr-receipt.json holds a usable delivered identity.
+
+    The DELIVERED receipt and the receipt EMBEDDED in the attempt record are two different
+    artifacts, and lost delivery means the first is gone whatever the second says (cycle 11: F-02).
+    """
+    try:
+        with open_regular(prefix + ".ccr-receipt.json") as stream:
+            delivered = json.loads(stream.read())
+    except (OSError, ValueError, UnicodeError):
+        return False
+    # Valid JSON need not be an object: `null` and `[]` parse and have no .get, and an AttributeError
+    # here escapes both this predicate's own except clause and the command-line handler — so the
+    # command every lost-receipt refusal names would raise a traceback in a delivery state it was
+    # extended to repair (cycle 12: F-05). Anything that is not a mapping is simply not a receipt.
+    if not isinstance(delivered, dict):
+        return False
+    return all(isinstance(delivered.get(key), str) and delivered[key]
+               for key in ("submission_id", "job_id", "session_id"))
+
+
 def recover(prefix):
     value = attempt(prefix)
-    if value.get("schema") == 2 and not value.get("receipt"):
+    if value.get("schema") == 2 and not (value.get("receipt") and delivered_receipt_readable(prefix)):
         # Status is read-only. A lost receipt never authorizes a fresh admission.
+        #
+        # An embedded receipt used to suppress this lookup on its own, which made the one operation
+        # that repairs delivery unavailable in the one state that needs it: the delivered receipt
+        # missing or unreadable while the attempt record still carries its own copy. The identity
+        # checks in reconcile_receipt are what keep that safe — a complete observation that
+        # disagrees with either retained identity is refused, not overwritten.
         record = lookup_submission(prefix, value)
         reconcile_receipt(prefix, value, record)
     value = bound_attempt(prefix)
@@ -310,10 +369,8 @@ def recover(prefix):
                       provider_model=value["model_document"].get("provider_model", ""),
                       compatibility=value["model_document"].get("compatibility", ""),
                       ccr_version=value["ccr_version"], command=shlex.join(value["argv"]),
-                      attach_command=shlex.join([value["runner"], prefix, "--attach", "--expected-job", admitted["job_id"],
-                                               "--stall-min", str(value.get("stall_min", 6)),
-                                               "--max-min", str(value.get("max_min", 25)),
-                                               "--poll-sec", str(value.get("poll_sec", 15))]),
+                      attach_command=saved_attach_command(value, prefix, admitted["job_id"]),
+                      attach_guidance=("" if recorded_bounds_argv(value) is not None else BOUNDS_UNRECORDED),
                       cancel_command=shlex.join(["python3", str(Path(value["runner"]).with_name("ccr-job.py")),
                                                 "cancel-attempt", prefix, admitted["job_id"]]))
         atomic(prefix + ".detached", "".join(f"{k}={v}\n" for k, v in fields.items()).encode())

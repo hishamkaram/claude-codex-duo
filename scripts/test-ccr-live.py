@@ -182,7 +182,11 @@ def main():
         watcher.wait(timeout=5)
         attach_out = (out / 'reattach.control2').open('wb')
         try:
-            collector = subprocess.Popen(['bash', str(RUNNER), str(prefix), '--attach', '--poll-sec', '1'],
+            # --expected-job is mandatory on every attach, and the identity comes from THIS
+            # launch's receipt, not from a later re-read of the prefix: a prefix outlives its
+            # attempts, so re-reading would bind to whatever occupies it when the command runs.
+            collector = subprocess.Popen(['bash', str(RUNNER), str(prefix), '--attach',
+                                          '--expected-job', receipt['job_id'], '--poll-sec', '1'],
                                          env=env, cwd=out, stdout=attach_out, stderr=subprocess.STDOUT)
         finally:
             attach_out.close()
@@ -255,7 +259,10 @@ def main():
         (out / 'sentinel.ready.json').write_text(json.dumps({'pid': sentinel_pid, 'identity': before,
                                                             'command': 'ccr launch --chrome (interactive PTY)'}, indent=2))
         watcher, prefix, receipt = launch('cancel')
-        run(['bash', str(RUNNER), str(prefix), '--attach', '--cancel'], name='cancel-command')
+        # Cancellation names its job too: it reaches the same requirement, and an unnamed
+        # cancellation would stop whichever admitted job occupies this prefix now.
+        run(['bash', str(RUNNER), str(prefix), '--attach', '--expected-job', receipt['job_id'],
+             '--cancel'], name='cancel-command')
         assert watcher.wait(timeout=30) == 1, 'cancelled workload was not reported failed'
         status = json.loads(run(['ccr', 'status', receipt['job_id'], '--json']).stdout)
         assert status['status'] == 'cancelled' and status['exit_code'] is not None

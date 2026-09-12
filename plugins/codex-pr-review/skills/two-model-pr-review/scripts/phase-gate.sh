@@ -36,6 +36,75 @@ PROVENANCE_VALIDATOR="$ROOT/scripts/validate-provenance.py"
 # Bumped to /5: the terminal-state grammar gained NOT_RUN_POLICY and the brief gained a Tier line,
 # so a directory written under /4 must be refused rather than reinterpreted by these gates.
 SCHEMA_MARKER="codex-pr-review/5"
+# The launch protocol this gate can reason about. It must equal CCR_PROTOCOL in codex-run.sh —
+# scripts/validate.sh check 4b1 fails the build if it does not — because a <prefix>.ccr-prelaunch
+# written under a protocol this gate does not understand must NOT be read as a pre-submission
+# proof. See ccr_release_check.
+CCR_PROTOCOL=1
+# Which proof last authorized a release: set by ccr_release_check, recorded on the spent claim and
+# on the RELEASED line so the permitting path is distinguishable from the refusing ones afterwards.
+RELEASE_EVIDENCE=""
+# The attach command to hand an operator for a detached prefix. The record's own text is used when
+# it already names a job; a record written before saved commands carried `--expected-job` is NOT
+# forwarded, because the runner now requires that binding on every attach and the stored string
+# would send the operator to a certain refusal (cycle 8: CX-01). It is regenerated instead, quoted
+# and absolute, exactly as the runner generates it.
+detached_attach_hint() {  # <prefix>
+  # The prefix is captured HERE, before anything below can clobber the positional parameters: the
+  # bounds used to be split with `set -- $bounds` followed by a bare `set --`, which deletes "$@",
+  # and the two regeneration branches then referenced $1 for the prefix. Under this file's `set -u`
+  # that aborts the command substitution the hint is computed in, so both branches printed nothing
+  # and the refusals that call this named no command at all — in exactly the two record shapes the
+  # branches exist for (cycle 12: F-01).
+  local prefix="$1" rec="$ART/$1.detached" job cmd bounds s m p
+  cmd=$(exec 9>&-; awk -F= '$1=="attach_command"{sub(/^[^=]*=/,""); print; exit}' "$rec" 2>/dev/null)
+  job=$(exec 9>&-; awk -F= '$1=="job"{print $2; exit}' "$rec" 2>/dev/null)
+  # The bounds the attempt was LAUNCHED with, taken from its own stored command — never this gate's
+  # idea of a default (cycle 9: F-07). On an attach the stall bound is not advisory: reaching it
+  # sets STALLED and issues a real cancel, so a hint that silently shortens it turns the recovery
+  # the gate is recommending into a cancellation of the live job. Each value is validated as a whole
+  # token, because a numeric PREFIX is not a number: `--stall-min 1e2` would otherwise read as 1
+  # (cycle 11: F-05).
+  bounds=$(exec 9>&-; printf '%s' "$cmd" | python3 9>&- -c 'import shlex,sys
+try:
+    argv = shlex.split(sys.stdin.read())
+except ValueError:
+    raise SystemExit(1)
+out = []
+for flag in ("--stall-min", "--max-min", "--poll-sec"):
+    if flag not in argv:
+        raise SystemExit(1)
+    value = argv[argv.index(flag) + 1] if argv.index(flag) + 1 < len(argv) else ""
+    if not value.isdigit() or int(value) <= 0:
+        raise SystemExit(1)
+    out.append(value)
+print(" ".join(out))') || bounds=""
+  read -r s m p <<EOF || true
+$bounds
+EOF
+  # A stored command is forwarded only when it is BOUND and carries all three bounds. The
+  # `--expected-job` early return used to forward any bound command untouched, which made every
+  # branch below unreachable for exactly the commands the composer emits without bounds — and a
+  # command with no bound options is not silent about bounds, because the runner substitutes its
+  # own defaults for the options it is not given (cycle 11: F-01).
+  if [ -n "$s" ] && [ -n "$m" ] && [ -n "$p" ]; then
+    case "$cmd" in *--expected-job*) printf '%s' "$cmd"; return 0;; esac
+  fi
+  # Nothing to bind to: the record is all there is. A record that carries no command either — the
+  # shape the composer writes when the launch bounds were never recorded — says why in
+  # attach_guidance, and printing that beats printing an empty line (cycle 11: F-01).
+  if [ -z "$job" ]; then
+    [ -n "$cmd" ] || cmd=$(exec 9>&-; awk -F= '$1=="attach_guidance"{sub(/^[^=]*=/,""); print; exit}' "$rec" 2>/dev/null)
+    printf '%s' "$cmd"; return 0
+  fi
+  if [ -z "$s" ] || [ -z "$m" ] || [ -z "$p" ]; then
+    python3 9>&- -c 'import os,shlex,sys; print(shlex.join([os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2]), "--attach", "--expected-job", sys.argv[3]]) + " --stall-min/--max-min/--poll-sec (the watch bounds this attempt was launched with are not recorded; choose them deliberately, knowing the stall bound cancels)")' \
+      "$ROOT/../../scripts/codex-run.sh" "$ART/$prefix" "$job"
+    return 0
+  fi
+  python3 9>&- -c 'import os,shlex,sys; print(shlex.join([os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2]), "--attach", "--expected-job", sys.argv[3], "--stall-min", sys.argv[4], "--max-min", sys.argv[5], "--poll-sec", sys.argv[6]]))' \
+    "$ROOT/../../scripts/codex-run.sh" "$ART/$prefix" "$job" "$s" "$m" "$p"
+}
 PACKET_VALIDATOR="$ROOT/scripts/validate-verifier-packets.py"
 VERDICT_VALIDATOR="$ROOT/scripts/validate-verdicts.py"
 PACKET_BUILDER="$ROOT/scripts/build-verifier-packets.py"
@@ -245,7 +314,7 @@ participants_status() {
         # naming it is the difference between an operator attaching and an operator relaunching a
         # live job. Say which state this is and print the record's own attach command.
         if [ -e "$ART/02-$id.detached" ]; then
-          fail "02-$id is detached and still in flight (runner exit 6): its job is still running, so no .exit was written. Do NOT relaunch — attach to it to publish the outcome: $(exec 9>&-; awk -F= '$1=="attach_command"{sub(/^[^=]*=/,""); print; exit}' "$ART/02-$id.detached" 2>/dev/null)"
+          fail "02-$id is detached and still in flight (runner exit 6): its job is still running, so no .exit was written. Do NOT relaunch — attach to it to publish the outcome: $(exec 9>&-; detached_attach_hint "02-$id")"
         fi
         fail "02-$id.exit missing: participant $id has not finished"
       fi
@@ -487,7 +556,7 @@ live_claim_check() {
         # The runner exited on its watch bound (exit 6) and left the job running. The phase is
         # still in flight — the job is — and the recovery is to resume the watch, never to launch
         # a second job against the same claim.
-        fail "$prefix is detached and its job may still be running ($prefix.detached exists, $prefix.exit does not): resume the watch with $(exec 9>&-; awk -F= '$1=="attach_command"{sub(/^[^=]*=/,""); print; exit}' "$ART/$prefix.detached" 2>/dev/null), or end the job with $(exec 9>&-; awk -F= '$1=="cancel_command"{sub(/^[^=]*=/,""); print; exit}' "$ART/$prefix.detached" 2>/dev/null) — never relaunch, and never release a live job"
+        fail "$prefix is detached and its job may still be running ($prefix.detached exists, $prefix.exit does not): resume the watch with $(exec 9>&-; detached_attach_hint "$prefix"), or end the job with $(exec 9>&-; awk -F= '$1=="cancel_command"{sub(/^[^=]*=/,""); print; exit}' "$ART/$prefix.detached" 2>/dev/null) — never relaunch, and never release a live job"
       fi
       fail "$prefix runner is still in flight ($prefix.claim/runner exists and $prefix.exit does not): wait for it, or if it is dead run phase-gate.sh release $ART $prefix — a phase cannot be recorded or advanced past while its runner may still write"
     fi
@@ -833,7 +902,60 @@ descendants_alive() {  # descendants_alive <pid>: 0 when any descendant is alive
 }
 ccr_release_check() {  # private admitted context is the sole workload authority
   local helper="$ROOT/../../scripts/ccr-job.py"
-  python3 9>&- "$helper" stopped "$ART/$1" >/dev/null || fail "release: CCR stop evidence for $1 is unresolved; restore CCR and attach. Legacy PID records cannot grant control."
+  # PROVEN PRE-SUBMISSION, released rather than refused. Everything else here still fails closed.
+  #
+  # The runner writes <prefix>.ccr-prelaunch, carrying the launch protocol, before it can submit
+  # anything; ccr-job.py `prepare()` persists <prefix>.ccr-attempt.json with fsync and an atomic
+  # replace strictly before it spawns the submitting process. There is no interleaving in which a
+  # workload exists without the attempt record. So a prelaunch marker at the protocol this gate
+  # understands, with no attempt record and no receipt, is not "we could not tell" — it is a proof
+  # that nothing was ever submitted, and there is no job whose life this refusal could protect.
+  #
+  # Refusing anyway is what made an interrupted admission unrecoverable: `release` refused, the
+  # attach it named could not be admitted (no <prefix>.detached), and a relaunch refused too, so
+  # the whole run directory was lost to a Ctrl-C. Exclusivity is already established before this
+  # runs — release_claim holds <prefix>.claim.lock, the same lease a live collector or a surviving
+  # preparation helper holds, and has proved the recorded runner pid and its descendants are gone.
+  #
+  # The marker's ABSENCE proves nothing: a legacy attempt, or state something else deleted, looks
+  # exactly the same. Those stay refused, which is why this is a discriminator and not a
+  # fall-through.
+  # Every field the marker carries is checked, not just the protocol number. `stage=` reads as a
+  # discriminator, so it must be one: a later author adding a second stage under the same protocol
+  # would otherwise produce a file this branch accepts as a pre-admission proof, and the build's
+  # protocol-agreement check compares only the integers. codex-run.sh's proven_pre_submission
+  # applies the identical test, because the gate frees the claim on this proof and the runner must
+  # then accept the relaunch that freed claim exists to authorize.
+  #
+  # "Identical" includes WHERE it is consulted, not only WHAT it tests. The runner reaches its
+  # predicate only in the branch where the attempt is otherwise unidentifiable — no CCR launch line
+  # and no companion job id in <prefix>.progress — because wherever there IS a job, its owner can be
+  # asked and asking beats inferring. This side had no such guard: it was called even when the
+  # progress file recorded a completed gateway launch, so it was the strictly more permissive half
+  # of a pair whose comments claim symmetry, and it is the half that FREES a claim (cycle 8: CL-01).
+  # The launch line is now part of the proof's precondition here too — and so is the absence of a
+  # detached record, which is the runner's own enclosing guard and was the last asymmetry left
+  # (cycle 10: F-03/CL-02). This branch is reached BECAUSE <prefix>.detached exists, so without that
+  # condition a record naming a job was freed on a proof that says nothing was ever submitted. No
+  # code path produces that state — the runner never writes .detached without an attempt record —
+  # but externally damaged state is exactly what the comment above says must keep failing closed.
+  if [ -e "$ART/$1.ccr-prelaunch" ] \
+     && grep -qxF -- "protocol=$CCR_PROTOCOL" "$ART/$1.ccr-prelaunch" 2>/dev/null \
+     && grep -qxF -- "stage=pre-admission" "$ART/$1.ccr-prelaunch" 2>/dev/null \
+     && grep -qxF -- "backend=ccr" "$ART/$1.ccr-prelaunch" 2>/dev/null \
+     && [ ! -e "$ART/$1.detached" ] \
+     && [ ! -e "$ART/$1.ccr-attempt.json" ] && [ ! -e "$ART/$1.ccr-receipt.json" ] \
+     && ! grep -qE '^[0-9]+s launched backend=ccr ' "$ART/$1.progress" 2>/dev/null \
+     && ! grep -qE 'launched job=task-[a-z0-9-]+' "$ART/$1.progress" 2>/dev/null; then
+    # The one branch here that PERMITS rather than refuses, so the run directory says which evidence
+    # freed the claim. Without it a release on this proof was indistinguishable from one backed by
+    # real stop evidence, and an incident involving a second job beside a live one would leave
+    # nothing to diagnose it with (cycle 8: CL-04).
+    RELEASE_EVIDENCE="pre-submission-proof(protocol=$CCR_PROTOCOL)"
+    return 0
+  fi
+  python3 9>&- "$helper" stopped "$ART/$1" >/dev/null || fail "release: CCR stop evidence for $1 is unresolved; restore CCR and attach. Legacy PID records cannot grant control. If this attempt predates the current launch protocol (no $1.ccr-prelaunch) it cannot be proved pre-submission either: drain it with its original runner, or abandon this prefix — record the phase FAILED and start a fresh run directory."
+  RELEASE_EVIDENCE="ccr-stop-evidence"
 }
 release_claim() {
   local prefix="$1" claim="$ART/$1.claim" pid job st root launch backend alias
@@ -848,6 +970,20 @@ release_claim() {
   # that died — and releasing it would free the claim while the job is still spending tokens.
   # Releasing is only safe once the job is known to be over, and that is the attach's job to
   # establish, not this gate's to assume.
+  # A publication in progress holds the same lock this function took, so reaching here means no
+  # attach is mid-publish for this prefix.
+  pid=$(exec 9>&-; cat "$claim/runner/pid" 2>/dev/null || true)
+  if [ -d "$claim/runner" ] && [ -z "$pid" ]; then
+    # The runner records its pid right after the atomic mkdir; a runner/ with
+    # no pid is a runner mid-acquisition unless it is old (round-37 CX-03).
+    [ $(( $(exec 9>&-; date +%s) - $(exec 9>&-; mtime "$claim/runner" || date +%s) )) -ge 60 ] || fail "release: a runner is taking the $prefix claim right now (runner/ exists, pid not yet recorded); retry in a minute"
+  fi
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then fail "release: runner $pid of $prefix is still alive"; fi
+  if [ -n "$pid" ] && descendants_alive "$pid"; then fail "release: a descendant of runner $pid of $prefix is still alive; cancel it first"; fi
+  # The detached-record decision runs HERE, after the liveness proofs, not before them. The
+  # pre-submission branch of ccr_release_check states those proofs as its precondition — "has proved
+  # the recorded runner pid and its descendants are gone" — and at the earlier position they had not
+  # run yet, so the comment described an ordering the code did not have (cycle 8: CL-01).
   if [ -e "$ART/$prefix.detached" ]; then
     d_backend=$(exec 9>&-; awk -F= '$1=="backend"{print $2; exit}' "$ART/$prefix.detached" 2>/dev/null)
     d_pid=$(exec 9>&-; awk -F= '$1=="pid"{print $2; exit}' "$ART/$prefix.detached" 2>/dev/null)
@@ -866,16 +1002,6 @@ release_claim() {
       fail "release: $prefix is detached (backend=$d_backend); run its attach command to publish an outcome before releasing the claim. If the attach cannot reach its backend at all, the two exits are: restore the backend and re-run the attach, or abandon this prefix — record the phase FAILED and start a fresh run directory. Never hand-free a claim whose job may still be running."
     fi
   fi
-  # A publication in progress holds the same lock this function took, so reaching here means no
-  # attach is mid-publish for this prefix.
-  pid=$(exec 9>&-; cat "$claim/runner/pid" 2>/dev/null || true)
-  if [ -d "$claim/runner" ] && [ -z "$pid" ]; then
-    # The runner records its pid right after the atomic mkdir; a runner/ with
-    # no pid is a runner mid-acquisition unless it is old (round-37 CX-03).
-    [ $(( $(exec 9>&-; date +%s) - $(exec 9>&-; mtime "$claim/runner" || date +%s) )) -ge 60 ] || fail "release: a runner is taking the $prefix claim right now (runner/ exists, pid not yet recorded); retry in a minute"
-  fi
-  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then fail "release: runner $pid of $prefix is still alive"; fi
-  if [ -n "$pid" ] && descendants_alive "$pid"; then fail "release: a descendant of runner $pid of $prefix is still alive; cancel it first"; fi
   job=$(exec 9>&-; grep -oE 'launched job=task-[a-z0-9-]+' "$ART/$prefix.progress" 2>/dev/null | head -1 | cut -d= -f2)
   launch=$(exec 9>&-; grep -E '^[0-9]+s launched backend=ccr ' "$ART/$prefix.progress" 2>/dev/null | head -1)
   # Which backend this attempt used: the launch line when there is one; otherwise the
@@ -904,6 +1030,7 @@ try: d=json.load(sys.stdin); print((d.get("job") or {}).get("status") or "")
 except Exception: print("")')
       case "$st" in completed|failed|cancelled|canceled) ;; *) fail "release: job $job status is '${st:-unknown}', not provably finished; cancel it first (node $root/scripts/codex-companion.mjs cancel $job)";; esac
       ! pgrep -f "task-worker.*--job-id $job" >/dev/null 2>&1 || fail "release: a worker process for job $job is still alive"
+      RELEASE_EVIDENCE="companion-status=$st"
     else
       # No id recorded: any job still running in the reviewed repository could
       # be this claim's. Refuse while one exists; list them so the operator
@@ -916,12 +1043,16 @@ import os
 same=lambda a,b: os.path.realpath(a)==os.path.realpath(b)
 print(" ".join(j.get("id","?") for j in (d.get("running") or []) if not repo or same(j.get("workspaceRoot") or "", repo)))' "$(exec 9>&-; repo_field repo)")
       [ -z "$live" ] || fail "release: $prefix.progress records no job id, and a Codex job is still running in the reviewed repository (${live}); cancel it first (node $root/scripts/codex-companion.mjs cancel <id>) or wait for it"
+      RELEASE_EVIDENCE="companion-no-live-job-in-repo"
     fi
   fi
   rotate_claim "$prefix"
-  printf 'released=%s\nreleased_by=phase-gate.sh release\njob=%s\n' "$(exec 9>&-; date -u +%Y-%m-%dT%H:%M:%SZ)" "${job:-none}" >> "$ART/$ROTATED_TO/owner" 2>/dev/null
+  # evidence= says WHICH proof freed this claim. A release backed by the pre-submission marker and
+  # one backed by stop evidence from the job's owner are different claims about the world, and the
+  # spent claim is the only record either of them leaves (cycle 8: CL-04).
+  printf 'released=%s\nreleased_by=phase-gate.sh release\njob=%s\nevidence=%s\n' "$(exec 9>&-; date -u +%Y-%m-%dT%H:%M:%SZ)" "${job:-none}" "${RELEASE_EVIDENCE:-none}" >> "$ART/$ROTATED_TO/owner" 2>/dev/null
   claim_unlock
-  echo "RELEASED $prefix -> $ROTATED_TO launches=$(exec 9>&-; runner_count "$prefix")"
+  echo "RELEASED $prefix -> $ROTATED_TO launches=$(exec 9>&-; runner_count "$prefix") evidence=${RELEASE_EVIDENCE:-none}"
 }
 claim_in_flight_check() {  # claim_in_flight_check <prefix> <terminal.md>: read-only; fails while an authorized launch is in flight
   local prefix="$1" terminal="$2" claim="$ART/$1.claim" age=0 now

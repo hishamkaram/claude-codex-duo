@@ -2,6 +2,278 @@
 
 All notable changes to this repository are documented here. Versions follow [Semantic Versioning](https://semver.org/).
 
+## [shared runner — recovery binds to a job, not to a prefix] - 2026-09-11
+
+**BREAKING**: `--expected-job` is now required on every `codex-run.sh --attach`.
+
+`codex-pr-review` 7.0.0 · `codex-deep-plan` 4.0.0 · `codex-debate` 3.0.0 — the runner is shipped
+byte-identically by all three and its `--attach` command line gains a **required** option, so all
+three are released together, and as a MAJOR bump: `scripts/codex-run.sh`'s command line is part of
+the versioned surface (the skills' own recovery instructions tell an operator to run it), a
+previously valid invocation is removed, and every `attach_command` persisted by an earlier release
+stops working. A minor bump would have let a `^6.1.0`-style range pick this up silently.
+
+> **Migration.** `--expected-job` is now mandatory on every `--attach`, cancellation included. The
+> `codex-run.sh <prefix> --attach` and `--attach --cancel` forms shown in the two entries below are
+> the pre-2026-09-11 spelling and are refused by this runner. Run the `attach_command` the runner
+> recorded (in `.meta` and `<prefix>.detached`); a saved command from before the binding existed is
+> refused with the correctly bound command to run instead.
+
+Two P1 defects found by the two-model review of the durable-job work below. Both are the same
+mistake from opposite ends: **a recovery action was bound to a prefix rather than to a job
+identity.** One was the case where no identity had been persisted yet, the other the case where a
+stale identity was reused.
+
+- **An interrupted CCR launch could wedge a whole run directory, permanently.** A SIGINT inside
+  the admission window left a prefix with a claim and a `.progress` and nothing else. `release`
+  refused (its CCR stop check loads `<prefix>.ccr-attempt.json` and raises when it is missing),
+  the attach that refusal named could not be admitted (no `<prefix>.detached`), and a relaunch
+  refused as an unfinished legacy attempt — so an ordinary Ctrl-C destroyed every artifact the run
+  had already produced, with no command that said so.
+
+  The refusal was not protecting anything, and this is provable rather than assumed: the runner
+  now writes `<prefix>.ccr-prelaunch` carrying `CCR_PROTOCOL` **before anything can be submitted**,
+  and `ccr-job.py prepare()` already persisted `<prefix>.ccr-attempt.json` (fsync + atomic replace)
+  strictly before spawning the submitting process. There is no interleaving in which a workload
+  exists without the attempt record. A prelaunch marker at the current protocol, with no attempt
+  record and no receipt, therefore *proves* no workload was submitted, and `release` frees the
+  claim. Absence of the marker proves nothing — a legacy attempt and externally deleted state look
+  identical — so those keep failing closed. Exclusivity is unchanged and already sufficient:
+  `release_claim` holds `<prefix>.claim.lock`, the same kernel lease a live collector or a
+  surviving preparation helper holds, and proves the recorded runner pid and its descendants are
+  gone first. `scripts/validate.sh` check 4b1 fails the build if the runner and the gate ever
+  disagree about the protocol number, because a gate that honoured a marker written under an
+  ordering it did not understand would free a claim whose job may be alive.
+
+- **A saved attach command could collect, and cancel, a different job.** For the companion backend
+  the saved command named only the prefix and the three watch bounds. A prefix is legitimately
+  reusable — the gate rotates a spent claim, the runner rotates the previous attempt's sidecars —
+  so running a stale saved command watched whichever job occupied the prefix now, under the old
+  attempt's stall policy, and cancelled it when that bound elapsed. The gateway backend never had
+  this hole: its saved command carries `--expected-job` and `verify-attempt` compares it before
+  collection. The companion backend now carries the same binding, `--expected-job` is accepted on
+  a prefix whose durable record is a `.detached` (it previously required a CCR attempt, which a
+  companion prefix never has), and the comparison runs under the publication lock the attach
+  already holds, before anything is observed or cancelled.
+
+- **The proof reaches the runner, not only the release gate.** Teaching it to the gate alone left
+  the prefix wedged *while reporting `RELEASED`*: `release` does not remove `<prefix>.progress`, and
+  the runner's `refuse_if_in_flight` exits 4 on it before `rotate_previous_attempt` would archive
+  the orphan that causes the refusal — so the operator looped between a gate that issued a claim
+  and a runner that refused it, burning a spent claim each pass. `proven_pre_submission` now states
+  the identical predicate on the runner side and is consulted in one place only: the branch where
+  the attempt is otherwise unidentifiable (no CCR launch line, no companion job id). Everywhere
+  else there is a job whose owner can be asked, and asking beats inferring.
+
+- **A lone `<prefix>.ccr-prelaunch` is archived by the next launch, never inherited.** The marker is
+  written one line before `<prefix>.progress`, so an interruption between them leaves a prefix
+  carrying a marker and none of the three files rotation used to trigger on. Once the runner honours
+  a marker, an inherited one could vouch for an attempt it knows nothing about — authorizing a
+  launch beside work that may be live. The marker is now itself a rotation trigger.
+
+- **Every field the marker carries is checked**, on both sides. `stage=` reads as a discriminator,
+  so it is one: a later author adding a second stage under the same protocol number cannot have it
+  silently accepted as a pre-admission proof, which the protocol-agreement check would not catch
+  because it compares only the integers.
+
+- **The attach binding asks the CALLER, not the record. BREAKING for `--attach`.** The first
+  attempt at this asked whether the record on the prefix was bound, and accepted an attach that
+  named no job whenever it was. That answers a question about the attempt that is *here*, not about
+  the one the incoming command was written for — and since a deliberate interactive attach and a
+  stale pre-binding saved command have identical arguments, a bound record vouched for every unbound
+  caller. An old command replayed against a newer attempt was admitted, watched it, and on its stall
+  bound cancelled it: exactly the defect the binding exists to prevent. `--expected-job` is now
+  required on every attach on both backends, cancellation included, and must match the job the
+  record names; both refusals observe and cancel nothing. There is no weaker check, because there is
+  nothing in the process to separate the two cases by. The gateway backend's early cancellation
+  path, which reaches the job before the record is read, applies the same requirement in place.
+  Unbound admission *discovery* is gone rather than unchanged: the ordering entry below moves the
+  refusal above the recovery step, so nothing unbound reaches it, and a lost receipt is repaired by
+  the explicit discovery command instead.
+- **Every emitted attach command comes from one generator**, is shell-quoted and carries an absolute
+  prefix. The refusal above hand-built the command it told the operator to run, so it split at the
+  first space in an installation or artifact path — the one actionable remedy it offered did not
+  work on paths the quoting tests explicitly support. The unbound fallbacks, the stored commands the
+  runner and the phase gate used to forward verbatim, and the command an attach copies forward into
+  its own record are all regenerated bound, so no path can print a command the admission block would
+  refuse.
+- **The release predicate matches the runner's in WHERE it is consulted, not only what it tests.**
+  The gate's copy never looked at `<prefix>.progress`, so it was reachable with a completed gateway
+  launch on record — the strictly more permissive half of a pair whose comments claim symmetry, and
+  the half that *frees* a claim. It now requires the absence of a launch line and of a companion job
+  id, as the runner's placement does. The detached-record decision also moved below the runner-pid
+  and descendant proofs it names as its precondition, which previously ran after it.
+- **The permitting branch leaves evidence.** A launch authorized by the pre-submission proof records
+  `PRE-SUBMISSION-PROOF:` in the new attempt's `.progress`, and a release authorized by it records
+  `evidence=pre-submission-proof(protocol=N)` on the spent claim and on the `RELEASED` line;
+  releases backed by stop evidence or by companion status record theirs the same way. Previously
+  nothing distinguished the one branch that permits from the ordinary ones.
+- **`<prefix>.ccr-prelaunch.part`** — the marker's staging name — is rotated with the attempt it
+  belongs to. A kill between its write and the rename left a permanent file that reads as a marker
+  in a directory whose names are load-bearing evidence. It is archived, never read: nothing treats a
+  staging file as authorization, and a prefix carrying only one still fails closed.
+- **The attach binding is required before anything is read, written or cancelled.** It was checked
+  thirty lines below the admission block, which calls `ccr-job.py recover` — and `recover` rewrites
+  `<prefix>.ccr-attempt.json` and can publish `<prefix>.detached`. So an unbound attach mutated the
+  record it was about to be refused for, while the refusal stated that nothing had been observed,
+  cancelled or written. The refusal now precedes both, and the job id its remedy names is read
+  directly from the attempt record or the receipt rather than by running recovery to find it. The
+  gateway backend's early cancellation path keeps its position ahead of the collector lock — it must
+  stay reachable while another collector holds the lease — and already required the binding.
+- **A lost receipt is repaired by submission-status discovery, not by attaching unbound.** An
+  attempt record does not imply a receipt: preparation precedes admission, so a prefix can carry
+  `<prefix>.ccr-attempt.json` with no receipt at all. Recovery for that state is the read-only
+  submission lookup and receipt reconciliation, documented in all three protocol references; the
+  attach that follows it is bound like every other. Naming a job discovered elsewhere does not
+  substitute for it — the binding check requires a readable receipt and refuses without one.
+- **A refusal's remedy carries the bounds the attempt was LAUNCHED with**, in the runner and in the
+  phase gate's hint, instead of the bounds of the invocation being refused (or, for the gate, none at
+  all). On an attach the stall bound is not advisory — reaching it sets `STALLED` and issues a real
+  cancel — so a printed recovery that silently shortened it converted the recovery into a
+  cancellation of the live job.
+- **A launch error keeps the proof note.** `launch_error` truncates `<prefix>.progress` with `>`, so
+  the `PRE-SUBMISSION-PROOF:` line written above it was erased on the one branch that both permits a
+  relaunch and then fails to start it — leaving an archived orphan with no record of what authorized
+  archiving it. The note is now written after the truncation, on every reachable path.
+- **The live gateway suite attaches bound, and a build check reads its argument lists.** The suite
+  is executed only by the CCR live workflow, never by `scripts/validate.sh`, so making
+  `--expected-job` mandatory broke it on every CI configuration while the repository's own
+  validation stayed green. Both call sites now pass their own launch's `receipt['job_id']`, and
+  `scripts/test-args.sh` parses the suite's positive `subprocess` argument lists and fails the build
+  on an unbound one — the deliberate refusal fixtures are allow-listed by name.
+- **An unknown watch bound is stated, never substituted.** The remedy's bounds were read from the
+  detached record alone, while the job id its own message names is read from three sources — so on
+  the prefix an interrupted admission leaves behind (receipt written, detached record not yet
+  published) the message named a job and carried the *refused caller's* bounds, which is the
+  substitution the entry above says it removed. There are exactly two durable sources for the
+  bounds: the detached record's stored command, and the attempt record's numeric `stall_min` /
+  `max_min` / `poll_sec` fields. The receipt is not a third — reconciliation keeps only the three
+  identity fields. When neither yields a complete, positive-integer tuple the runner now says the
+  bounds are unrecorded and offers no runnable command, rather than filling them in from the
+  invocation being refused. `ccr-job.py`'s recovery composer and the phase gate's regenerated hint
+  follow the same rule: neither manufactures `6/25/15` for a field the record does not carry.
+  Unchanged on purpose: an accepted attach and a fresh detach still use the invocation's bounds,
+  because there the caller *is* the watcher.
+- **A lost receipt is refused as a lost receipt, and names the command that repairs it.** The
+  binding is compared against the delivered receipt, so an unreadable one fails before any
+  comparison — for every job id, the correct one included — and the single fixed message said
+  "saved attach belongs to a different attempt". That told an operator in the one recoverable state
+  that their correct command was wrong, and named nothing to run. The two failures are now
+  distinguished, and the lost-receipt branch names `ccr-job.py recover <prefix>` — the read-only
+  submission-status lookup, which rewrites the delivered receipt under the same identity-conflict
+  checks and submits nothing — after which an ordinary bound attach works. That lookup now covers
+  **either** lost-delivery state: an attempt record with no receipt of its own, and a delivered
+  receipt that is missing or unreadable while the record still carries its copy. Previously an
+  embedded receipt suppressed the lookup, which made the repairing operation unavailable in exactly
+  the state that needs it. `complete-admission` is deliberately **not** named here: when the gateway
+  still reports the admission prepared it replays the saved launch request under its original token
+  and may start execution. It never requests a replacement job, but finishing an admission is a
+  decision, not an observation, and describing it as read-only was wrong in five places.
+- **The binding refusal is above the lock, not only above recovery.** `publish_lock` creates
+  `<prefix>.claim.lock` with an append redirect, so the refusal's "nothing was observed, cancelled
+  or written" was false by one file. It reads the durable records and nothing else, so it needs
+  neither the lock nor recovery, and now runs before both.
+- **The release proof excludes a detached record.** The gate's pre-submission proof gained the
+  launch-line preconditions last release but not the runner's enclosing `[ ! -e .detached ]` — and
+  the branch that consults it fires *because* that record exists, so a record naming a job could be
+  released on a proof that says nothing was ever submitted. No code path produces that state; only
+  external damage does, which is precisely what the surrounding comment says must fail closed.
+- **A fixture that reproduces a caller by hand is a fixture that cannot fail.** The
+  relative-prefix test still synthesized `bound_attach_command "$JOB"`, one argument to a
+  four-argument generator: `shift 4` failed, the bounds expanded empty, the job was left as a
+  trailing argument, and its permissive stub reported success. Both saved-command fixtures now lift
+  the runner's own assignment line through one shared extraction that requires an unambiguous
+  match, and both assert the complete argument vector.
+- **A command with no bound options is not silent about bounds.** The unrecorded-bounds rule above
+  emitted `<runner> <prefix> --attach --expected-job <job>` and left the options off — and the
+  runner substitutes `6/25/15` for every option it is not given, so that command *means* a
+  six-minute stall threshold that cancels, chosen by the parser rather than by the record. The phase
+  gate then forwarded it untouched, because its early return accepted any command carrying the
+  binding. The composer now records an **empty** `attach_command` plus an `attach_guidance=` line
+  saying the bounds are unrecorded and must be chosen deliberately; the gate validates all three
+  bounds before forwarding *any* stored command, binding included; and the runner prints the
+  guidance where it would otherwise print an empty line. No consumer invents a fallback.
+- **A refused attach never publishes `.exit`.** `die4` suppressed its terminal write only when one
+  of eight sidecars already existed, and the binding refusal was deliberately moved above every
+  writer — so on a bare prefix, the one state that refusal always runs in, the message "nothing was
+  observed, cancelled or written" was published as a terminal `4` that every gate reads as a
+  finished attempt: a stronger write than the `.claim.lock` the refusal was moved above to avoid.
+  An attach is never the attempt a `.exit` describes — it is a second watcher of a job another
+  invocation launched — so no attach publishes one, marker or no marker. A launch-shaped argument
+  error still does, because that *is* this invocation's attempt. `<prefix>.ccr-prelaunch` and its
+  staging name are now also markers, where rotation already treated them as attempt markers.
+- **A stored bound is read as a whole token, or not at all.** The runner extracted each with a
+  `sed` matching `[1-9][0-9]*` followed by `.*`, so the trailing pattern ate the rest of the token
+  and `--stall-min 1e2` was read as `1` — a one-minute cancellation threshold the record never
+  expressed, invented by the reader. Both readers now parse the stored command with `shlex` and
+  require each value to be a complete positive integer, failing to the unrecorded-bounds message.
+- **The lost-receipt remedy is shell-quoted like every other emitted command.** `abs_path` makes a
+  path absolute; it does not quote it, so the one command added by the previous entry fell apart on
+  exactly the artifact paths the quoting tests support. It is composed through `quote_command` now.
+- **A remedy disappeared on a prefix containing a colon.** The job-id lookup packed `path:field`
+  into one word and unpacked it with `${f%%:*}`, which strips from the *first* colon — so any
+  artifact path containing one truncated, the record was never found, and the refusal ended without
+  the remedy it promises. It fails safe (nothing wrong is printed) but silently. Path and field are
+  separate values now.
+- **An attach never republishes the record's attach command, on either backend.** The command is
+  regenerated and bound when an attach is admitted, and the companion path kept that value; both
+  gateway detach paths read it back out of the record, so the attach that had just computed the
+  correct command republished whatever the record held — an unbound command from a pre-binding
+  record, or the empty one the entry above introduces. The rule held on one backend only.
+- **The release-policy check asserts a relation, not this release's numbers.** Its first version
+  required `"version": "[0-9]+\.0\.0"` in every manifest unconditionally and grepped for this
+  entry's own heading, so it asserted "the repository is at 7.0.0/4.0.0/3.0.0" — true the day it was
+  written, false at the next ordinary release, and blind to the drift it is named for, since it
+  never compared a manifest to the changelog at all. It now reads the top entry's per-plugin
+  versions and requires the three manifests and the marketplace record to agree with them, and a
+  major bump exactly when that entry is labelled BREAKING.
+- **The gate's recovery hint kept its own prefix.** `detached_attach_hint` split the stored bounds
+  with `set -- $bounds` and then cleared the positional parameters with a bare `set --`, while both
+  regeneration branches still used `$1` for the prefix. Under the file's `set -u` that aborts the
+  command substitution the hint is computed in, so the two refusals that tell an operator how to
+  recover a detached attempt printed no command at all — in exactly the two record shapes the
+  branches exist for (a legacy unbound command, and the empty command the entry above introduces).
+  Only the early return survived: the function worked in the one case where it does nothing. The
+  prefix is now captured before anything can clobber `$@`, and the bounds are read with `read`.
+- **The release-policy check can now fail, and tests a relation between two releases.** Three
+  defects in one fixture, each hiding the next. Its `2>&1` sat on its own line after the heredoc
+  terminator, which inside `$(…)` is a separate, successful command — so the substitution's status
+  was 0 however the validator exited, and the check could not report anything for any input. Behind
+  that, the BREAKING clause tested the *shape* `X.0.0` rather than an increase, so a breaking
+  release repeating the current versions passed; and it matched the word anywhere in the entry body,
+  so an ordinary release whose notes merely said "nothing here is BREAKING" was forced to a major
+  bump. The check now requires each declared version to increase over the most recent earlier entry
+  naming that plugin, with the major component increasing exactly when the entry carries a
+  **BREAKING** label — a line of its own, which this release now carries. Four scratch-tree cases
+  cover both directions, and one asserts that a failing check is reported at all.
+- **A delivered receipt that is not an object is not a receipt.** `delivered_receipt_readable`
+  called `.get()` on whatever `json.loads` returned, so a receipt of `null` or `[]` raised
+  `AttributeError` — past its own `except` clause and past the command-line handler — out of
+  `recover()`, the command every lost-receipt refusal names. The runner's own `receipt_readable`
+  had the mirror-image defect: it accepted any document with a non-empty `job_id` while the binding
+  it guards requires all three identity fields, so a receipt that parsed but was incomplete failed
+  the binding and then passed the readability test, and the operator was told their correct command
+  "belongs to a different attempt". Both predicates now ask the same question of the same file.
+- **The relaunch refusal names a remedy on both backends.** The job was read only inside the
+  companion arm of the backend test, so on the gateway backend neither the regeneration nor the
+  unrecorded-bounds sentence ran, and the record's own `attach_command` was echoed — a blank line
+  for the record shape whose command is deliberately empty. The job is read for both arms now, and
+  anything still empty renders the record's own guidance.
+- **The identity-mismatch refusal writes nothing either.** It sat below `publish_lock`, which
+  creates `<prefix>.claim.lock` and never unlinks it, so the refusal that says nothing was observed
+  or cancelled left a file on a prefix it had just refused — the same file the binding-presence
+  refusal was moved up to avoid. The comparison now runs as soon as the record names a job, before
+  the lock; the comparison below it stays, as the authoritative one and the one that refuses a
+  record naming no job, and both go through a single refusal so the message cannot drift.
+- **An empty attach command travels with the reason it is empty.** Both publication blocks copied
+  `attach_command` and dropped `attach_guidance`, so a republished record stopped explaining its own
+  empty field.
+- **The T-3 fixture links the real interpreter, not `command -v python3`.** On a machine where
+  `python3` is a version-manager shim (pyenv, asdf), the shim re-execs through helpers — `basename`
+  among them — that T-3's deliberately bare PATH does not carry, so the symlinked shim failed before
+  the runner could reach the check T-3 exists to make. Pre-existing; unrelated to the rest of this
+  entry.
+
 ## [shared runner — guarded CCR continuation] - 2026-09-11
 
 `codex-pr-review` 6.1.0 · `codex-deep-plan` 3.1.0 · `codex-debate` 2.1.0.

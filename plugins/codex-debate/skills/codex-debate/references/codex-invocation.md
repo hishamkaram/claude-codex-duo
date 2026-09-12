@@ -13,8 +13,14 @@ mid-round on 2026-09-02 and left a phantom "running" job.
 
 ```bash
 ${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/<name>" [--via codex|ccr:<alias>] --fresh|--resume-last|--resume-session <id> --prompt-file "$ART/<name>.prompt.md" [--stall-min 6] [--max-min 25] [--poll-sec 15]
-${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/<name>" --attach [--max-min 25]   # after exit 6: resume the watch, never relaunch
+${CLAUDE_PLUGIN_ROOT}/scripts/codex-run.sh "$ART/<name>" --attach --expected-job <job> [--max-min 25]   # after exit 6: resume the watch, never relaunch
 ```
+
+`--expected-job` is mandatory on every attach, cancellation included: a prefix outlives its
+attempts, so only the caller can say which job it meant. Run the `attach_command` the runner
+recorded rather than composing one — an attach that names no job, or names a job the record does
+not, is refused (exit 4) having observed and cancelled nothing, and prints the command for the job
+that is here.
 
 "Codex" in the rest of this file means the opponent whichever backend runs it,
 except where a backend is named. With several participants each has its own
@@ -196,8 +202,22 @@ A changed head is refused by CCR. Never select an older successful job to bypass
 newer unresolved attempt. Keep separate anchors for separate participants.
 
 The private attempt persists its submission token and complete invocation before admission.
-Attach recovers a lost receipt through read-only submission status; it never submits another
-workload. An unavailable lookup remains unresolved with no terminal `.exit`.
+A lost receipt is repaired by the read-only submission-status lookup, `ccr-job.py recover
+<prefix>`, which looks the submission up, rewrites the delivered receipt under the same
+identity-conflict checks, and never submits anything. It repairs either lost-delivery state: the
+attempt record carrying no receipt, and the delivered receipt missing or unreadable while the record
+still carries its own copy. `complete-admission` is a DIFFERENT operation and not the remedy for
+this state: when the gateway still reports the admission prepared it replays the saved launch
+request under its original token and may start execution — it never requests a replacement job, but
+it is a deliberate decision to finish the original admission, not an observation.
+
+That repair is a step BEFORE the attach, not something the attach performs on the caller's behalf:
+every attach must name its job (`--attach --expected-job <job>`), and the binding check requires a
+readable receipt, so an unbound attach — or one naming a job discovered elsewhere while the receipt
+is still missing — is refused with nothing observed, cancelled or written. The refusal for an
+unreadable receipt says so and names the lookup, rather than reporting the attach as naming another
+attempt's job. An unavailable lookup remains unresolved
+with no terminal `.exit`.
 A proven aborted `not_started` admission may close as failure without inventing a child exit.
 Successful output is restricted to CCR's committed byte boundary and verified digest.
 
